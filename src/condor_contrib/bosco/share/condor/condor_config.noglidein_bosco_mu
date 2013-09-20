@@ -1,0 +1,27 @@
+##############################################
+# Things you have to edit
+#
+
+# Passwords normally are in $(LOCAL_DIR), /etc/condor on system installs via RPM
+PASSWORD_DIR = $(LOCAL_DIR)
+#PASSWORD_DIR = /etc/condor
+
+# Uncomment to debug BOSCO MU job submission
+#GRIDMANAGER_DEBUG = D_FULLDEBUG
+
+
+##############################################
+# Things that are 'safe' to leave
+#
+SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION = TRUE
+
+SEC_PASSWORD_FILE = $(PASSWORD_DIR)/passwdfile
+
+# Daemons have their own passwdfile, always owned by the daemon user
+COLLECTOR.SEC_PASSWORD_FILE = $(PASSWORD_DIR)/passwdfile.daemon
+NEGOTIATOR.SEC_PASSWORD_FILE = $(PASSWORD_DIR)/passwdfile.daemon
+GRIDMANAGER.SEC_PASSWORD_FILE = $(PASSWORD_DIR)/passwdfile.daemon
+
+# Password authentication for grid jobs file transfer
+SEC_DEFAULT_AUTHENTICATION_METHODS = $(SEC_DEFAULT_AUTHENTICATION_METHODS), PASSWORD
+
