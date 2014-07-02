@@ -3,7 +3,7 @@
 ################################################################################
 # blahp-over-ssh shim script
 #
-# command [options] remote_hostname [remote options/arguments]
+# command [options] remote_hostname [remote command] [remote options/arguments]
 #
 # Options:
 #   see usage string 
@@ -58,15 +58,77 @@ REMOTE_HOSTS=(
 
 # Parse command line arguments 
 PROG_NAME=$0
-USAGE="Usage: $PROG_NAME [options] remote_hostname remote_cmd [remote options and arguments]\n \
+USAGE="Usage: $PROG_NAME [options] remote_hostname REMOTE_CMD [remote options and arguments]\n \
+$PROG_NAME [options] remote_hostname [remote options and arguments]\n \
+Options: \n \
  --rgahp-user REMOTE_USER \tuser name on the remote host\n \
- --rgahp-key PRIVATE-KEY-PATH \tlocation of ssh private key (~/.ssh/id_rsa)\n \
+ --rgahp-key PRIVATE-KEY-PATH \tlocation of ssh private key (~/.ssh/bosco_key.rsa)\n \
  --rgahp-nokey  \t\tno ssh private key or key already enabled (same as empty rgahp-key)\n \
  --rgahp-pass PASSPHRASE \tlocation of passphrase protecting ssh private key (~/.bosco/.pass)\n \
  --rgahp-nopass \t\tno passphrase protecting ssh private key (same as empty rgahp-pass)\n \
- --rgahp-script SCRIPT \tpath to script to start up blahp (~/.bosco/batch_gahp)\n \
+ --rgahp-glite PATH \tpath to the directory of the script (~/bosco/glite)\n \
+ --rgahp-script SCRIPT \tpath to script to start up blahp (PATH/bin/batch_gahp)\n \
  --help, -h \t\t\tprint this\n \
+ remote_hostname: USER@HOST same string that can be used to ssh to the host\n \
+ remote options and arguments are passed to the REMOTE_CMD
+ REMOTE_CMD can be expressed as argument or option
 "
+
+
+inserted_par=""
+# Removing REMOTE_CMD that is added in second position
+# This interferes with the options 
+if [ "x$1" != "x--rgahp-script" ]; then
+    if [[ "x$2" == "xbatch_gahp" || "#$2" == "xcondor_ft-gahp" ]]; then 
+        inserted_par="$2"
+        set -- "$1" "${@:3}" 
+    fi
+fi
+
+getopt -T > /dev/null
+if [ $? -ne 4 ]; then
+    # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
+    # the exit code test is suggested by man getopt, better than `uname` = "Darwin"
+    # Getopt replacement to make long options work
+    # TODO Still options aren't checked on Mac OS X. We should fix that sometime.
+    arg_found=1
+    skip_next=1
+    for i; do
+        # $i is $1  
+        if [ $arg_found -eq 0 ]; then
+            set -- "${@:2}" "$i"
+        else
+            if [[ $skip_next -eq 0 || $i =~ ^--.+ ]]; then
+                # option or argument
+                if [[ "--rgahp-user,--rgahp-key,--rgahp-pass,--rgahp-glite,--rgahp-script" == *"$i"* ]]; then
+                    #echo "Long option"
+                    skip_next=0
+                else 
+                    skip_next=1
+                fi
+                set -- "${@:2}" "$i"
+            else
+                # echo "Found!"
+                arg_found=0
+                if [ -n "$inserted_par" ]; then
+                    set -- "${@:2}" -- "$i" "$inserted_par"
+                else
+                    set -- "${@:2}" -- "$i" 
+                fi
+            fi
+        fi
+    done
+else
+    TEMP=`getopt -o +h --long help,rgahp-csub:,rgahp-user:,rgahp-key:,rgahp-nokey,rgahp-pass:,rgahp-nopass,rgahp-glite:,rgahp-script: -- "$@"`
+
+    if [ $? != 0 ] ; then echo -e "$USAGE" >&2 ; exit 1 ; fi
+
+    eval set -- "$TEMP"
+fi
+
+
+
+
 if [ `uname` = "Darwin" ] ; then
     # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
     # TODO This means that the --rgahp-* options aren't supported on
@@ -82,6 +144,11 @@ fi
 
 # Remote hostname is mandatory
 # It is the first argument after the rgahp options
+# 
+if [ -n "$inserted_par" ]; then
+    REMOTE_CMD="$inserted_par"
+fi
+
 tmp_found=1
 for i; do
 	if [ $tmp_found -eq 0 ] ; then 
@@ -135,6 +202,8 @@ for i; do
 			shift ;;
 		--rgahp-glite ) REMOTE_GLITE="$2"
 			shift 2;;
+		--rgahp-script ) REMOTE_CMD="$2"
+			shift 2;;
 		--  ) shift; break ;;
 	esac
 done
@@ -144,13 +213,18 @@ done
 # Start and init ssh agent if key file is specified
 
 
-# if a passphrase is required, start up a ssh-agent and do ssh-add
-if [ "$PRIVATE_KEY_LOCATION" != "" -a -f "$PRIVATE_KEY_LOCATION" ] ; then
+# if a ssh key is required, start up a ssh-agent and do ssh-add
+if [ -n "$PRIVATE_KEY_LOCATION" -a -f "$PRIVATE_KEY_LOCATION" ] ; then
 	# start the ssh-agent
 	eval `ssh-agent -s` 1>&2
 
 	# Call the external program to do ssh-add
-	bosco_ssh_start
+        # If a passphrase is required pass it to the script
+        if [ -n "$PASSPHRASE_LOCATION" ]; then 
+	    bosco_ssh_start --key "$PRIVATE_KEY_LOCATION" --pass "$PASSPHRASE_LOCATION"
+        else
+	    bosco_ssh_start --key "$PRIVATE_KEY_LOCATION" --nopass
+        fi
 	ADD_STATUS=$?
 
 	# check if ssh-add failed
