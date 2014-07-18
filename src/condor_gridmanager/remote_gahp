@@ -93,7 +93,7 @@ fi
 # This interferes with the options for the REMOTE_CMD
 if [[ "x${@: -1}" == "xbatch_gahp" || "#${@: -1}" == "xcondor_ft-gahp" ]]; then 
     inserted_par="${@: -1}"
-    set -- "$1" "${@:1: $#-1}" 
+    set -- "${@:1: $#-1}" 
 fi
 ## END WORKAROUND SECTION
 
@@ -273,7 +273,7 @@ elif [ "${REMOTE_CMD}" = "condor_ft-gahp" ] ; then
         SSH_STATUS=$?
     done
 else
-    echo "Unknown remote command" 1>&2
+    echo "Unknown remote command (${REMOTE_CMD})" 1>&2
     SSH_STATUS=1
 fi
 
