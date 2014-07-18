@@ -145,10 +145,6 @@ fi
 # Remote hostname is mandatory
 # It is the first argument after the rgahp options
 # 
-if [ -n "$inserted_par" ]; then
-    REMOTE_CMD="$inserted_par"
-fi
-
 tmp_found=1
 for i; do
 	if [ $tmp_found -eq 0 ] ; then 
@@ -167,6 +163,12 @@ for i; do
 done
 
 if [ "X${REMOTE_HOSTNAME}X" = "XX" ] ; then echo -e "$USAGE" >&2 ; exit 1 ; fi
+
+# If the REMOTE_CMD was found by the workaround this takes precedence to the positional parameter
+if [ -n "$inserted_par" ]; then
+    REMOTE_CMD="$inserted_par"
+fi
+
 
 
 # Go through possible remote hosts and set eventual host default
@@ -240,12 +242,15 @@ fi
 # remove hostname from arglist
 shift
 
+# remove the remote command from the arglist (it may not be there depending on how it was passed)
+[ "x$1" = "x${REMOTE_CMD}" ] && shift
+
 # use BatchMode so we fail if a password is requested
 #echo "** Follows output of: ssh -o \"BatchMode yes\" $REMOTE_USER@$REMOTE_HOSTNAME /bin/bash -c \"'GLITE_LOCATION=$REMOTE_GLITE $REMOTE_GLITE/bin/batch_gahp $*'\""
-if [ "${REMOTE_CMD}" = "batch_gahp" ] ; then
+if [ "batch_gahp" = "${REMOTE_CMD}" ] ; then
     ssh -o "BatchMode yes" $REMOTE_USER@$REMOTE_HOSTNAME /bin/bash -l -c "'GLITE_LOCATION=$REMOTE_GLITE $REMOTE_GLITE/bin/batch_gahp $*'"
     SSH_STATUS=$?
-elif [ "${REMOTE_CMD}" = "condor_ft-gahp" ] ; then
+elif [ "condor_ft-gahp" = "${REMOTE_CMD}" ] ; then
     # We need to set up a tunnel from the remote machine for the file
     # transfer TCP connections. If we knew that both sides were running
     # OpenSSH 5.2p1 or later, we could have ssh pick the port on the
