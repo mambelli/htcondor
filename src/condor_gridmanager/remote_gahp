@@ -74,9 +74,14 @@ Options: \n \
  REMOTE_CMD can be expressed as argument or option
 "
 
-
+## START WORKAROUND SECTION
 inserted_par=""
-# Removing REMOTE_CMD that is added in second position
+# The remote command should be added exactly after the hostname or as a parameter.
+# Since there may be options before (for remote_gahp) and after (for REMOTE_CMD) that, this may be tricky
+# The suggestion is to use the option "--rgahp-script REMOTE_CMD" at the beginning (before any parameter or option),
+# this would allow to remove this whole WORKAROUND SECTION
+# 
+# Removing REMOTE_CMD that is added in second position (HTCondor <= 8.2.1)
 # This interferes with the options 
 if [ "x$1" != "x--rgahp-script" ]; then
     if [[ "x$2" == "xbatch_gahp" || "#$2" == "xcondor_ft-gahp" ]]; then 
@@ -84,6 +89,16 @@ if [ "x$1" != "x--rgahp-script" ]; then
         set -- "$1" "${@:3}" 
     fi
 fi
+# Removing REMOTE_CMD that is added in last position (HTCondor >= 8.2.2)
+# This interferes with the options for the REMOTE_CMD
+if [[ "x${@: -1}" == "xbatch_gahp" || "#${@: -1}" == "xcondor_ft-gahp" ]]; then 
+    inserted_par="${@: -1}"
+    set -- "$1" "${@:1: $#-1}" 
+fi
+## END WORKAROUND SECTION
+
+
+
 
 getopt -T > /dev/null
 if [ $? -ne 4 ]; then
@@ -119,28 +134,13 @@ if [ $? -ne 4 ]; then
         fi
     done
 else
-    TEMP=`getopt -o +h --long help,rgahp-csub:,rgahp-user:,rgahp-key:,rgahp-nokey,rgahp-pass:,rgahp-nopass,rgahp-glite:,rgahp-script: -- "$@"`
+    TEMP=`getopt -o +h --long help,rgahp-user:,rgahp-key:,rgahp-nokey,rgahp-pass:,rgahp-nopass,rgahp-glite:,rgahp-script: -- "$@"`
 
     if [ $? != 0 ] ; then echo -e "$USAGE" >&2 ; exit 1 ; fi
 
     eval set -- "$TEMP"
 fi
 
-
-
-
-if [ `uname` = "Darwin" ] ; then
-    # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
-    # TODO This means that the --rgahp-* options aren't supported on
-    #   Mac OS X. We should fix that sometime.
-    eval set -- -- "$@"
-else
-    TEMP=`getopt -o +h --long help,rgahp-user:,rgahp-key:,rgahp-nokey,rgahp-pass:,rgahp-nopass,rgahp-script: -- "$@"`
-
-    if [ $? != 0 ] ; then echo -e "$USAGE" >&2 ; exit 1 ; fi
-
-    eval set -- "$TEMP"
-fi
 
 # Remote hostname is mandatory
 # It is the first argument after the rgahp options
