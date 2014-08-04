@@ -1576,10 +1576,31 @@ if($btdebug == 1) {
 				}
 			} else {
 				print "cygwin 64 bit windows\n";
+				my @whereresponse = ();
+				my $wherecount = 0;
 				#can't use which. its a linux tool and will lie about the path to java.
 				if (1) {
 					print "Running where $javabinary\n";
-					$jvm = `where $javabinary`;
+					#$jvm = `where $javabinary`;
+					@whereresponse = `where $javabinary`;
+					$wherecount = @whereresponse;
+					print "Where returned more then one response:$wherecount\n";
+					if($wherecount > 1) {
+						foreach my $targ (@whereresponse) {
+							if($targ =~ /sysnative/) {
+								$jvm = $targ;
+							}
+						}
+						if($jvm eq "") {
+							$jvm = $whereresponse[0];
+						}
+					} else {
+						$jvm = $whereresponse[0];
+					}
+
+
+
+
 					fullchomp($jvm);
 					$_ = $jvm;
 					s/\\/\\\\/g;
@@ -3792,8 +3813,8 @@ print CC $eof2;
 	}
 
 my $eof3 =  <<EOF1;
-use ROLE : PERSONAL
-use SECURITY : HOST_BASED
+USE ROLE : PERSONAL
+USE SECURITY : HOST_BASED
 EOF1
 print CC $eof3;
 
