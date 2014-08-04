@@ -53,7 +53,7 @@ commands:
  -h|--help                  Show this help message
 
 Where host is user@fqdn.example.com
-$0 can manage max 254 clustars
+$0 can manage max 254 clusters
 
 EOM
 }
@@ -735,14 +735,18 @@ get_status () {
 
 
 # The getopt command line.  Using -a for alternate (allow options with only 1 '-')
-if [ `uname` = "Darwin" ] ; then
-    # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
-    TEMP="$@"
-else
-    TEMP=`getopt -a -o a:ls:t:r:hp: --longoptions add:,platform:,list,status:,test:,remove:,help  -n 'bosco_cluster' -- "$@"`
+#if [ `uname` = "Darwin" ] ; then
+#    # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
+#    TEMP="$@"
+#else
+#    # GNU getopt :: for optional arguments - but would cause restrictions on how the optional argument is specified (=,no spaces)
+#    TEMP=`getopt -a -o a:ls:t:r:hp: --longoptions add:,platform:,list,status:,test:,remove:,help  -n 'bosco_cluster' -- "$@"`
+#
+#    if [ $? != 0 ]; then usage; echo "Terminating..." >&2; exit 1; fi
+#fi
+# a better syntax would be: bosco_cluster [options] [command [arguments]]
 
-    if [ $? != 0 ]; then usage; echo "Terminating..." >&2; exit 1; fi
-fi
+TEMP="$@"
 
 eval set -- "$TEMP"
 
