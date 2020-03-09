@@ -20,7 +20,7 @@
 
 
 #include "condor_daemon_core.h"
-#include "Queue.h"
+#include <queue>
 
 /**
    This class implements a special kind of Queue: a Queue that can
@@ -54,7 +54,7 @@ class SelfDrainingHashItem {
 	bool operator == (const SelfDrainingHashItem &other) const {
 		return m_service->ServiceDataCompare(other.m_service)==0;
 	}
-	static unsigned int HashFn(SelfDrainingHashItem const &);
+	static size_t HashFn(SelfDrainingHashItem const &);
 };
 
 class SelfDrainingQueue : public Service
@@ -77,7 +77,7 @@ public:
 
 
 private:
-	Queue<ServiceData*> queue;
+	std::queue<ServiceData*> queue;
 	HashTable<SelfDrainingHashItem,bool> m_hash;
 	ServiceDataHandler handler_fn;
 	ServiceDataHandlercpp handlercpp_fn;

@@ -28,11 +28,25 @@ class StartdCronJob;
 class StartdNamedClassAd : public NamedClassAd
 {
   public:
-	StartdNamedClassAd( const char *name, StartdCronJob &job );
+	StartdNamedClassAd( const char *name, StartdCronJob &job, ClassAd * ad = NULL );
 	~StartdNamedClassAd( void ) { };
 	bool InSlotList( unsigned slot ) const;
+	StartdNamedClassAd * NewPeer( const char * name, ClassAd * ad = NULL ) { return new StartdNamedClassAd(name, m_job, ad); }
+	bool IsJob(StartdCronJob * job) const { return &m_job == job; }
+	bool ShouldMergeInto(ClassAd * merge_into, const char ** pattr_used);
+	bool MergeInto(ClassAd *merge_to);
+
+	void AggregateFrom(ClassAd *aggregateFrom);
+	bool AggregateInto(ClassAd *aggregateInfo);
+	bool isResourceMonitor();
+	static bool Merge( ClassAd * to, ClassAd * from );
+	void reset_monitor();
+	void unset_monitor();
 
   private:
+	void Aggregate( ClassAd * to, ClassAd * from );
+
+	static AttrNameSet dont_merge_attrs;
 	StartdCronJob	&m_job;
 };
 

@@ -20,6 +20,7 @@
 #ifndef CONDOR_SYSTEM_H
 #define CONDOR_SYSTEM_H
 
+#include "config.h"
 
 /******************************
 ** Windows specifics
@@ -51,14 +52,10 @@
 
 #if defined(LINUX)
 #	include "condor_sys_linux.h"
-#elif defined(HPUX)
-#	include "condor_sys_hpux.h"
 #elif defined(Solaris)
 #	include "condor_sys_solaris.h"
 #elif defined(Darwin)
 #	include "condor_sys_bsd.h"
-#elif defined(AIX)
-#	include "condor_sys_aix.h"
 #elif defined(CONDOR_FREEBSD)
 #	include "condor_sys_bsd.h"
 #else
@@ -88,39 +85,6 @@
 ** Clean-up, default definitions, etc.
 **********************************************************************/
 
-#if !defined(HAS_U_TYPES)
-    typedef unsigned int	u_int;
-    typedef unsigned char	u_char;
-    typedef unsigned short	u_short;
-    typedef unsigned long	u_long;
-#endif
-
-#if !defined(NO_VOID_SIGNAL_RETURN)
-#	define VOID_SIGNAL_RETURN	1
-#endif
-
-#if !defined(SIGISMEMBER_IS_BROKEN)
-#	define SIGISMEMBER_IS_BROKEN 0
-#endif
-
-#if !defined(HAS_F_DUP2FD)
-#	define HAS_F_DUP2FD 0
-#endif
-
-#if !defined(NBBY)
-#	define NBBY 8
-#endif
-
-#if !defined(NFDS)
-#	define NFDS(x) (x)
-#endif
-
-
-/* If WCOREFLAG is defined but WCOREFLG is not, define WCOREFLG since
-   that's what we use in our code. */
-#if defined(WCOREFLAG) && !defined(WCOREFLG)
-#	define WCOREFLG WCOREFLAG
-#endif
 
 #ifndef _POSIX_PATH_MAX
 #	define _POSIX_PATH_MAX 255
@@ -170,12 +134,6 @@
 #include <math.h>
 #include <utime.h>
 
-/* select() on all our platforms takes an fd_set pointer, so we can
-   just define this here for everyone.  We don't really need it
-   anymore, but we might hit a platform that has a different select,
-   so the level of indirection is worth keeping around. */
-typedef fd_set *SELECT_FDSET_PTR;
-
 #include "condor_unsetenv.h"
 
 #endif /* UNIX */
@@ -205,6 +163,9 @@ typedef fd_set *SELECT_FDSET_PTR;
 #ifndef O_LARGEFILE
 #  define O_LARGEFILE	0x0
 #endif
+#ifndef _O_NOINHERIT
+#  define _O_NOINHERIT	0x0 /* child process doesn't inherit file */
+#endif
 
 #include "condor_sys_formats.h"
 
@@ -219,21 +180,10 @@ typedef fd_set *SELECT_FDSET_PTR;
  * it thinks its parent is gone, and general badness.
  */
 
-  #if defined(AIX) && HAVE_READDIR64
-
-    typedef DIR64 condor_DIR;
-    #define condor_opendir opendir64
-    #define condor_closedir closedir64
-    #define condor_rewinddir rewinddir64
-
-  #else
-
-    typedef DIR condor_DIR;
-    #define condor_opendir opendir
-    #define condor_closedir closedir
-    #define condor_rewinddir rewinddir
-
-  #endif
+  typedef DIR condor_DIR;
+  #define condor_opendir opendir
+  #define condor_closedir closedir
+  #define condor_rewinddir rewinddir
 
   #if HAVE_READDIR64
     typedef struct dirent64 condor_dirent;
@@ -244,6 +194,13 @@ typedef fd_set *SELECT_FDSET_PTR;
   #endif
 
 #endif // !WIN32
+
+/* Declaration for Sleep(int milliseconds) in our util lib.  Note
+ * we don't do this on Win32, since Sleep() is native on Win32.
+ */
+#ifndef WIN32
+	unsigned int Sleep(unsigned int milliseconds);
+#endif
 
 /* This defines macros that can disable certain gcc warnings */
 /* If not using gcc, macros are null defines */

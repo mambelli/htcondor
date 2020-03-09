@@ -51,3 +51,8 @@
 #define	CONDOR_SetAttributeByConstraint2	10032		/* Rob */
 #define CONDOR_GetDirtyAttributes	10033		/* Rob */
 #define CONDOR_GetNextDirtyJobByConstraint	10034	/* Rob */
+#define CONDOR_SetAllowProtectedAttrChanges 10035
+#define CONDOR_GetCapabilities      10036 /* tj */
+#define CONDOR_SetJobFactory        10037 /* tj */
+#define CONDOR_SetMaterializeData   10038 /* tj - abandoned */
+#define CONDOR_SendMaterializeData  10039 /* tj */

@@ -20,7 +20,6 @@
 
 #include "condor_common.h"
 #include "condor_config.h"
-#include "job_lease.h"
 
 #include "baseresource.h"
 #include "basejob.h"
@@ -56,7 +55,6 @@ BaseResource::BaseResource( const char *resource_name )
 								"BaseResource::UpdateLeases", (Service*)this );
 	lastUpdateLeases = 0;
 	updateLeasesActive = false;
-	leaseAttrsSynched = false;
 	updateLeasesCmdActive = false;
 	m_hasSharedLeases = false;
 	m_defaultLeaseDuration = -1;
@@ -74,6 +72,10 @@ BaseResource::BaseResource( const char *resource_name )
 
 	m_batchStatusActive = false;
 	m_batchPollTid = TIMER_UNSET;
+
+	m_paramJobPollRate = -1;
+	m_paramJobPollInterval = -1;
+	m_jobPollInterval = 0;
 }
 
 BaseResource::~BaseResource()
@@ -296,6 +298,9 @@ void BaseResource::PublishResourceAd( ClassAd *resource_ad )
 	resource_ad->Assign( ATTR_SCHEDD_NAME, ScheddName );
     resource_ad->Assign( ATTR_SCHEDD_IP_ADDR, ScheddObj->addr() );
 	resource_ad->Assign( ATTR_OWNER, myUserName );
+	if ( SelectionValue ) {
+		resource_ad->Assign( ATTR_GRIDMANAGER_SELECTION_VALUE, SelectionValue );
+	}
 	resource_ad->Assign( "NumJobs", registeredJobs.Number() );
 	resource_ad->Assign( "JobLimit", jobLimit );
 	resource_ad->Assign( "SubmitsAllowed", submitsAllowed.Number() );
@@ -336,6 +341,12 @@ void BaseResource::RegisterJob( BaseJob *job )
 		} else {
 			job->NotifyResourceUp();
 		}
+	}
+
+	int lease_expiration = -1;
+	job->jobAd->LookupInteger( ATTR_JOB_LEASE_EXPIRATION, lease_expiration );
+	if ( lease_expiration > 0 ) {
+		RequestUpdateLeases();
 	}
 
 	if ( deleteMeTid != TIMER_UNSET ) {
@@ -408,7 +419,7 @@ bool BaseResource::RequestSubmit( BaseJob *job )
 
 	if ( submitsAllowed.Length() < jobLimit &&
 		 submitsWanted.Length() > 0 ) {
-		EXCEPT("In BaseResource for %s, SubmitsWanted is not empty and SubmitsAllowed is not full\n",resourceName);
+		EXCEPT("In BaseResource for %s, SubmitsWanted is not empty and SubmitsAllowed is not full",resourceName);
 	}
 	if ( submitsAllowed.Length() < jobLimit ) {
 		submitsAllowed.Append( job );
@@ -539,6 +550,34 @@ void BaseResource::DoPing( unsigned& ping_delay, bool& ping_complete,
 	ping_succeeded = true;
 }
 
+time_t BaseResource::GetLeaseExpiration( const BaseJob *job )
+{
+	// Without a job to consider, just return the shared lease
+	// expiration, if we have one.
+	if ( job == NULL ) {
+		return m_sharedLeaseExpiration;
+	}
+	// What lease expiration should be used for this job?
+	// Some jobs may have no lease (default for grid-type condor).
+	// Otherwise, if we haven't established a shared lease yet,
+	// calculate one for this job only.
+	int new_expiration = 0;
+	int job_lease_duration = m_defaultLeaseDuration;
+	job->jobAd->LookupInteger( ATTR_JOB_LEASE_DURATION, job_lease_duration );
+	if ( job_lease_duration > 0 ) {
+		new_expiration = m_sharedLeaseExpiration > 0 ?
+			m_sharedLeaseExpiration : time(NULL) + job_lease_duration;
+	}
+	return new_expiration;
+}
+
+void BaseResource::RequestUpdateLeases()
+{
+	if ( updateLeasesTimerId != TIMER_UNSET ) {
+		daemonCore->Reset_Timer( updateLeasesTimerId, 0 );
+	}
+}
+
 void BaseResource::UpdateLeases()
 {
 dprintf(D_FULLDEBUG,"*** UpdateLeases called\n");
@@ -562,94 +601,53 @@ dprintf(D_FULLDEBUG,"    UpdateLeases: last update too recent, delaying %d secs\
 
     if ( updateLeasesActive == false ) {
 		BaseJob *curr_job;
-		time_t next_renew_time = INT_MAX;
-		time_t job_renew_time;
-		int min_new_expire = INT_MAX;
+		int new_lease_duration = INT_MAX;
 dprintf(D_FULLDEBUG,"    UpdateLeases: calc'ing new leases\n");
 		registeredJobs.Rewind();
-dprintf(D_FULLDEBUG,"    starting min_new_expire=%d next_renew_time=%ld\n",min_new_expire,next_renew_time);
 		while ( registeredJobs.Next( curr_job ) ) {
-			int new_expire;
-			std::string  job_id;
-			job_renew_time = next_renew_time;
-				// Don't update the lease for a job that isn't submitted
-				// anywhere. The Job object will start the lease when it
-				// submits the job.
-			if ( ( m_hasSharedLeases || curr_job->jobAd->LookupString( ATTR_GRID_JOB_ID, job_id ) ) &&
-				 CalculateJobLease( curr_job->jobAd, new_expire,
-									m_defaultLeaseDuration,
-									&job_renew_time ) ) {
-
-				if ( new_expire < min_new_expire ) {
-					min_new_expire = new_expire;
-				}
-				if ( !m_hasSharedLeases ) {
-					curr_job->UpdateJobLeaseSent( new_expire );
-					leaseUpdates.Append( curr_job );
-				}
-			} else if ( job_renew_time < next_renew_time ) {
-				next_renew_time = job_renew_time;
+			int job_lease_duration = m_defaultLeaseDuration;
+			curr_job->jobAd->LookupInteger( ATTR_JOB_LEASE_DURATION, job_lease_duration );
+			if ( job_lease_duration > 0 && job_lease_duration < new_lease_duration ) {
+				new_lease_duration = job_lease_duration;
 			}
-dprintf(D_FULLDEBUG,"    after %d.%d: min_new_expire=%d next_renew_time=%ld job_renew_time=%ld\n",curr_job->procID.cluster,curr_job->procID.proc,min_new_expire,next_renew_time,job_renew_time);
 		}
-		if ( min_new_expire == INT_MAX ||
-			 ( m_hasSharedLeases && next_renew_time < INT_MAX &&
-			   m_sharedLeaseExpiration != 0 ) ) {
-			if ( next_renew_time > time(NULL) + 3600 ) {
+dprintf(D_FULLDEBUG,"    UpdateLeases: new shared lease duration: %d\n", new_lease_duration );
+		// This is how close to the lease expiration time we want to be
+		// when we try a renewal.
+		int renew_threshold = ( new_lease_duration * 2 / 3 ) + 10;
+		if ( new_lease_duration == INT_MAX ||
+			 m_sharedLeaseExpiration > time(NULL) + renew_threshold ) {
+			// Lease doesn't need renewal, yet.
+			time_t next_renew_time = m_sharedLeaseExpiration - renew_threshold;
+			if ( new_lease_duration == INT_MAX ||
+				 next_renew_time > time(NULL) + 3600 ) {
 				next_renew_time = time(NULL) + 3600;
 			}
 dprintf(D_FULLDEBUG,"    UpdateLeases: nothing to renew, resetting timer for %ld secs\n",next_renew_time - time(NULL));
 			lastUpdateLeases = time(NULL);
 			daemonCore->Reset_Timer( updateLeasesTimerId,
 									 next_renew_time - time(NULL) );
+			return;
 		} else {
-			if ( m_hasSharedLeases ) {
+			// Time to renew the lease
+			m_sharedLeaseExpiration = time(NULL) + new_lease_duration;
+			if ( !m_hasSharedLeases ) {
 				registeredJobs.Rewind();
 				while ( registeredJobs.Next( curr_job ) ) {
 					std::string job_id;
-					if ( curr_job->jobAd->LookupString( ATTR_GRID_JOB_ID, job_id ) ) {
-						curr_job->UpdateJobLeaseSent( min_new_expire );
+					int tmp;
+					if ( curr_job->jobAd->LookupString( ATTR_GRID_JOB_ID, job_id ) &&
+						 curr_job->jobAd->LookupInteger( ATTR_JOB_LEASE_DURATION, tmp )
+					) {
+						leaseUpdates.Append( curr_job );
 					}
 				}
-				m_sharedLeaseExpiration = min_new_expire;
-dprintf(D_FULLDEBUG,"    new shared lease expiration at %ld, updating job ads...\n",m_sharedLeaseExpiration);
 			}
+dprintf(D_FULLDEBUG,"    new shared lease expiration at %ld, performing renewal...\n",m_sharedLeaseExpiration);
 			requestScheddUpdateNotification( updateLeasesTimerId );
 			updateLeasesActive = true;
-			leaseAttrsSynched = false;
 		}
-		return;
 	}
-
-	if ( leaseAttrsSynched == false ) {
-		bool still_dirty = false;
-		BaseJob *curr_job;
-		leaseUpdates.Rewind();
-		while ( leaseUpdates.Next( curr_job ) ) {
-			bool exists, dirty;
-			curr_job->jobAd->GetDirtyFlag( ATTR_JOB_LEASE_EXPIRATION,
-										   &exists, &dirty );
-			if ( !exists ) {
-					// What!? The attribute disappeared? Forget about renewing
-					// the lease then
-				dprintf( D_ALWAYS, "Lease attribute disappeared for job %d.%d, ignoring it\n",
-						 curr_job->procID.cluster, curr_job->procID.proc );
-				leaseUpdates.DeleteCurrent();
-			}
-			if ( dirty ) {
-				still_dirty = true;
-				requestScheddUpdate( curr_job, false );
-			}
-		}
-		if ( still_dirty ) {
-			requestScheddUpdateNotification( updateLeasesTimerId );
-dprintf(D_FULLDEBUG,"    UpdateLeases: waiting for schedd synch\n");
-			return;
-		}
-else dprintf(D_FULLDEBUG,"    UpdateLeases: leases synched\n");
-	}
-
-	leaseAttrsSynched = true;
 
 	unsigned update_delay = 0;
 	bool update_complete;
@@ -664,7 +662,7 @@ dprintf(D_FULLDEBUG,"    UpdateLeases: calling DoUpdateLeases\n");
 
 	if ( update_delay ) {
 		daemonCore->Reset_Timer( updateLeasesTimerId, update_delay );
-dprintf(D_FULLDEBUG,"    UpdateLeases: DoUpdateLeases wants delay of %uld secs\n",update_delay);
+dprintf(D_FULLDEBUG,"    UpdateLeases: DoUpdateLeases wants delay of %u secs\n",update_delay);
 		return;
 	}
 
@@ -690,46 +688,23 @@ dprintf(D_FULLDEBUG,"    UpdateLeases: DoUpdateLeases complete, processing resul
 				// before they proceed with submission.
 				curr_job->SetEvaluateState();
 			}
-			if ( !curr_job->jobAd->LookupString( ATTR_GRID_JOB_ID, tmp ) ) {
-				continue;
-			}
-			bool curr_renewal_failed = !update_success;
-			bool last_renewal_failed = false;
-			curr_job->jobAd->LookupBool( ATTR_LAST_JOB_LEASE_RENEWAL_FAILED,
-										 last_renewal_failed );
-			if ( curr_renewal_failed != last_renewal_failed ) {
-				curr_job->jobAd->Assign( ATTR_LAST_JOB_LEASE_RENEWAL_FAILED,
-										 curr_renewal_failed );
-				requestScheddUpdate( curr_job, false );
+			if ( curr_job->jobAd->LookupString( ATTR_GRID_JOB_ID, tmp ) ) {
+				curr_job->UpdateJobLeaseSent( m_sharedLeaseExpiration );
 			}
 		}
 	} else {
-update_succeeded.Rewind();
-PROC_ID id;
 std::string msg = "    update_succeeded:";
- while(update_succeeded.Next(id)) formatstr_cat(msg, " %d.%d", id.cluster, id.proc);
-dprintf(D_FULLDEBUG,"%s\n",msg.c_str());
 		BaseJob *curr_job;
-		leaseUpdates.Rewind();
-		while ( leaseUpdates.Next( curr_job ) ) {
-			bool curr_renewal_failed;
-			bool last_renewal_failed = false;
-			if ( update_succeeded.IsMember( curr_job->procID ) ) {
-dprintf(D_FULLDEBUG,"    %d.%d is in succeeded list\n",curr_job->procID.cluster,curr_job->procID.proc);
-				curr_renewal_failed = false;
-			} else {
-dprintf(D_FULLDEBUG,"    %d.%d is not in succeeded list\n",curr_job->procID.cluster,curr_job->procID.proc);
-				curr_renewal_failed = true;
+		PROC_ID curr_id;
+		update_succeeded.Rewind();
+		while ( update_succeeded.Next( curr_id ) ) {
+formatstr_cat(msg, " %d.%d", curr_id.cluster, curr_id.proc);
+			if ( BaseJob::JobsByProcId.lookup( curr_id, curr_job ) == 0 ) {
+				curr_job->UpdateJobLeaseSent( m_sharedLeaseExpiration );
 			}
-			curr_job->jobAd->LookupBool( ATTR_LAST_JOB_LEASE_RENEWAL_FAILED,
-										 last_renewal_failed );
-			if ( curr_renewal_failed != last_renewal_failed ) {
-				curr_job->jobAd->Assign( ATTR_LAST_JOB_LEASE_RENEWAL_FAILED,
-										 curr_renewal_failed );
-				requestScheddUpdate( curr_job, false );
-			}
-			leaseUpdates.DeleteCurrent();
 		}
+dprintf(D_FULLDEBUG,"%s\n",msg.c_str());
+		leaseUpdates.Clear();
 	}
 
 	updateLeasesActive = false;
@@ -803,7 +778,7 @@ GahpClient * BaseResource::BatchGahp()
 	return 0;
 }
 
-int BaseResource::DoBatchStatus()
+void BaseResource::DoBatchStatus()
 {
 	dprintf(D_FULLDEBUG, "BaseResource::DoBatchStatus for %s.\n", ResourceName());
 
@@ -813,7 +788,7 @@ int BaseResource::DoBatchStatus()
 			// in polling
 		daemonCore->Reset_Timer( m_batchPollTid, BatchStatusInterval() );
 		dprintf(D_FULLDEBUG, "BaseResource::DoBatchStatus for %s skipped for %d seconds because %s.\n", ResourceName(), BatchStatusInterval(), resourceDown ? "the resource is down":"there are no jobs registered");
-		return 0;
+		return;
 	}
 
 	GahpClient * gahp = BatchGahp();
@@ -821,7 +796,7 @@ int BaseResource::DoBatchStatus()
 		int GAHP_INIT_DELAY = 5;
 		dprintf( D_ALWAYS,"BaseResource::DoBatchStatus: gahp server not up yet, delaying %d seconds\n", GAHP_INIT_DELAY );
 		daemonCore->Reset_Timer( m_batchPollTid, GAHP_INIT_DELAY );
-		return 0;
+		return;
 	}
 
 	daemonCore->Reset_Timer( m_batchPollTid, TIMER_NEVER );
@@ -833,19 +808,19 @@ int BaseResource::DoBatchStatus()
 			case BSR_DONE:
 				dprintf(D_FULLDEBUG, "BaseResource::DoBatchStatus: Finished bulk job poll of %s\n", ResourceName());
 				daemonCore->Reset_Timer( m_batchPollTid, BatchStatusInterval() );
-				return 0;
+				return;
 
 			case BSR_ERROR:
 				dprintf(D_ALWAYS, "BaseResource::DoBatchStatus: An error occurred trying to start a bulk poll of %s\n", ResourceName());
 				daemonCore->Reset_Timer( m_batchPollTid, BatchStatusInterval() );
-				return 0;
+				return;
 
 			case BSR_PENDING:
 				m_batchStatusActive = true;
-				return 0;
+				return;
 
 			default:
-				EXCEPT("BaseResource::DoBatchStatus: Unknown BatchStatusResult %d\n", (int)bsr);
+				EXCEPT("BaseResource::DoBatchStatus: Unknown BatchStatusResult %d", (int)bsr);
 		}
 
 	} else {
@@ -855,20 +830,19 @@ int BaseResource::DoBatchStatus()
 				dprintf(D_FULLDEBUG, "BaseResource::DoBatchStatus: Finished bulk job poll of %s\n", ResourceName());
 				m_batchStatusActive = false;
 				daemonCore->Reset_Timer( m_batchPollTid, BatchStatusInterval() );
-				return 0;
+				return;
 
 			case BSR_ERROR:
 				dprintf(D_ALWAYS, "BaseResource::DoBatchStatus: An error occurred trying to finish a bulk poll of %s\n", ResourceName());
 				m_batchStatusActive = false;
 				daemonCore->Reset_Timer( m_batchPollTid, BatchStatusInterval() );
-				return 0;
+				return;
 
 			case BSR_PENDING:
-				return 0;
+				return;
 
 			default:
-				EXCEPT("BaseResource::DoBatchStatus: Unknown BatchStatusResult %d\n", (int)bsr);
+				EXCEPT("BaseResource::DoBatchStatus: Unknown BatchStatusResult %d", (int)bsr);
 		}
 	}
-	return 0;
 }

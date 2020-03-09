@@ -34,7 +34,7 @@ ReliSock *qmgmt_sock = NULL;
 static Qmgr_connection connection;
 
 Qmgr_connection *
-ConnectQ(const char *qmgr_location, int timeout, bool read_only, CondorError* errstack, const char *effective_owner, const char* schedd_version_str )
+ConnectQ(const char *qmgr_location, int timeout, bool read_only, CondorError* errstack, const char *effective_owner, const char* /*schedd_version_str*/ )
 {
 	int		rval, ok;
 	int cmd = read_only ? QMGMT_READ_CMD : QMGMT_WRITE_CMD;
@@ -64,24 +64,6 @@ ConnectQ(const char *qmgr_location, int timeout, bool read_only, CondorError* er
 			dprintf( D_ALWAYS, "Can't find address of local queue manager\n" );
 		}
 	} else { 
-			// QMGMT_WRITE_CMD didn't exist before 7.5.0, so use QMGMT_READ_CMD
-			// when talking to older schedds
-		if( cmd == QMGMT_WRITE_CMD ) {
-			if( !schedd_version_str ) schedd_version_str = d.version();
-			if( !schedd_version_str ) {
-					// Some day when we don't care about compatibility with
-					// things from before 7.5.0, we could stop defaulting
-					// to QMGMT_READ_CMD here.
-				cmd = QMGMT_READ_CMD;
-			}
-			else {
-				CondorVersionInfo ver_info(schedd_version_str);
-				if( !ver_info.built_since_version(7,5,0) ) {
-					cmd = QMGMT_READ_CMD;
-				}
-			}
-		}
-
 		qmgmt_sock = (ReliSock*) d.startCommand( cmd,
 												 Stream::reli_sock,
 												 timeout,
@@ -195,13 +177,13 @@ ConnectQ(const char *qmgr_location, int timeout, bool read_only, CondorError* er
 
 // we can ignore the parameter because there is only one connection
 bool
-DisconnectQ(Qmgr_connection *,bool commit_transactions)
+DisconnectQ(Qmgr_connection *,bool commit_transactions, CondorError *errstack)
 {
 	int rval = -1;
 
 	if( !qmgmt_sock ) return( false );
 	if ( commit_transactions ) {
-		rval = RemoteCommitTransaction();
+		rval = RemoteCommitTransaction(0, errstack);
 	}
 	CloseSocket();
 	delete qmgmt_sock;
@@ -232,14 +214,14 @@ SendSpoolFileBytes(char const *filename)
 
 
 void
-WalkJobQueue(scan_func func)
+WalkJobQueue2(scan_func func, void* pv)
 {
 	ClassAd *ad;
 	int rval = 0;
 
 	ad = GetNextJob(1);
 	while (ad != NULL && rval >= 0) {
-		rval = func(ad);
+		rval = func(ad, pv);
 		if (rval >= 0) {
 			FreeJobAd(ad);
 			ad = GetNextJob(0);
@@ -271,3 +253,4 @@ float_to_rusage(double utime, double stime, struct rusage *ru)
 	ru->ru_stime.tv_usec = 0;
 	return 0;
 }
+

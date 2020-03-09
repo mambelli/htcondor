@@ -22,25 +22,12 @@
 #define CONDOR_SECMAN_H
 
 #include "condor_common.h"
-// #include "condor_debug.h"
-// #include "condor_config.h"
-// #include "condor_ver_info.h"
-
-// #include "daemon.h"
-// #include "condor_string.h"
-// #include "condor_attributes.h"
-// #include "condor_adtypes.h"
-// #include "condor_query.h"
-// #include "my_hostname.h"
-// #include "internet.h"
-// #include "HashTable.h"
 #include "KeyCache.h"
-// #include "condor_daemon_core.h"
 #include "classy_counted_ptr.h"
 #include "reli_sock.h"
 
 
-typedef void StartCommandCallbackType(bool success,Sock *sock,CondorError *errstack,void *misc_data);
+typedef void StartCommandCallbackType(bool success, Sock *sock, CondorError *errstack, const std::string &trust_domain, bool should_try_token_request, void *misc_data);
 
 extern char const *USE_TMP_SEC_SESSION;
 
@@ -83,17 +70,62 @@ public:
 	static const char sec_feat_act_rev[][10];
 	static const char sec_req_rev[][10];
 
-	static KeyCache                      * session_cache;
-	static HashTable<MyString, MyString> * command_map;
+	// A pointer to the current session cache.
+	static KeyCache                     *session_cache;
+	// The default session cache - used when there are no tags
+	static KeyCache                      m_default_session_cache;
+	// Alternate session caches.
+	static std::map<std::string,KeyCache*> *m_tagged_session_cache;
+        static std::string m_tag;
+	// Alternate tag methods
+	static std::map<DCpermission, std::string> m_tag_methods;
+	static std::string m_tag_token_owner;
+	static HashTable<MyString, MyString> command_map;
 	static int sec_man_ref_count;
+	static std::set<std::string> m_not_my_family;
+
+	// Manage the pool password
+	static std::string m_pool_password;
+
+		// Manage the in-memory token override
+	static std::string m_token;
 
 		// The following is indexed by session index name ( "addr,<cmd>" )
-	static HashTable<MyString, classy_counted_ptr<SecManStartCommand> > *tcp_auth_in_progress;
+	static HashTable<MyString, classy_counted_ptr<SecManStartCommand> > tcp_auth_in_progress;
 
-	SecMan(int numbuckets = 209);  // years of careful research... HA HA HA HA
+	SecMan();
 	SecMan(const SecMan &);
 	~SecMan();
 	const SecMan & operator=(const SecMan &);
+	SecMan &operator=(SecMan &&);
+
+		// A struct to order all the startCommand parameters below (as opposed
+		// to having 10 parameters to a single function).
+		//
+		// Mostly a duplicate of the internal "SecManStartCommand" class, except
+		// simpler and stripped down.
+	struct StartCommandRequest {
+
+		StartCommandRequest() {}
+		StartCommandRequest(const StartCommandRequest &) = delete;
+
+		int m_cmd{-1};
+		Sock *m_sock{nullptr};
+		bool m_raw_protocol{false};
+		CondorError *m_errstack{nullptr};
+		int m_subcmd{-1};
+		StartCommandCallbackType *m_callback_fn{nullptr};
+		void *m_misc_data{nullptr};
+		bool m_nonblocking{false};
+		const char *m_cmd_description{nullptr};
+		const char *m_sec_session_id{nullptr};
+			// Do the start command on behalf of a specific owner;
+			// empty tag is the default (`condor` for daemons...).
+		std::string m_owner;
+			// If m_owner is set, then we can also specify the authentication
+			// methods to use for that owner.
+		std::vector<std::string> m_methods;
+	};
 
 		// Prepare a socket for sending a CEDAR command.  This takes
 		// care of security negotiation and authentication.
@@ -107,13 +139,16 @@ public:
 		// spawn off a non-blocking attempt to create a security
 		// session so that in the future, a UDP command could succeed
 		// without StartCommandWouldBlock.
-	StartCommandResult startCommand( int cmd, Sock* sock, bool raw_protocol, CondorError* errstack, int subcmd, StartCommandCallbackType *callback_fn, void *misc_data, bool nonblocking,char const *cmd_description,char const *sec_session_id);
+	StartCommandResult startCommand(const StartCommandRequest &req);
 
 		// Authenticate a socket using whatever authentication methods
 		// have been configured for the specified perm level.
 	static int authenticate_sock(Sock *s,DCpermission perm, CondorError* errstack);
 	static int authenticate_sock(Sock *s,KeyInfo *&ki, DCpermission perm, CondorError* errstack);
 
+	bool getSessionPolicy(const char *sess_id, classad::ClassAd &policy);
+
+	bool getSessionStringAttribute(const char *sess_id, const char *attr_name, std::string &attr_value);
 
     //------------------------------------------
     // invalidate cache
@@ -124,16 +159,55 @@ public:
     void                    invalidateExpiredCache();
 	void					invalidateByParentAndPid(const char * parent, int pid);
 
+	// Setup `tag`ing mechanism - provide a way for a unique set of session caches.
+	// This is useful when CEDAR needs to impersonate several logical users within the
+	// same process but does not want the session cache for user A to be reused by user B.
+	static void setTag(const std::string &);
+        static const std::string &getTag() {return m_tag;}
+
+	// Get and set a pool password - the SecMan controls this as it is a convenient global.
+	// This is useful when a pool password needs to be managed programmatically - and not
+	// read from disk.
+	//
+	// An empty pool password is invalid and indicates one should disable the feature.
+	static void setPoolPassword(const std::string &pool) {m_pool_password = pool;}
+	// An empty pool indicates this is not used.
+	static const std::string &getPoolPassword() {return m_pool_password;}
+
+		// Get and set the in-memory token.  See comments for similar approach in
+		// setPoolPassword
+	static void setToken(const std::string &token) {m_token = token;}
+	static const std::string &getToken() {return m_token;}
+
+	// Setup the current authentication methods for a tag; these are considered overrides
+	// and are cleared when the tag is changed.
+	static void setTagAuthenticationMethods(DCpermission perm, const std::vector<std::string> &methods);
+	static const std::string getTagAuthenticationMethods(DCpermission perm);
+
+	// Setup the tag credential owner name; this is considered an override and cleared when the
+	// tag is changed.
+	//
+	// When non-empty, the authentication method should proceed as-if the daemon was running as
+	// the specified owner.  While `tag` is an opaque string, this is interpreted as a username.
+	static void setTagCredentialOwner(const std::string &owner) {m_tag_token_owner = owner;}
+	static const std::string &getTagCredentialOwner() {return m_tag_token_owner;}
 
 	bool	FillInSecurityPolicyAd( DCpermission auth_level,
 									ClassAd* ad,
 									bool raw_protocol=false,
 									bool use_tmp_sec_session=false,
 									bool force_authentication=false);
-	ClassAd * 				ReconcileSecurityPolicyAds(ClassAd &cli_ad, ClassAd &srv_ad);
+
+	bool	FillInSecurityPolicyAdFromCache( DCpermission auth_level,
+									ClassAd* &ad,
+									bool raw_protocol=false,
+									bool use_tmp_sec_session=false,
+									bool force_authentication=false);
+
+	ClassAd * 				ReconcileSecurityPolicyAds(const ClassAd &cli_ad, const ClassAd &srv_ad);
 	bool 					ReconcileSecurityDependency (sec_req &a, sec_req &b);
-	SecMan::sec_feat_act	ReconcileSecurityAttribute(const char* attr, ClassAd &cli_ad, ClassAd &srv_ad, bool *required = NULL);
-	MyString			ReconcileMethodLists( char * cli_methods, char * srv_methods );
+	SecMan::sec_feat_act	ReconcileSecurityAttribute(const char* attr, const ClassAd &cli_ad, const ClassAd &srv_ad, bool *required = NULL);
+	std::string			ReconcileMethodLists( char * cli_methods, char * srv_methods );
 
 
 	static  void			key_printf(int debug_levels, KeyInfo *k);
@@ -141,12 +215,12 @@ public:
 	static	int 			getAuthBitmask ( const char * methods );
 	static void             getAuthenticationMethods( DCpermission perm, MyString *result );
 
-	static	MyString 		getDefaultAuthenticationMethods();
+	static	MyString 		getDefaultAuthenticationMethods( DCpermission perm );
 	static	MyString 		getDefaultCryptoMethods();
 	static	SecMan::sec_req 		sec_alpha_to_sec_req(char *b);
 	static	SecMan::sec_feat_act 	sec_alpha_to_sec_feat_act(char *b);
-	static	SecMan::sec_req 		sec_lookup_req( ClassAd &ad, const char* pname );
-	static	SecMan::sec_feat_act 	sec_lookup_feat_act( ClassAd &ad, const char* pname );
+	static	SecMan::sec_req 		sec_lookup_req( const ClassAd &ad, const char* pname );
+	static	SecMan::sec_feat_act 	sec_lookup_feat_act( const ClassAd &ad, const char* pname );
 
 		// For each auth level in config hierarchy, look up config value
 		// and return first one found.  Optionally, set param_name to the
@@ -171,9 +245,9 @@ public:
 
 	static	int 			sec_char_to_auth_method( char* method );
 
-	bool 					sec_copy_attribute( ClassAd &dest, ClassAd &source, const char* attr );
+	bool 					sec_copy_attribute( classad::ClassAd &dest, const ClassAd &source, const char* attr );
 
-	bool 					sec_copy_attribute( ClassAd &dest, const char *to_attr, ClassAd &source, const char *from_attr );
+	bool 					sec_copy_attribute( ClassAd &dest, const char *to_attr, const ClassAd &source, const char *from_attr );
 
 	bool		set_parent_unique_id(const char *v);
 	char*		my_parent_unique_id();
@@ -183,6 +257,8 @@ public:
 	static IpVerify *getIpVerify();
 	static int Verify(DCpermission perm, const condor_sockaddr& addr, const char * fqu, MyString *allow_reason=NULL, MyString *deny_reason=NULL );
 
+	static classad::References* getResumeProj() { return &m_resume_proj; };
+
 		// Create a security session from scratch (without doing any
 		// security negotation with the peer).  The session id and
 		// key will presumably be communicated to the peer using some
@@ -190,7 +266,12 @@ public:
 		// Setting duration=0 means the session never expires.  (In this case
 		// it should be explicitly deleted with invalidateKey() when it
 		// is no longer needed.)
-	bool CreateNonNegotiatedSecuritySession(DCpermission auth_level, char const *sesid,char const *private_key,char const *exported_session_info,char const *peer_fqu,char const *peer_sinful, int duration);
+		//
+		// If additional attributes should be copied into the session policy,
+		// these can be copied into the policy parameter:
+	bool CreateNonNegotiatedSecuritySession(DCpermission auth_level, char const *sesid, char const *private_key,
+		char const *exported_session_info, char const *peer_fqu, char const *peer_sinful, int duration,
+		classad::ClassAd *policy);
 
 		// Get security session info to send to our peer so that peer
 		// can create pre-built security session compatible with ours.
@@ -211,6 +292,8 @@ public:
 	bool SetSessionLingerFlag(char const *session_id);
 
  private:
+	void invalidateOneExpiredCache(KeyCache *session_cache);
+
     void                    remove_commands(KeyCacheEntry * keyEntry);
 
 	static char*		_my_unique_id;
@@ -218,6 +301,7 @@ public:
 	static bool			_should_check_env_for_unique_id;
 
 	static IpVerify *m_ipverify;
+	static classad::References m_resume_proj;
 
 	friend class SecManStartCommand;
 
@@ -227,6 +311,20 @@ public:
 		// of the session attributes produced by ExportSecSessionInfo
 		// and apply them while creating a session.
 	bool ImportSecSessionInfo(char const *session_info,ClassAd &policy);
+
+		// Once the authentication methods are known, fill in metadata from
+		// the relevant subclass; this may allow the remote client to skip a
+		// authentication which has no chance to succeed.
+	void UpdateAuthenticationMetadata(ClassAd &ad);
+
+	// Attributes for cached Security Policy Ad
+	DCpermission m_cached_auth_level;
+	bool m_cached_raw_protocol;
+	bool m_cached_use_tmp_sec_session;
+	bool m_cached_force_authentication;
+	ClassAd m_cached_policy_ad;
+	bool m_cached_return_value;
+
 };
 
 #endif

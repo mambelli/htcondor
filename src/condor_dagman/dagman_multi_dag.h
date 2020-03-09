@@ -26,6 +26,7 @@
 #ifndef DAGMAN_MULTI_DAG_H
 #define DAGMAN_MULTI_DAG_H
 
+#if 0 // Moved to dagman_utils
 	// The default maximum rescue DAG number.
 const int MAX_RESCUE_DAG_DEFAULT = 100;
 
@@ -33,9 +34,9 @@ const int MAX_RESCUE_DAG_DEFAULT = 100;
 	// is normally configured lower).
 const int ABS_MAX_RESCUE_DAG_NUM = 999;
 
-/** Get the configuration file, if any, specified by the given list of
-	DAG files.  If more than one DAG file specifies a configuration file,
-	they must specify the same file.
+/** Get the configuration file (if any) and the submit append commands
+	(if any), specified by the given list of DAG files.  If more than one
+	DAG file specifies a configuration file, they must specify the same file.
 	@param dagFiles: the list of DAG files
 	@param useDagDir: run DAGs in directories from DAG file paths 
 			if true
@@ -44,11 +45,12 @@ const int ABS_MAX_RESCUE_DAG_NUM = 999;
 			be set to that value before this method is called; the
 			value of configFile will be changed if it's not already
 			set and the DAG file(s) specify a configuration file
+	@param attrLines: a StringList to receive the submit attributes
 	@param errMsg: a MyString to receive any error message
 	@return true if the operation succeeded; otherwise false
 */
-bool GetConfigFile(/* const */ StringList &dagFiles, bool useDagDir,
-			MyString &configFile, MyString &errMsg);
+bool GetConfigAndAttrs( /* const */ StringList &dagFiles, bool useDagDir,
+			MyString &configFile, StringList &attrLines, MyString &errMsg );
 
 /** Make the given path into an absolute path, if it is not already.
 	@param filePath: the path to make absolute (filePath is changed)
@@ -100,5 +102,6 @@ MyString HaltFileName( const MyString &primaryDagFile );
 	@param pathname The path of the file to unlink
 */
 void tolerant_unlink( const char *pathname );
+#endif
 
 #endif /* #ifndef DAGMAN_MULTI_DAG_H */

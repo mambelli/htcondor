@@ -34,6 +34,7 @@ public:
 	~addrinfo_iterator();
 	addrinfo* next();
 	addrinfo_iterator& operator= (const addrinfo_iterator& rhs);
+	addrinfo_iterator & operator=(addrinfo_iterator &&rhs);
 	void reset();
 protected:
 	shared_context* cxt_;
@@ -44,15 +45,9 @@ protected:
 addrinfo get_default_hint();
 
 // will use default hint
-int ipv6_getaddrinfo(const char *node, const char *service, 
+int ipv6_getaddrinfo(const char *node, const char *service,
 		addrinfo_iterator& ai, const addrinfo& hint = get_default_hint());
 
-//addrinfo_iterator ipv6_getaddrinfo(const char *node, const char *service);
-//addrinfo_iterator ipv6_getaddrinfo2(const char *node, int port_no);	// port_no is host byte-order
-
 bool find_any_ipv4(addrinfo_iterator& ai, sockaddr_in& sin);
-
-//std::string ipv6_inet_ntop(struct sockaddr* sa);
-//std::string ipv6_inet_ntop(int family, const void* addr);
 
 #endif // IPV6_ADDRINFO_H

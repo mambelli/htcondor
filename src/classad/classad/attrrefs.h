@@ -61,6 +61,14 @@ class AttributeReference : public ExprTree
 		 */
 		void GetComponents( ExprTree *&expr,std::string &attr, bool &abs ) const;
 
+		/** Overwrite the components of an attribute reference
+		 * 	@param expr The expression part of the reference (NULL for
+		 * 		absolute or simple references)
+		 * 	@param attr The name of the attribute being referred to
+		 * 	@param abs  true iff the reference is absolute (i.e., .attr)
+		 */
+		bool SetComponents( ExprTree *expr, const std::string &attr, bool abs );
+
         /** Return a copy of this attribute reference.
          */
 		virtual ExprTree* Copy( ) const;
@@ -84,6 +92,8 @@ class AttributeReference : public ExprTree
          */
         friend bool operator==(const AttributeReference &ref1, const AttributeReference &ref2);
 
+		virtual const ClassAd *GetParentScope( ) const { return( parentScope ); }
+
 	protected:
 		/// Constructor
     	AttributeReference ();
@@ -96,6 +106,8 @@ class AttributeReference : public ExprTree
     	virtual bool _Evaluate( EvalState & , Value &, ExprTree*& ) const;
     	virtual bool _Flatten( EvalState&, Value&, ExprTree*&, int* ) const;
 		int	FindExpr( EvalState&, ExprTree*&, ExprTree*&, bool ) const;
+
+		const ClassAd *parentScope;
 
 		ExprTree	*expr;
 		bool		absolute;

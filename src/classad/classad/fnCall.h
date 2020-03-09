@@ -97,6 +97,13 @@ class FunctionCall : public ExprTree
 
 	static bool RegisterSharedLibraryFunctions(const char *shared_library_path);
 
+	/** Returns true if the function expression points to a valid
+	 *  function in the ClassAd library.
+	 */
+	bool FunctionIsDefined() const {return function != NULL;}
+
+	virtual const ClassAd *GetParentScope( ) const { return( parentScope ); }
+
  protected:
 	/// Constructor
 	FunctionCall ();
@@ -116,6 +123,8 @@ class FunctionCall : public ExprTree
     static FuncTable &getFunctionTable(void);
 	static bool		 initialized;
 	
+	const ClassAd *parentScope;
+
 	// function call specific information
 	std::string		functionName;
 	ClassAdFunc		function;

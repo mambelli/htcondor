@@ -36,7 +36,6 @@
 #include <math.h>
 
 // these are declared static in baseshadow.h; allocate space here
-WriteUserLog BaseShadow::uLog;
 BaseShadow* BaseShadow::myshadow_ptr = NULL;
 
 
@@ -72,14 +71,19 @@ BaseShadow::BaseShadow() {
 	m_cleanup_retry_tid = -1;
 	m_cleanup_retry_delay = 30;
 	m_RunAsNobody = false;
+	attemptingReconnectAtStartup = false;
+	m_force_fast_starter_shutdown = false;
+	m_committed_time_finalized = false;
 }
 
 BaseShadow::~BaseShadow() {
+	myshadow_ptr = NULL;
 	if (jobAd) FreeJobAd(jobAd);
 	if (gjid) free(gjid); 
 	if (scheddAddr) free(scheddAddr);
 	if( job_updater ) delete job_updater;
 	if (m_cleanup_retry_tid != -1) daemonCore->Cancel_Timer(m_cleanup_retry_tid);
+	free( core_file_name );
 }
 
 void
@@ -132,20 +136,12 @@ BaseShadow::baseInit( ClassAd *job_ad, const char* schedd_addr, const char *xfer
 
 		// construct the core file name we'd get if we had one.
 	MyString tmp_name = iwd;
-	tmp_name += DIR_DELIM_CHAR;
-	tmp_name += "core.";
-	tmp_name += cluster;
-	tmp_name += '.';
-	tmp_name += proc;
+	formatstr_cat( tmp_name, "%ccore.%d.%d", DIR_DELIM_CHAR, cluster, proc );
 	core_file_name = strdup( tmp_name.Value() );
 
         // put the shadow's sinful string into the jobAd.  Helpful for
         // the mpi shadow, at least...and a good idea in general.
-	MyString tmp_addr = ATTR_MY_ADDRESS;
-	tmp_addr += "=\"";
-	tmp_addr += daemonCore->InfoCommandSinfulString();
-	tmp_addr += '"';
-    if ( !jobAd->Insert( tmp_addr.Value() )) {
+    if ( !jobAd->Assign( ATTR_MY_ADDRESS, daemonCore->InfoCommandSinfulString() )) {
         EXCEPT( "Failed to insert %s!", ATTR_MY_ADDRESS );
     }
 
@@ -158,8 +154,11 @@ BaseShadow::baseInit( ClassAd *job_ad, const char* schedd_addr, const char *xfer
 
 	// handle system calls with Owner's privilege
 // XXX this belong here?  We'll see...
-	if ( !init_user_ids(owner.Value(), domain.Value())) {
-		dprintf(D_ALWAYS, "init_user_ids() failed as user %s\n",owner.Value() );
+	// Calling init_user_ids() while in user priv causes badness.
+	// Make sure we're in another priv state.
+	set_condor_priv();
+	if ( !init_user_ids(owner.c_str(), domain.c_str())) {
+		dprintf(D_ALWAYS, "init_user_ids() failed as user %s\n",owner.c_str() );
 		// uids.C will EXCEPT when we set_user_priv() now
 		// so there's not much we can do at this point
 		
@@ -169,14 +168,14 @@ BaseShadow::baseInit( ClassAd *job_ad, const char* schedd_addr, const char *xfer
 			dprintf(D_ALWAYS, "trying init_user_ids() as user nobody\n" );
 			
 			owner="nobody";
-			domain=NULL;
-			if (!init_user_ids(owner.Value(), domain.Value()))
+			domain="";
+			if (!init_user_ids(owner.c_str(), domain.c_str()))
 			{
 				dprintf(D_ALWAYS, "init_user_ids() failed!\n");
 			}
 			else
 			{
-				jobAd->Assign( ATTR_JOB_RUNAS_OWNER, "FALSE" );
+				jobAd->Assign( ATTR_JOB_RUNAS_OWNER, false );
 				m_RunAsNobody=true;
 				dprintf(D_ALWAYS, "init_user_ids() now running as user nobody\n");
 			}
@@ -230,19 +229,19 @@ BaseShadow::baseInit( ClassAd *job_ad, const char* schedd_addr, const char *xfer
 	}
 
 		// If we need to claim the startd before activating the claim
-	int wantClaiming = 0;
+	bool wantClaiming = false;
 	jobAd->LookupBool(ATTR_CLAIM_STARTD, wantClaiming);
 	if (wantClaiming) {
-		MyString startdSinful;
-		MyString claimid;
+		std::string startdSinful;
+		std::string claimid;
 
 			// Pull startd addr and claimid out of the jobad
 		jobAd->LookupString(ATTR_STARTD_IP_ADDR, startdSinful);
 		jobAd->LookupString(ATTR_CLAIM_ID, claimid);
 
-		dprintf(D_ALWAYS, "%s is true, trying to claim startd %s\n", ATTR_CLAIM_STARTD, startdSinful.Value());
+		dprintf(D_ALWAYS, "%s is true, trying to claim startd %s\n", ATTR_CLAIM_STARTD, startdSinful.c_str());
 
-		classy_counted_ptr<DCStartd> startd = new DCStartd("description", NULL, startdSinful.Value(), claimid.Value());
+		classy_counted_ptr<DCStartd> startd = new DCStartd("description", NULL, startdSinful.c_str(), claimid.c_str());
 	
 		classy_counted_ptr<DCMsgCallback> cb = 
 			new DCMsgCallback((DCMsgCallback::CppFunction)&BaseShadow::startdClaimedCB,
@@ -301,14 +300,14 @@ int BaseShadow::cdToIwd() {
 		p = set_root_priv();
 #endif
 	
-	if (chdir(iwd.Value()) < 0) {
+	if (chdir(iwd.c_str()) < 0) {
 		int chdir_errno = errno;
 		dprintf(D_ALWAYS, "\n\nPath does not exist.\n"
 				"He who travels without bounds\n"
 				"Can't locate data.\n\n" );
 		MyString hold_reason;
 		hold_reason.formatstr("Cannot access initial working directory %s: %s",
-		                    iwd.Value(), strerror(chdir_errno));
+		                    iwd.c_str(), strerror(chdir_errno));
 		dprintf( D_ALWAYS, "%s\n",hold_reason.Value());
 		holdJobAndExit(hold_reason.Value(),CONDOR_HOLD_CODE_IwdError,chdir_errno);
 		iRet = -1;
@@ -322,6 +321,12 @@ int BaseShadow::cdToIwd() {
 	return iRet;
 }
 
+
+void
+BaseShadow::shutDownFast( int reason ) {
+	m_force_fast_starter_shutdown = true;
+	shutDown( reason );
+}
 
 void
 BaseShadow::shutDown( int reason ) 
@@ -377,8 +382,22 @@ BaseShadow::reconnectFailed( const char* reason )
 	
 	logReconnectFailedEvent( reason );
 
+		// if the shadow was born disconnected, exit with 
+		// JOB_RECONNECT_FAILED so the schedd can make 
+		// an accurate restart report.  otherwise just
+		// exist with JOB_SHOULD_REQUEUE.
+	if ( attemptingReconnectAtStartup ) {
+		dprintf(D_ALWAYS,"Exiting with JOB_RECONNECT_FAILED\n");
 		// does not return
-	DC_Exit( JOB_SHOULD_REQUEUE );
+		DC_Exit( JOB_RECONNECT_FAILED );
+	} else {
+		dprintf(D_ALWAYS,"Exiting with JOB_SHOULD_REQUEUE\n");
+		// does not return
+		DC_Exit( JOB_SHOULD_REQUEUE );
+	}
+
+	// Should never get here....
+	ASSERT(true);
 }
 
 
@@ -389,12 +408,12 @@ BaseShadow::holdJob( const char* reason, int hold_reason_code, int hold_reason_s
 			 getCluster(), getProc(), hold_reason_code, hold_reason_subcode,reason );
 
 	if( ! jobAd ) {
-		dprintf( D_ALWAYS, "In HoldJob() w/ NULL JobAd!" );
+		dprintf( D_ALWAYS, "In HoldJob() w/ NULL JobAd!\n" );
 		DC_Exit( JOB_SHOULD_HOLD );
 	}
 
 		// cleanup this shadow (kill starters, etc)
-	cleanUp();
+	cleanUp( jobWantsGracefulRemoval() );
 
 		// Put the reason in our job ad.
 	jobAd->Assign( ATTR_HOLD_REASON, reason );
@@ -415,14 +434,19 @@ BaseShadow::holdJob( const char* reason, int hold_reason_code, int hold_reason_s
 void
 BaseShadow::holdJobAndExit( const char* reason, int hold_reason_code, int hold_reason_subcode )
 {
+	m_force_fast_starter_shutdown = true;
 	holdJob(reason,hold_reason_code,hold_reason_subcode);
 
-	// finally, exit and tell the schedd what to do
+	// Doing this neither prevents scary network-level error messages in
+	// the starter log, nor actually works: if the shadow doesn't exit
+	// here it exits later with a different error code that causes the job
+	// to be rescheduled.
+	// exitAfterEvictingJob( JOB_SHOULD_HOLD );
 	DC_Exit( JOB_SHOULD_HOLD );
 }
 
 void
-BaseShadow::mockTerminateJob( MyString exit_reason, 
+BaseShadow::mockTerminateJob( std::string exit_reason,
 		bool exited_by_signal, int exit_code, int exit_signal, 
 		bool core_dumped )
 {
@@ -439,7 +463,7 @@ BaseShadow::mockTerminateJob( MyString exit_reason,
 			 exit_code,
 			 exit_signal,
 			 core_dumped ? "TRUE" : "FALSE",
-			 exit_reason.Value());
+			 exit_reason.c_str());
 
 	if( ! jobAd ) {
 		dprintf(D_ALWAYS, "BaseShadow::mockTerminateJob(): NULL JobAd! "
@@ -470,23 +494,16 @@ BaseShadow::mockTerminateJob( MyString exit_reason,
 void BaseShadow::removeJobPre( const char* reason )
 {
 	if( ! jobAd ) {
-		dprintf( D_ALWAYS, "In removeJob() w/ NULL JobAd!" );
+		dprintf( D_ALWAYS, "In removeJob() w/ NULL JobAd!\n" );
 	}
 	dprintf( D_ALWAYS, "Job %d.%d is being removed: %s\n", 
 			 getCluster(), getProc(), reason );
 
 	// cleanup this shadow (kill starters, etc)
-	cleanUp();
+	cleanUp( jobWantsGracefulRemoval() );
 
 	// Put the reason in our job ad.
-	int size = strlen( reason ) + strlen( ATTR_REMOVE_REASON ) + 4;
-	char* buf = (char*)malloc( size * sizeof(char) );
-	if( ! buf ) {
-		EXCEPT( "Out of memory!" );
-	}
-	sprintf( buf, "%s=\"%s\"", ATTR_REMOVE_REASON, reason );
-	jobAd->Insert( buf );
-	free( buf );
+	jobAd->Assign( ATTR_REMOVE_REASON, reason );
 
 	emailRemoveEvent( reason );
 
@@ -502,9 +519,8 @@ void BaseShadow::removeJobPre( const char* reason )
 void BaseShadow::removeJob( const char* reason )
 {
 	this->removeJobPre(reason);
-	
-	// does not return.
-	DC_Exit( JOB_SHOULD_REMOVE );
+
+	exitAfterEvictingJob( JOB_SHOULD_REMOVE );
 }
 
 void
@@ -529,13 +545,12 @@ BaseShadow::retryJobCleanup( void )
 }
 
 
-int
+void
 BaseShadow::retryJobCleanupHandler( void )
 {
 	m_cleanup_retry_tid = -1;
 	dprintf(D_ALWAYS, "Retrying job cleanup, calling terminateJob()\n");
 	terminateJob();
-	return TRUE;
 }
 
 void
@@ -543,17 +558,15 @@ BaseShadow::terminateJob( update_style_t kind ) // has a default argument of US_
 {
 	int reason;
 	bool signaled;
-	MyString str;
 
 	if( ! jobAd ) {
-		dprintf( D_ALWAYS, "In terminateJob() w/ NULL JobAd!" );
+		dprintf( D_ALWAYS, "In terminateJob() w/ NULL JobAd!\n" );
 	}
 
 	/* The first thing we do is record that we are in a termination pending
 		state. */
 	if (kind == US_NORMAL) {
-		str.formatstr("%s = TRUE", ATTR_TERMINATION_PENDING);
-		jobAd->Insert(str.Value());
+		jobAd->Assign( ATTR_TERMINATION_PENDING, true );
 	}
 
 	if (kind == US_TERMINATE_PENDING) {
@@ -585,8 +598,7 @@ BaseShadow::terminateJob( update_style_t kind ) // has a default argument of US_
 
 		if (exited_by_signal == TRUE) {
 			reason = JOB_COREDUMPED;
-			str.formatstr("%s = \"%s\"", ATTR_JOB_CORE_FILENAME, core_file_name);
-			jobAd->Insert(str.Value());
+			jobAd->Assign( ATTR_JOB_CORE_FILENAME, core_file_name );
 		} else {
 			reason = JOB_EXITED;
 		}
@@ -616,8 +628,7 @@ BaseShadow::terminateJob( update_style_t kind ) // has a default argument of US_
 	/* also store the corefilename into the jobad so we can recover this 
 		during a termination pending scenario. */
 	if( reason == JOB_COREDUMPED ) {
-		str.formatstr("%s = \"%s\"", ATTR_JOB_CORE_FILENAME, getCoreName());
-		jobAd->Insert(str.Value());
+		jobAd->Assign( ATTR_JOB_CORE_FILENAME, getCoreName() );
 	}
 
     // Update final Job committed time
@@ -628,7 +639,7 @@ BaseShadow::terminateJob( update_style_t kind ) // has a default argument of US_
     int int_value = (last_ckpt_time > current_start_time) ?
                         last_ckpt_time : current_start_time;
 
-    if( int_value > 0 ) {
+    if( int_value > 0 && !m_committed_time_finalized ) {
         int job_committed_time = 0;
         jobAd->LookupInteger(ATTR_JOB_COMMITTED_TIME, job_committed_time);
 		int delta = (int)time(NULL) - int_value;
@@ -641,6 +652,8 @@ BaseShadow::terminateJob( update_style_t kind ) // has a default argument of US_
 		jobAd->LookupFloat(ATTR_COMMITTED_SLOT_TIME, slot_time);
 		slot_time += slot_weight * delta;
 		jobAd->Assign(ATTR_COMMITTED_SLOT_TIME, slot_time);
+
+		m_committed_time_finalized = true;
     }
 
 	CommitSuspensionTime(jobAd);
@@ -705,6 +718,15 @@ BaseShadow::evictJob( int reason )
 {
 	MyString from_where;
 	MyString machine;
+
+	// If we previously delayed exiting to let the starter wrap up, then
+	// immediately try exiting now. None of the cleanup below here is
+	// appropriate in that case.
+	if ( exitDelayed( reason ) ) {
+		exitAfterEvictingJob( reason );
+		return;
+	}
+
 	if( getMachineName(machine) ) {
 		from_where.formatstr(" from %s",machine.Value());
 	}
@@ -712,20 +734,18 @@ BaseShadow::evictJob( int reason )
 			 getCluster(), getProc(), from_where.Value() );
 
 	if( ! jobAd ) {
-		dprintf( D_ALWAYS, "In evictJob() w/ NULL JobAd!" );
+		dprintf( D_ALWAYS, "In evictJob() w/ NULL JobAd!\n" );
 		DC_Exit( reason );
 	}
 
 		// cleanup this shadow (kill starters, etc)
-	cleanUp();
+	cleanUp( jobWantsGracefulRemoval() );
 
 		// write stuff to user log:
 	logEvictEvent( reason );
 
 		// record the time we were vacated into the job ad 
-	char buf[64];
-	sprintf( buf, "%s = %d", ATTR_LAST_VACATE_TIME, (int)time(0) ); 
-	jobAd->Insert( buf );
+	jobAd->Assign( ATTR_LAST_VACATE_TIME, (int)time(0) );
 
 		// update the job ad in the queue with some important final
 		// attributes so we know what happened to the job when using
@@ -735,8 +755,7 @@ BaseShadow::evictJob( int reason )
 		dprintf( D_ALWAYS, "Failed to update job queue!\n" );
 	}
 
-		// does not return.
-	DC_Exit( reason );
+	exitAfterEvictingJob( reason );
 }
 
 
@@ -744,7 +763,7 @@ void
 BaseShadow::requeueJob( const char* reason )
 {
 	if( ! jobAd ) {
-		dprintf( D_ALWAYS, "In requeueJob() w/ NULL JobAd!" );
+		dprintf( D_ALWAYS, "In requeueJob() w/ NULL JobAd!\n" );
 	}
 	dprintf( D_ALWAYS, 
 			 "Job %d.%d is being put back in the job queue: %s\n", 
@@ -754,14 +773,7 @@ BaseShadow::requeueJob( const char* reason )
 	cleanUp();
 
 		// Put the reason in our job ad.
-	int size = strlen( reason ) + strlen( ATTR_REQUEUE_REASON ) + 4;
-	char* buf = (char*)malloc( size * sizeof(char) );
-	if( ! buf ) {
-		EXCEPT( "Out of memory!" );
-	}
-	sprintf( buf, "%s=\"%s\"", ATTR_REQUEUE_REASON, reason );
-	jobAd->Insert( buf );
-	free( buf );
+	jobAd->Assign( ATTR_REQUEUE_REASON, reason );
 
 		// write stuff to user log:
 	logRequeueEvent( reason );
@@ -774,8 +786,7 @@ BaseShadow::requeueJob( const char* reason )
 		dprintf( D_ALWAYS, "Failed to update job queue!\n" );
 	}
 
-		// does not return.
-	DC_Exit( JOB_SHOULD_REQUEUE );
+	exitAfterEvictingJob( JOB_SHOULD_REQUEUE );
 }
 
 
@@ -795,64 +806,23 @@ BaseShadow::emailRemoveEvent( const char* reason )
 }
 
 
-FILE*
-BaseShadow::emailUser( const char *subjectline )
-{
-	dprintf(D_FULLDEBUG, "BaseShadow::emailUser() called.\n");
-	if( !jobAd ) {
-		return NULL;
-	}
-	return email_user_open( jobAd, subjectline );
-}
-
-
 void BaseShadow::initUserLog()
 {
-	MyString logfilename,dagmanLogFile;
-	int  use_xml;
-
 		// we expect job_updater to already be initialized, in case we
 		// need to put the job on hold as a result of failure to open
 		// the log
 	ASSERT( job_updater );
 
-	std::vector<const char*> logfiles;
-	if ( getPathToUserLog(jobAd, logfilename) ) {
-		logfiles.push_back(logfilename.Value());
-		dprintf(D_FULLDEBUG, "%s = %s\n", ATTR_ULOG_FILE, logfilename.Value());	
-	}
-	if ( getPathToUserLog(jobAd, dagmanLogFile, ATTR_DAGMAN_WORKFLOW_LOG) ) {
-		logfiles.push_back(dagmanLogFile.Value());
-		dprintf(D_FULLDEBUG, "%s = %s\n", ATTR_DAGMAN_WORKFLOW_LOG, dagmanLogFile.Value());	
-	}
-	if( !logfiles.empty()) {
-		if( !uLog.initialize (logfiles, cluster, proc, 0, gjid)) {
-			MyString hold_reason;
-			hold_reason.formatstr("Failed to initialize user log to %s%s%s",
-				logfilename.Value(), logfiles.size() == 1 ? "" : " or ",
-				dagmanLogFile.Value());
-			dprintf( D_ALWAYS, "%s\n",hold_reason.Value());
-			holdJobAndExit(hold_reason.Value(),
-					CONDOR_HOLD_CODE_UnableToInitUserLog,0);
-				// holdJobAndExit() should not return, but just in case it does
-				// EXCEPT
-			EXCEPT("Failed to initialize user log: %s",hold_reason.Value());
-		}
-		uLog.setUseXML(jobAd->LookupBool(ATTR_ULOG_USE_XML, use_xml) &&
-			use_xml);
-		if(logfiles.size() > 1) {
-			MyString msk;
-			jobAd->LookupString(ATTR_DAGMAN_WORKFLOW_MASK, msk);
-			Tokenize(msk.Value());
-			dprintf(D_FULLDEBUG, "Mask is \"%s\"\n", msk.Value());
-			while(const char* mask = GetNextToken(",",true)) {
-				dprintf(D_FULLDEBUG, "Adding \"%s\" to mask\n",mask);
-				uLog.AddToMask(ULogEventNumber(atoi(mask)));
-			}
-		}
-	} else {
-		dprintf(D_FULLDEBUG, "no %s found\n", ATTR_ULOG_FILE);
-		dprintf(D_FULLDEBUG, "and no %s found\n", ATTR_DAGMAN_WORKFLOW_LOG);
+	if( !uLog.initialize(*jobAd) ) {
+		// TODO Should we keep inclusion of filename in hold message?
+		std::string hold_reason;
+		formatstr(hold_reason,"Failed to initialize user log");
+		dprintf( D_ALWAYS, "%s\n",hold_reason.c_str());
+		holdJobAndExit(hold_reason.c_str(),
+				CONDOR_HOLD_CODE_UnableToInitUserLog,0);
+			// holdJobAndExit() should not return, but just in case it does
+			// EXCEPT
+		EXCEPT("Failed to initialize user log: %s",hold_reason.c_str());
 	}
 }
 
@@ -896,7 +866,6 @@ static void set_usageAd (ClassAd* jobAd, ClassAd ** ppusageAd)
 	StringList reslist(resslist.c_str());
 	if (reslist.number() > 0) {
 		ClassAd * puAd = new ClassAd();
-		puAd->Clear(); // get rid of default "CurrentTime = time()" value.
 
 		reslist.rewind();
 		while (const char * resname = reslist.next()) {
@@ -906,7 +875,7 @@ static void set_usageAd (ClassAd* jobAd, ClassAd ** ppusageAd)
 			const int copy_ok = classad::Value::ERROR_VALUE | classad::Value::BOOLEAN_VALUE | classad::Value::INTEGER_VALUE | classad::Value::REAL_VALUE;
 			classad::Value value;
 			attr = res + "Provisioned";	 // provisioned value
-			if (jobAd->EvalAttr(attr.c_str(), NULL, value) && (value.GetType() & copy_ok) != 0) {
+			if (jobAd->EvaluateAttr(attr, value) && (value.GetType() & copy_ok) != 0) {
 				classad::ExprTree * plit = classad::Literal::MakeLiteral(value);
 				if (plit) {
 					puAd->Insert(resname, plit); // usage ad has attribs like they appear in Machine ad
@@ -914,20 +883,48 @@ static void set_usageAd (ClassAd* jobAd, ClassAd ** ppusageAd)
 			}
 			// /*for debugging*/ else { puAd->Assign(resname, 42); }
 			attr = "Request"; attr += res;   	// requested value
-			if (jobAd->EvalAttr(attr.c_str(), NULL, value)&& (value.GetType() & copy_ok) != 0) {
+			if (jobAd->EvaluateAttr(attr, value)&& (value.GetType() & copy_ok) != 0) {
 				classad::ExprTree * plit = classad::Literal::MakeLiteral(value);
 				if (plit) {
-					puAd->Insert(attr.c_str(), plit);
+					puAd->Insert(attr, plit);
 				}
 			}
-			// /*for debugging*/ else { puAd->Assign(attr.Value(), 99); }
-			attr = res + "Usage"; // usage value
-			if (jobAd->EvalAttr(attr.c_str(), NULL, value) && (value.GetType() & copy_ok) != 0) {
+			// /*for debugging*/ else { puAd->Assign(attr, 99); }
+
+			attr = res + "Usage"; // (implicitly) peak usage value
+			if (jobAd->EvaluateAttr(attr, value) && (value.GetType() & copy_ok) != 0) {
 				classad::ExprTree * plit = classad::Literal::MakeLiteral(value);
 				if (plit) {
-					puAd->Insert(attr.c_str(), plit);
+					puAd->Insert(attr, plit);
 				}
 			}
+
+			attr = res + "AverageUsage"; // average usage
+			if (jobAd->EvaluateAttr(attr, value) && (value.GetType() & copy_ok) != 0) {
+				classad::ExprTree * plit = classad::Literal::MakeLiteral(value);
+				if (plit) {
+					puAd->Insert(attr, plit);
+				}
+			}
+
+			attr = res + "MemoryUsage"; // special case for GPUs.
+			if (jobAd->EvaluateAttr(attr, value) && (value.GetType() & copy_ok) != 0) {
+				classad::ExprTree * plit = classad::Literal::MakeLiteral(value);
+				if (plit) {
+					puAd->Insert(attr, plit);
+				}
+			}
+
+			attr = res + "MemoryAverageUsage"; // just in case.
+			if (jobAd->EvaluateAttr(attr, value) && (value.GetType() & copy_ok) != 0) {
+				classad::ExprTree * plit = classad::Literal::MakeLiteral(value);
+				if (plit) {
+					puAd->Insert(attr, plit);
+				}
+			}
+
+			attr = "Assigned"; attr += res;
+			CopyAttribute( attr, *puAd, *jobAd );
 		}
 		*ppusageAd = puAd;
 	}
@@ -939,7 +936,7 @@ BaseShadow::logTerminateEvent( int exitReason, update_style_t kind )
 {
 	struct rusage run_remote_rusage;
 	JobTerminatedEvent event;
-	MyString corefile;
+	std::string corefile;
 
 	memset( &run_remote_rusage, 0, sizeof(struct rusage) );
 
@@ -983,23 +980,24 @@ BaseShadow::logTerminateEvent( int exitReason, update_style_t kind )
 
 		event.run_remote_rusage = run_remote_rusage;
 		event.total_remote_rusage = run_remote_rusage;
-	
+
 		/*
-		  we want to log the events from the perspective of the user
-		  job, so if the shadow *sent* the bytes, then that means the
-		  user job *received* the bytes
+		  Both the job ad and the terminated event record bytes
+		  transferred from the perspective of the job, not the shadow.
 		*/
-		jobAd->LookupFloat(ATTR_BYTES_SENT, event.recvd_bytes);
-		jobAd->LookupFloat(ATTR_BYTES_RECVD, event.sent_bytes);
+		jobAd->LookupFloat(ATTR_BYTES_RECVD, event.recvd_bytes);
+		jobAd->LookupFloat(ATTR_BYTES_SENT, event.sent_bytes);
 
 		event.total_recvd_bytes = event.recvd_bytes;
 		event.total_sent_bytes = event.sent_bytes;
-	
+
 		if( exited_by_signal == TRUE ) {
 			jobAd->LookupString(ATTR_JOB_CORE_FILENAME, corefile);
-			event.setCoreFile( corefile.Value() );
+			event.setCoreFile( corefile.c_str() );
 		}
 
+		classad::ClassAd * toeTag = dynamic_cast<classad::ClassAd *>(jobAd->Lookup(ATTR_JOB_TOE));
+		event.setToeTag( toeTag );
 		if (!uLog.writeEvent (&event,jobAd)) {
 			dprintf (D_ALWAYS,"Unable to log "
 				 	"ULOG_JOB_TERMINATED event\n");
@@ -1012,7 +1010,7 @@ BaseShadow::logTerminateEvent( int exitReason, update_style_t kind )
 	// the default kind == US_NORMAL path
 
 	run_remote_rusage = getRUsage();
-	
+
 	if( exitedBySignal() ) {
 		event.normal = false;
 		event.signalNumber = exitSignal();
@@ -1053,34 +1051,37 @@ BaseShadow::logTerminateEvent( int exitReason, update_style_t kind )
 	if (reslist.number() > 0) {
 		int64_t int64_value = 0;
 		ClassAd * puAd = new ClassAd();
-		puAd->Clear(); // get rid of default "CurrentTime = time()" value.
 
 		reslist.rewind();
 		char * resname = NULL;
 		while ((resname = reslist.next()) != NULL) {
-			MyString attr;
+			std::string attr;
 			int64_value = -1;
-			attr.formatstr("%s", resname); // provisioned value
-			if (jobAd->LookupInteger(attr.Value(), int64_value)) {
-				puAd->Assign(resname, int64_value);
+			attr = resname; // provisioned value
+			if (jobAd->LookupInteger(attr, int64_value)) {
+				puAd->Assign(attr, int64_value);
 			} 
-			// /*for debugging*/ else { puAd->Assign(resname, 42); }
+			// /*for debugging*/ else { puAd->Assign(attr, 42); }
 			int64_value = -2;
-			attr.formatstr("Request%s", resname);	// requested value
-			if (jobAd->LookupInteger(attr.Value(), int64_value)) {
-				puAd->Assign(attr.Value(), int64_value);
+			attr = "Request";
+			attr += resname; // requested value
+			if (jobAd->LookupInteger(attr, int64_value)) {
+				puAd->Assign(attr, int64_value);
 			}
-			// /*for debugging*/ else { puAd->Assign(attr.Value(), 99); }
+			// /*for debugging*/ else { puAd->Assign(attr, 99); }
 			int64_value = -3;
-			attr.formatstr("%sUsage", resname); // usage value
-			if (jobAd->LookupInteger(attr.Value(), int64_value)) {
-				puAd->Assign(attr.Value(), int64_value);
+			attr = resname;
+			attr += "Usage"; // usage value
+			if (jobAd->LookupInteger(attr, int64_value)) {
+				puAd->Assign(attr, int64_value);
 			}
 		}
 		event.pusageAd = puAd;
 	}
 #endif
-	
+
+	classad::ClassAd * toeTag = dynamic_cast<classad::ClassAd *>(jobAd->Lookup(ATTR_JOB_TOE));
+	event.setToeTag( toeTag );
 	if (!uLog.writeEvent (&event,jobAd)) {
 		dprintf (D_ALWAYS,"Unable to log "
 				 "ULOG_JOB_TERMINATED event\n");
@@ -1104,7 +1105,7 @@ BaseShadow::logEvictEvent( int exitReason )
 		break;
 	default:
 		dprintf( D_ALWAYS, 
-				 "logEvictEvent with unknown reason (%d), aborting\n",
+				 "logEvictEvent with unknown reason (%d), not logging.\n",
 				 exitReason ); 
 		return;
 	}
@@ -1181,6 +1182,16 @@ BaseShadow::logRequeueEvent( const char* reason )
 	}
 }
 
+void
+BaseShadow::logDataflowJobSkippedEvent()
+{
+	DataflowJobSkippedEvent event;
+	if (!uLog.writeEvent (&event, jobAd)) {
+		dprintf( D_ALWAYS, "Unable to log ULOG_DATAFLOW_JOB_SKIPPED "
+				 "(and requeued) event\n" );
+	}
+}
+
 
 void
 BaseShadow::checkSwap( void )
@@ -1212,36 +1223,36 @@ BaseShadow::checkSwap( void )
 void
 BaseShadow::log_except(const char *msg)
 {
+	if(!msg) msg = "";
+
+	if ( BaseShadow::myshadow_ptr == NULL ) {
+		::dprintf (D_ALWAYS, "Unable to log ULOG_SHADOW_EXCEPTION event (no Shadow object): %s\n", msg);
+		return;
+	}
+
 	// log shadow exception event
 	ShadowExceptionEvent event;
 	bool exception_already_logged = false;
 
-	if(!msg) msg = "";
 	snprintf(event.message, sizeof(event.message), "%s", msg);
 	event.message[sizeof(event.message)-1] = '\0';
 
-	if ( BaseShadow::myshadow_ptr ) {
-		BaseShadow *shadow = BaseShadow::myshadow_ptr;
+	BaseShadow *shadow = BaseShadow::myshadow_ptr;
 
-		// we want to log the events from the perspective of the
-		// user job, so if the shadow *sent* the bytes, then that
-		// means the user job *received* the bytes
-		event.recvd_bytes = shadow->bytesSent();
-		event.sent_bytes = shadow->bytesReceived();
-		exception_already_logged = shadow->exception_already_logged;
+	// we want to log the events from the perspective of the
+	// user job, so if the shadow *sent* the bytes, then that
+	// means the user job *received* the bytes
+	event.recvd_bytes = shadow->bytesSent();
+	event.sent_bytes = shadow->bytesReceived();
+	exception_already_logged = shadow->exception_already_logged;
 
-		if (shadow->began_execution) {
-			event.began_execution = TRUE;
-		}
-
-	} else {
-		event.recvd_bytes = 0.0;
-		event.sent_bytes = 0.0;
+	if (shadow->began_execution) {
+		event.began_execution = TRUE;
 	}
 
-	if (!exception_already_logged && !uLog.writeEventNoFsync (&event,NULL))
+	if (!exception_already_logged && !shadow->uLog.writeEventNoFsync (&event,NULL))
 	{
-		::dprintf (D_ALWAYS, "Unable to log ULOG_SHADOW_EXCEPTION event\n");
+		::dprintf (D_ALWAYS, "Failed to log ULOG_SHADOW_EXCEPTION event: %s\n", msg);
 	}
 }
 
@@ -1317,6 +1328,7 @@ BaseShadow::updateJobInQueue( update_t type )
 		break;
 	}
 
+	recordFileTransferStateChanges( jobAd, & ftAd );
 	MergeClassAdsCleanly(jobAd,&ftAd);
 
 	ASSERT( job_updater );
@@ -1333,7 +1345,7 @@ BaseShadow::updateJobInQueue( update_t type )
 		// Note that we force a non-durable update for X509 updates; if the
 		// schedd crashes, we don't really care when the proxy was updated
 		// on the worker node.
-	return job_updater->updateJob( type, (type == U_PERIODIC) ? NONDURABLE : 0 );
+	return job_updater->updateJob( type, 0 );
 }
 
 
@@ -1378,7 +1390,7 @@ BaseShadow::resourceBeganExecution( RemoteResource* /* rr */ )
 		// hear from the starter, the semantics are about as solid as
 		// we can hope for, but it's a schedd scalability problem.  If
 		// we do a lazy update, there's no additional cost to the
-		// schedd, but it means that condor_q and quill won't see the
+		// schedd, but it means that condor_q won't see the
 		// change for N minutes, and if we happen to crash during that
 		// time, the attribute is never incremented.  However, the
 		// semantics aren't 100% solid, even if we don't update lazy,
@@ -1418,26 +1430,13 @@ BaseShadow::startQueueUpdateTimer( void )
 void
 BaseShadow::publishShadowAttrs( ClassAd* ad )
 {
-	MyString tmp;
-	tmp = ATTR_SHADOW_IP_ADDR;
-	tmp += "=\"";
-	tmp += daemonCore->InfoCommandSinfulString();
-    tmp += '"';
-	ad->Insert( tmp.Value() );
+	ad->Assign( ATTR_SHADOW_IP_ADDR, daemonCore->InfoCommandSinfulString() );
 
-	tmp = ATTR_SHADOW_VERSION;
-	tmp += "=\"";
-	tmp += CondorVersion();
-    tmp += '"';
-	ad->Insert( tmp.Value() );
+	ad->Assign( ATTR_SHADOW_VERSION, CondorVersion() );
 
 	char* my_uid_domain = param( "UID_DOMAIN" );
 	if( my_uid_domain ) {
-		tmp = ATTR_UID_DOMAIN;
-		tmp += "=\"";
-		tmp += my_uid_domain;
-		tmp += '"';
-		ad->Insert( tmp.Value() );
+		ad->Assign( ATTR_UID_DOMAIN, my_uid_domain );
 		free( my_uid_domain );
 	}
 }
@@ -1532,6 +1531,9 @@ BaseShadow::handleUpdateJobAd( int sig )
 bool
 BaseShadow::jobWantsGracefulRemoval()
 {
+	if ( m_force_fast_starter_shutdown ) {
+		return false;
+	}
 	bool job_wants_graceful_removal = param_boolean("GRACEFULLY_REMOVE_JOBS", true);
 	bool job_request;
 	ClassAd *thejobAd = getJobAd();

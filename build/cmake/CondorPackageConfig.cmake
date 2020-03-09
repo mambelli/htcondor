@@ -1,3 +1,4 @@
+
  ###############################################################
  #
  # Copyright 2011 Red Hat, Inc.
@@ -35,14 +36,18 @@ if(PRE_RELEASE)
   if(BUILDID)
     CLEAN_STRING( CLEAN_BUILDID "${BUILDID}" )
     set (CONDOR_PACKAGE_NAME "${PACKAGE_NAME}-${PACKAGE_VERSION}-${CLEAN_BUILDID}")
+    set (CONDOR_TEST_PACKAGE_NAME "${TEST_PACKAGE_NAME}-${PACKAGE_VERSION}-${CLEAN_BUILDID}")
   elseif(BUILD_DATETIME)
     set (CONDOR_PACKAGE_NAME "${PACKAGE_NAME}-${PACKAGE_VERSION}-${BUILD_TIMEDATE}")
+    set (CONDOR_TEST_PACKAGE_NAME "${TEST_PACKAGE_NAME}-${PACKAGE_VERSION}-${BUILD_TIMEDATE}")
   else()
     CLEAN_STRING( CLEAN_RELEASE "${PRE_RELEASE}" )
     set (CONDOR_PACKAGE_NAME "${PACKAGE_NAME}-${PACKAGE_VERSION}-${CLEAN_RELEASE}")
+    set (CONDOR_TEST_PACKAGE_NAME "${TEST_PACKAGE_NAME}-${PACKAGE_VERSION}-${CLEAN_RELEASE}")
   endif(BUILDID)
 else()
   set (CONDOR_PACKAGE_NAME "${CONDOR_VERSION}")
+  set (CONDOR_TEST_PACKAGE_NAME "${TEST_PACKAGE_NAME}-${CONDOR_VERSION}")
 endif()
 
 set (CPACK_PACKAGE_DESCRIPTION "Condor is a specialized workload management system for
@@ -85,16 +90,20 @@ set(CPACK_SOURCE_STRIP_FILES TRUE)
 # here is where we can
 if (PLATFORM)
   set (CPACK_PACKAGE_FILE_NAME "${CONDOR_PACKAGE_NAME}-${PLATFORM}" )
+  set (CPACK_TEST_PACKAGE_FILE_NAME "${CONDOR_TEST_PACKAGE_NAME}-${PLATFORM}" )
 elseif(SYSTEM_NAME)
   set (CPACK_PACKAGE_FILE_NAME "${CONDOR_PACKAGE_NAME}-${SYSTEM_NAME}" )
+  set (CPACK_TEST_PACKAGE_FILE_NAME "${CONDOR_TEST_PACKAGE_NAME}-${SYSTEM_NAME}" )
 else()
   set (CPACK_PACKAGE_FILE_NAME "${CONDOR_PACKAGE_NAME}-${OS_NAME}-${SYS_ARCH}" )
+  set (CPACK_TEST_PACKAGE_FILE_NAME "${CONDOR_TEST_PACKAGE_NAME}-${OS_NAME}-${SYS_ARCH}" )
 endif()
 
 # you can enable/disable file stripping.
 option(CONDOR_STRIP_PACKAGES "Enables stripping of packaged binaries" ON)
 set(CPACK_STRIP_FILES ${CONDOR_STRIP_PACKAGES})
 if (NOT CONDOR_STRIP_PACKAGES)
+  set (PACKAGE_REVISION "${PACKAGE_REVISION}+symbols" )
   set (CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}-unstripped" )
 else()
   set (CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}-stripped" )
@@ -108,6 +117,9 @@ endif()
 #option used to enable/disable make package for rpm/deb with different install paths
 option(CONDOR_PACKAGE_BUILD "Enables a package build" OFF)
 
+#option used to control RPATH when using rpmbuild directly
+option(CONDOR_RPMBUILD "Whether rpmbuild is being used to build HTCondor" OFF)
+
 # 1st set the location of the install targets, these are the defaults for
 set( C_BIN			bin)
 set( C_LIB			lib)
@@ -117,6 +129,7 @@ set( C_LIBEXEC		libexec )
 set( C_SBIN			sbin)
 
 set( C_PYTHONARCHLIB lib/python)
+set( C_PYTHON3ARCHLIB lib/python3)
 
 set( C_INCLUDE		include)
 set( C_INCLUDE_PUBLIC		include)
@@ -152,20 +165,35 @@ set ( CPACK_GENERATOR "TGZ" )
 if ( ${OS_NAME} STREQUAL "LINUX" )
 	set( EXTERNALS_LIB "${C_LIB}/condor" )
 	if (${BIT_MODE} MATCHES "32" OR ${SYS_ARCH} MATCHES "IA64" )
-		if ( ${SYSTEM_NAME} MATCHES "rhel3" )
-			message (FATAL_ERROR "ERROR: RHEL3 is EOL you are trying to build new packages on a deprecated platform")
-		else()
-			set( CONDOR_RPATH "$ORIGIN/../lib:/lib:/usr/lib:$ORIGIN/../lib/condor" )
-			set( EXTERNALS_RPATH "$ORIGIN/../lib:/lib:/usr/lib:$ORIGIN/../lib/condor:/usr/lib/condor" )
-			set( PYTHON_RPATH "$ORIGIN/../:/lib:/usr/lib:$ORIGIN/../condor" )
-		endif()
+		set( CONDOR_RPATH "$ORIGIN/../lib:/lib:/usr/lib:$ORIGIN/../lib/condor:/usr/lib/condor" )
+		set( EXTERNALS_RPATH "$ORIGIN/../lib:/lib:/usr/lib:$ORIGIN/../lib/condor:/usr/lib/condor" )
+		set( PYTHON_RPATH "$ORIGIN/../../:/lib:/usr/lib:$ORIGIN/../../condor" )
 	else()
-		set( CONDOR_RPATH "$ORIGIN/../lib:/lib64:/usr/lib64:$ORIGIN/../lib/condor" )
+		set( CONDOR_RPATH "$ORIGIN/../lib:/lib64:/usr/lib64:$ORIGIN/../lib/condor:/usr/lib64/condor" )
 		set( EXTERNALS_RPATH "$ORIGIN/../lib:/lib64:/usr/lib64:$ORIGIN/../lib/condor:/usr/lib64/condor" )
-		set( PYTHON_RPATH "$ORIGIN/../:/lib64:/usr/lib64:$ORIGIN/../condor" )
+        if ( ${SYSTEM_NAME} MATCHES "rhel7" OR ${SYSTEM_NAME} MATCHES "centos7" OR ${SYSTEM_NAME} MATCHES "sl7")
+            set( PYTHON_RPATH "$ORIGIN/../../:/usr/lib64/boost169:/lib64:/usr/lib64:$ORIGIN/../../condor" )
+        else()
+            set( PYTHON_RPATH "$ORIGIN/../../:/lib64:/usr/lib64:$ORIGIN/../../condor" )
+        endif()
 	endif()
 elseif( ${OS_NAME} STREQUAL "DARWIN" )
 	set( EXTERNALS_LIB "${C_LIB}/condor" )
+endif()
+
+# Use the limited RPATH when building directly with RPM
+if ( CONDOR_RPMBUILD )
+	if (${BIT_MODE} MATCHES "32" OR ${SYS_ARCH} MATCHES "IA64" )
+	    set( CONDOR_RPATH "/usr/lib:/usr/lib/condor" )
+	    set( PYTHON_RPATH "/usr/lib/condor" )
+	else()
+	    set( CONDOR_RPATH "/usr/lib64:/usr/lib64/condor" )
+        if ( ${SYSTEM_NAME} MATCHES "rhel7" OR ${SYSTEM_NAME} MATCHES "centos7" OR ${SYSTEM_NAME} MATCHES "sl7")
+            set( PYTHON_RPATH "/usr/lib64/condor:/usr/lib64/boost169" )
+        else()
+            set( PYTHON_RPATH "/usr/lib64/condor" )
+        endif()
+	endif ()
 endif()
 
 #this needs to be evaluated in order due to WIN collision.
@@ -173,6 +201,23 @@ if(${OS_NAME} STREQUAL "DARWIN")
 	# enable if we desire native packaging.
 	# set ( CPACK_GENERATOR "${CPACK_GENERATOR};PackageMaker" ) ;
 	# set (CPACK_OSX_PACKAGE_VERSION)
+
+elseif ( ${OS_NAME} STREQUAL "FREEBSD" )
+
+	# Condor installs nothing useful to FreeBSD in C_INIT, so
+	# just tuck it out of the way.  FreeBSD RC scripts come from
+	# the port's "files" directory.
+	set( C_INIT		etc/condor )
+	set( C_ETC		etc/condor )
+	set( C_CONFIGD		etc/condor/config.d )
+	set( C_SYSCONFIG	etc/condor/sysconfig )
+	
+	set( C_ETC_EXAMPLES	etc/condor/examples )
+	# Condor installs an "examples" directory into C_SHARE_EXAMPLES
+	# so set it to share/condor instead of share/condor/examples.
+	set( C_SHARE_EXAMPLES	share/examples/condor )
+	set( C_DOC		share/doc/condor )
+	
 elseif ( ${OS_NAME} MATCHES "WIN" )
 
 	# override for windows.
@@ -186,6 +231,7 @@ elseif ( ${OS_NAME} MATCHES "WIN" )
 	set (CPACK_INCLUDE_TOPLEVEL_DIRECTORY 0)
 	set (CPACK_PACKAGE_INSTALL_DIRECTORY "${CONDOR_PACKAGE_NAME}")
 	set (CPACK_PACKAGE_FILE_NAME "${CONDOR_PACKAGE_NAME}")
+	set (CPACK_TEST_PACKAGE_FILE_NAME "${CONDOR_TEST_PACKAGE_NAME}")
 	set (CPACK_PACKAGE_INSTALL_REGISTRY_KEY "${CONDOR_VERSION}")
 
 	############################################################
@@ -217,7 +263,7 @@ elseif ( ${OS_NAME} MATCHES "WIN" )
 		set (VC_CRT_MSM Microsoft_VC90_CRT_x86.msm)
 		find_file( CPACK_VC_POLICY_MODULE 
 			policy_9_0_Microsoft_VC90_CRT_x86.msm
-               		"C:/Program Files/Common Files/Merge Modules";"C:/Program Files (x86)/Common Files/Merge Modules" )
+               		"C:/Program Files/Common Files/Merge Modules" "C:/Program Files (x86)/Common Files/Merge Modules" )
 		set (WIX_MERGE_MODLES "<Merge Id=\"VCPolicy\" Language=\"1033\" DiskId=\"1\" SourceFile=\"${CPACK_VC_POLICY_MODULE}\"/>")
 		set (WIX_MERGE_REFS "<MergeRef Id=\"VCPolicy\"/>")
 		set (MSVCVER vc90)
@@ -227,9 +273,21 @@ elseif ( ${OS_NAME} MATCHES "WIN" )
 		set (MSVCVER vc100)
 		set (MSVCVERNUM 10.0)
 	elseif(MSVC11)
-		set (VC_CRT_MSM Microsoft_VC110_CRT_x86.msm)
+		if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+			set (VC_CRT_MSM Microsoft_VC110_CRT_x64.msm)
+		else()
+			set (VC_CRT_MSM Microsoft_VC110_CRT_x86.msm)
+		endif()
 		set (MSVCVER vc110)
 		set (MSVCVERNUM 11.0)
+	elseif(MSVC14)
+		if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+			set (VC_CRT_MSM Microsoft_VC140_CRT_x64.msm)
+		else()
+			set (VC_CRT_MSM Microsoft_VC140_CRT_x86.msm)
+		endif()
+		set (MSVCVER vc140)
+		set (MSVCVERNUM 14.0)
 	else()
 		message(FATAL_ERROR "unsupported compiler version")
 	endif()
@@ -237,7 +295,7 @@ elseif ( ${OS_NAME} MATCHES "WIN" )
 	# look for the all important C-runtime
 	find_file( CPACK_VC_MERGE_MODULE 
 		${VC_CRT_MSM}
-		"C:/Program Files/Common Files/Merge Modules";"C:/Program Files (x86)/Common Files/Merge Modules" )
+		"C:/Program Files/Common Files/Merge Modules" "C:/Program Files (x86)/Common Files/Merge Modules" )
 
 	set (WIX_MERGE_MODLES "<Merge Id=\"VCCRT\" Language=\"1033\" DiskId=\"1\" SourceFile=\"${CPACK_VC_MERGE_MODULE}\"/>\n${WIX_MERGE_MODLES}")
 	set (WIX_MERGE_REFS "<MergeRef Id=\"VCCRT\"/>\n${WIX_MERGE_REFS}")
@@ -260,12 +318,10 @@ elseif ( ${OS_NAME} MATCHES "WIN" )
 	file( WRITE ${WINVER} "#define CONDOR_VERSION \"${PACKAGE_VERSION}\"\n")
 	#file( APPEND ${WINVER} "#define CONDOR_BLAH \"${YOUR_VAR}\"\n")
 
-	option(WIN_EXEC_NODE_ONLY "Minimal Package Win exec node only" OFF)
-
 	# below are options an overrides to enable packge generation for rpm & deb
 elseif( ${OS_NAME} STREQUAL "LINUX" AND CONDOR_PACKAGE_BUILD )
 
-	execute_process( COMMAND python -c "import distutils.sysconfig; import sys; sys.stdout.write(distutils.sysconfig.get_python_lib(1)[1:])" OUTPUT_VARIABLE C_PYTHONARCHLIB)
+	execute_process( COMMAND python -c "import distutils.sysconfig; import sys; sys.stdout.write(distutils.sysconfig.get_python_lib(1))" OUTPUT_VARIABLE C_PYTHONARCHLIB)
 
 	# it's a smaller subset easier to differentiate.
 	# check the operating system name
@@ -288,13 +344,16 @@ elseif( ${OS_NAME} STREQUAL "LINUX" AND CONDOR_PACKAGE_BUILD )
 		set (CPACK_PACKAGE_FILE_NAME "${CONDOR_PACKAGE_NAME}-${PACKAGE_REVISION}-${DEB_SYSTEM_NAME}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}" )
 		string( TOLOWER "${CPACK_PACKAGE_FILE_NAME}" CPACK_PACKAGE_FILE_NAME )
 
+		set (CPACK_TEST_PACKAGE_FILE_NAME "${CONDOR_TEST_PACKAGE_NAME}-${PACKAGE_REVISION}-${DEB_SYSTEM_NAME}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}" )
+		string( TOLOWER "${CPACK_TEST_PACKAGE_FILE_NAME}" CPACK_TEST_PACKAGE_FILE_NAME )
+
 		set ( CPACK_DEBIAN_PACKAGE_SECTION "contrib/misc")
 		set ( CPACK_DEBIAN_PACKAGE_PRIORITY "extra")
 		set ( CPACK_DEBIAN_PACKAGE_DESCRIPTION "${CPACK_DEBIAN_DESCRIPTION_SUMMARY}")
 		set ( CPACK_DEBIAN_PACKAGE_MAINTAINER "Condor Team <${CPACK_PACKAGE_CONTACT}>" )
 		set ( CPACK_DEBIAN_PACKAGE_VERSION "${PACKAGE_VERSION}-${PACKAGE_REVISION}")
 		set ( CPACK_DEBIAN_PACKAGE_HOMEPAGE "${URL}")
-		set ( CPACK_DEBIAN_PACKAGE_DEPENDS "python, adduser, libdate-manip-perl")
+		set ( CPACK_DEBIAN_PACKAGE_DEPENDS "python, adduser, libdate-manip-perl, ecryptfs-utils")
 
 		#Control files
 		set( CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
@@ -354,6 +413,9 @@ elseif( ${OS_NAME} STREQUAL "LINUX" AND CONDOR_PACKAGE_BUILD )
 		set (CPACK_PACKAGE_FILE_NAME "${CONDOR_PACKAGE_NAME}-${PACKAGE_REVISION}.${RPM_SYSTEM_NAME}.${SYS_ARCH}" )
 		string( TOLOWER "${CPACK_PACKAGE_FILE_NAME}" CPACK_PACKAGE_FILE_NAME )
 
+		set (CPACK_TEST_PACKAGE_FILE_NAME "${CONDOR_TEST_PACKAGE_NAME}-${PACKAGE_REVISION}.${RPM_SYSTEM_NAME}.${SYS_ARCH}" )
+		string( TOLOWER "${CPACK_TEST_PACKAGE_FILE_NAME}" CPACK_TEST_PACKAGE_FILE_NAME )
+
 		set ( CPACK_RPM_PACKAGE_RELEASE ${PACKAGE_REVISION})
 		set ( CPACK_RPM_PACKAGE_GROUP "Applications/System")
 		set ( CPACK_RPM_PACKAGE_LICENSE "Apache License, Version 2.0")
@@ -406,10 +468,12 @@ elseif( ${OS_NAME} STREQUAL "LINUX" AND CONDOR_PACKAGE_BUILD )
 		set(CMAKE_INSTALL_PREFIX "")
 		set(CPACK_SET_DESTDIR "ON")
 
+		set(CPACK_PACKAGE_RELOCATABLE "OFF")
+
 	endif()
 
 	set( EXTERNALS_LIB "${C_LIB}" )
-	set( CONDOR_RPATH "/${C_LIB}" )
+	set( CONDOR_RPATH "/${C_LIB_PUBLIC}:/${C_LIB}" )
 	set( PYTHON_RPATH "/${C_LIB}" )
 
 	# Generate empty folder to ship with package

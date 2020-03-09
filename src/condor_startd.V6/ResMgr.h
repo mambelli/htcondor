@@ -63,6 +63,10 @@ typedef void (Resource::*ResourceMaskMember)(amask_t);
 typedef void (Resource::*VoidResourceMember)();
 typedef int (*ComparisonFunc)(const void *, const void *);
 
+namespace htcondor {
+class DataReuseDirectory;
+}
+
 // Statistics to publish global to the startd
 class StartdStats {
 public:
@@ -72,6 +76,8 @@ public:
 	stats_entry_recent<int>	total_rank_preemptions;
 	stats_entry_recent<int>	total_user_prio_preemptions;
 	stats_entry_recent<int>	total_job_starts;
+	stats_entry_recent<Probe> job_busy_time;
+	stats_entry_recent<Probe> job_duration;
 
 	time_t init_time;
 	time_t lifetime;
@@ -90,11 +96,24 @@ public:
 		pool.AddProbe("JobUserPrioPreemptions", &total_user_prio_preemptions);
 		pool.AddProbe("JobStarts", &total_job_starts);
 
+		// publish two Miron probes, showing only XXXCount if count is zero, and
+		// also XXXMin, XXXMax and XXXAvg if count is non-zero
+		const int flags = stats_entry_recent<Probe>::PubValueAndRecent | ProbeDetailMode_CAMM | IF_NONZERO | IF_VERBOSEPUB;
+		pool.AddProbe("JobBusyTime", &job_busy_time, NULL, flags);
+		pool.AddProbe("JobDuration", &job_duration, NULL, flags);
+
+		// for probes to be published if they are in the whitelist
+		std::string strWhitelist;
+		if (param(strWhitelist, "STATISTICS_TO_PUBLISH_LIST")) {
+			pool.SetVerbosities(strWhitelist.c_str(), 0, true);
+		}
+
+
 		pool.SetRecentMax(recent_window, window_quantum);
 	}
 
 	void Publish(ClassAd &ad, int flags) const {
-		pool.Publish(ad, flags);	
+		pool.Publish(ad, flags);
 	}
 
 	void Tick(time_t now) {
@@ -174,13 +193,19 @@ public:
 
 	// Manipulate the supplemental Class Ad list
 	int		adlist_register( StartdNamedClassAd *ad );
-	int		adlist_replace( const char *name, const char *prefix, ClassAd *ad, 
-							bool report_diff = false );
-	int		adlist_delete( const char *name );
-	int		adlist_publish( unsigned r_id, ClassAd *resAd, amask_t mask );
+	StartdNamedClassAd* adlist_find( const char *name );
+	int		adlist_replace( const char *name, ClassAd *ad) { return extra_ads.Replace( name, ad ); }
+	int		adlist_replace( const char *name, ClassAd *ad, bool report_diff, const char *prefix);
+	int		adlist_delete( const char *name ) { return extra_ads.Delete( name ); }
+	int		adlist_delete( StartdCronJob * job ) { return extra_ads.DeleteJob( job ); }
+	int		adlist_clear( StartdCronJob * job )  { return extra_ads.ClearJob( job ); } // delete child ads, and clear the base job ad
+	int		adlist_publish( unsigned r_id, ClassAd *resAd, amask_t mask, const char * r_id_str );
+	void	adlist_reset_monitors( unsigned r_id, ClassAd * forWhom );
+	void	adlist_unset_monitors( unsigned r_id, ClassAd * forWhom );
 
 	// Methods to control various timers
 	void	check_polling( void );	// See if we need to poll frequently
+	int		start_sweep_timer(void); // Timer for sweeping SEC_CREDENTIAL_DIRECTORY
 	int		start_update_timer(void); // Timer for updating the CM(s)
 	int		start_poll_timer( void ); // Timer for polling the resources
 	void	cancel_poll_timer( void );
@@ -198,8 +223,8 @@ public:
 											const char *job_id);
 
 	Resource*	findRipForNewCOD( ClassAd* ad );
-	Resource*	get_by_cur_id(const char*);	// Find rip by ClaimId of r_cur
-	Resource*	get_by_any_id(const char*);	// Find rip by r_cur or r_pre
+	Resource*	get_by_cur_id(const char* id);	// Find rip by ClaimId of r_cur
+	Resource*	get_by_any_id(const char* id, bool move_cp_claim = false);	// Find rip by any claim id
 	Resource*	get_by_name(const char*);		// Find rip by r_name
 	Resource*	get_by_slot_id(int);	// Find rip by r_id
 	State		state( void );			// Return the machine state
@@ -211,8 +236,10 @@ public:
 	
 	ClassAd*	totals_classad;
 	ClassAd*	config_classad;
+	ClassAd*	extras_classad;
 
 	void		init_config_classad( void );
+	void		updateExtrasClassAd( ClassAd * cap );
 
 	void		addResource( Resource* );
 	bool		removeResource( Resource* );
@@ -221,6 +248,9 @@ public:
 
 		//Make a list of the ClassAds from each slot we represent.
 	void		makeAdList( ClassAdList*, ClassAd * pqueryAd=NULL );
+
+		// count the number of resources owned by this user
+	int			claims_for_this_user(const char * user);
 
 	void		markShutdown() { is_shutting_down = true; };
 	bool		isShuttingDown() { return is_shutting_down; };
@@ -242,7 +272,7 @@ public:
 #if HAVE_HIBERNATION
 	HibernationManager const& getHibernationManager () const;
 	void updateHibernateConfiguration ();
-    int disableResources ( const MyString &state );
+    int disableResources ( const std::string &state );
 	bool hibernating () const;
 #endif /* HAVE_HIBERNATION */
 
@@ -287,7 +317,7 @@ public:
 	bool considerResumingAfterDraining();
 
 		// how_fast: DRAIN_GRACEFUL, DRAIN_QUICK, DRAIN_FAST
-	bool startDraining(int how_fast,bool resume_on_completion,ExprTree *check_expr,std::string &new_request_id,std::string &error_msg,int &error_code);
+	bool startDraining(int how_fast,bool resume_on_completion,ExprTree *check_expr,ExprTree *start_expr,std::string &new_request_id,std::string &error_msg,int &error_code);
 
 	bool cancelDraining(std::string request_id,std::string &error_msg,int &error_code);
 
@@ -301,7 +331,13 @@ public:
 	bool typeNumCmp( int* a, int* b );
 
 	void calculateAffinityMask(Resource *rip);
+
+	void checkForDrainCompletion();
+	int getMaxJobRetirementTimeOverride() { return max_job_retirement_time_override; }
+	void resetMaxJobRetirementTime() { max_job_retirement_time_override = -1; }
+
 private:
+	static void token_request_callback(bool success, void *miscdata);
 
 	Resource**	resources;		// Array of pointers to Resource objects
 	int			nresources;		// Size of the array
@@ -312,6 +348,7 @@ private:
 	int		num_updates;
 	int		up_tid;		// DaemonCore timer id for update timer
 	int		poll_tid;	// DaemonCore timer id for polling timer
+	int		m_cred_sweep_tid;	// DaemonCore timer id for polling timer
 	time_t	startTime;		// Time that we started
 	time_t	cur_time;		// current time
 
@@ -344,6 +381,16 @@ private:
 		*/
 	void check_use( void );
 
+	void sweep_timer_handler( void );
+
+	void try_token_request();
+
+		// State of the in-flight token request; for now, we only allow
+		// one at a time.
+	std::string m_token_request_id;
+	std::string m_token_client_id;
+	Daemon *m_token_daemon{nullptr};
+
 #if HAVE_BACKFILL
 	bool backfillConfig( void );
 	bool m_backfill_shutdown_pending;
@@ -360,7 +407,7 @@ private:
 	int					m_hibernate_tid;
 	bool				m_hibernating;
 	void checkHibernate(void);
-	int	 allHibernating( MyString &state_str ) const;
+	int	 allHibernating( std::string &state_str ) const;
 	int  startHibernateTimer();
 	void resetHibernateTimer();
 	void cancelHibernateTimer();
@@ -377,6 +424,10 @@ private:
 	int expected_quick_draining_badput;
 	int total_draining_badput;
 	int total_draining_unclaimed;
+	int max_job_retirement_time_override;
+
+	DCTokenRequester m_token_requester;
+	std::unique_ptr<htcondor::DataReuseDirectory> m_reuse_dir;
 };
 
 

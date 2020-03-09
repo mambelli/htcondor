@@ -454,7 +454,7 @@ void dynuser::update_t() {
 					accountname, -1, accountname_t, 100)) {
 			dprintf(D_ALWAYS, "DynUser: MultiByteToWideChar() failed "
 					"error=%li\n", GetLastError());
-			EXCEPT("Unexpected failure in dynuser:update_t\n");
+			EXCEPT("Unexpected failure in dynuser:update_t");
 		}
 	}
 	if ( password && password_t ) {
@@ -480,7 +480,7 @@ void dynuser::update_t() {
 
 		dprintf(D_ALWAYS, "DynUser: MultiByteToWideChar() failed "
 				"error=%li\n", GetLastError());
-		EXCEPT("Unexpected failure in dynuser:update_t\n");
+		EXCEPT("Unexpected failure in dynuser:update_t");
 	}
 }
 
@@ -498,9 +498,9 @@ dynuser::get_accountname() {
 }
 
 void InitString( UNICODE_STRING &us, wchar_t *psz ) {
-	USHORT cch = wcslen( psz );
-	us.Length = cch * sizeof(wchar_t);
-	us.MaximumLength = (cch + 1) * sizeof (wchar_t);
+	size_t cch = wcslen( psz );
+	us.Length = (USHORT)(cch * sizeof(wchar_t));
+	us.MaximumLength = (USHORT)((cch + 1) * sizeof (wchar_t));
 	us.Buffer = psz;
 }
 
@@ -831,7 +831,7 @@ bool dynuser::deleteuser(char const * username ) {
 		DWORD netret = NetWkstaGetInfo( NULL, 100, 
 			(LPBYTE *)&pwkiWorkstationInfo);
 		if ( netret != NERR_Success ) {
-			EXCEPT("dynuser::deleteuser(): Cannot determine workstation name\n");
+			EXCEPT("dynuser::deleteuser(): Cannot determine workstation name");
 		}
 		InitString( machine, 
 			(wchar_t *)pwkiWorkstationInfo->wki100_computername);

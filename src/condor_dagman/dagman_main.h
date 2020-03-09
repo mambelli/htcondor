@@ -23,6 +23,8 @@
 #include "dag.h"
 #include "string_list.h"
 #include "dagman_classad.h"
+#include "dagman_stats.h"
+#include "utc_time.h"
 
 	// Don't change these values!  Doing so would break some DAGs.
 enum exit_value {
@@ -32,9 +34,12 @@ enum exit_value {
 	EXIT_RESTART = 3,	// exit but indicate that we should be restarted
 };
 
-void main_shutdown_rescue( int exitVal, Dag::dag_status dagStatus );
+void main_shutdown_rescue( int exitVal, Dag::dag_status dagStatus,
+			bool removeCondorJobs = true );
 void main_shutdown_graceful( void );
-void print_status();
+void main_shutdown_logerror( void );
+void print_status( bool forceScheddUpdate = false );
+void jobad_update();
 
 class Dagman {
   public:
@@ -54,13 +59,12 @@ class Dagman {
 		// whether we should fall back to non-default log mode.
 	void CheckLogFileMode( const CondorVersionInfo &submitFileVersion );
 
-		// Disable use of the default node log (use the log files from
-		// the submit files instead).
-	void DisableDefaultLog();
-
 		// Resolve macro substitutions in _defaultNodeLog.  Also check
 		// for some errors/warnings.
 	void ResolveDefaultLog();
+
+		// Publish statistics to a log file.
+	void PublishStats();
 
     Dag * dag;
     int maxIdle;  // Maximum number of idle DAG nodes
@@ -71,8 +75,6 @@ class Dagman {
 
 	char* condorSubmitExe;
 	char* condorRmExe;
-	char* storkSubmitExe;
-	char* storkRmExe;
 
 	// number of seconds to wait before consecutive calls to
 	// condor_submit (or dap_submit, etc.)
@@ -82,7 +84,12 @@ class Dagman {
     int max_submit_attempts;
 		// maximum number of jobs to submit in a single periodic timer
 		// interval
-    int max_submits_per_interval;
+	int max_submits_per_interval;
+		// In "aggressive submit" mode, DAGMan overrides the timer interval
+		// which DaemonCore fires every m_user_log_scan_interval seconds. 
+		// The submit cycle will continue submitting jobs until there are no 
+		// more ready jobs available, or until it exceeds max_submit_attempts.
+	bool aggressive_submit;
 
 		// How long dagman waits before checking the log files to see if
 		// some events happened. With very short running jobs in a linear
@@ -90,6 +97,11 @@ class Dagman {
 		// job finished so it can submit the next one. This allows us to
 		// configure that to be much faster with a minimum of 1 second.
 	int m_user_log_scan_interval;
+
+		// How long dagman waits before updating the schedd with its metrics
+		// and statistics. These are not essential updates, so typically we
+		// will want to keep them infrequent to reduce load on the schedd.
+	int schedd_update_interval;
 
 		// "Primary" DAG file -- if we have multiple DAG files this is
 		// the first one.  The lock file name, rescue DAG name, etc., 
@@ -113,11 +125,6 @@ class Dagman {
 		// whether to peform expensive cycle-detection at startup
 		// (note: we perform run-time cycle-detection regardless)
 	bool startup_cycle_detect;
-
-		// Allow the job to execute even if we have an error determining
-		// the log files (e.g., the log file is missing from one of the
-		// node submit files).
-	bool allowLogError;
 
 		// Whether to treat the dirname portion of any DAG file paths
 		// as a directory that the DAG should effectively be run from.
@@ -156,7 +163,7 @@ class Dagman {
 		// to breadth-first).
 	bool submitDepthFirst;
 
-		// Whether to abort on a "scary" submit event (Condor ID doesn't
+		// Whether to abort on a "scary" submit event (HTCondor ID doesn't
 		// match expected value).
 	bool abortOnScarySubmit;
 
@@ -164,7 +171,7 @@ class Dagman {
 		// are pending.
 	int pendingReportInterval;
 
-		// the Condor job id of the DAGMan job
+		// the HTCondor job id of the DAGMan job
 	CondorID DAGManJobId;
 
 		// The DAGMan configuration file (NULL if none is specified).
@@ -218,11 +225,30 @@ class Dagman {
 		// If _runPost is true, we run a POST script even if the PRE
 		// script for the node fails.
 	bool _runPost;
-		// Default priority that DAGman uses for nodes.
-	int _defaultPriority;
+
+		// Priority for this DAG.
+	int _priority;
+
 	int _claim_hold_time;
 
+		// True iff -DoRecov is specified on the command line.
+	bool _doRecovery;
+
+		// True iff we want to suppress jobs from writing to the
+		// log files specified in their submit files (see gittrac #4353).
+	bool _suppressJobLogs;
+
+		// Batch-name for this workflow.
+	MyString _batchName;
+
 	DagmanClassad *_dagmanClassad;
+
+		// True iff we should remove node jobs ourself when we are
+		// condor_rm'ed.
+	bool _removeNodeJobs;
+
+		// Dagman statistics
+	DagmanStats _dagmanStats;
 };
 
 #endif	// ifndef DAGMAN_MAIN_H

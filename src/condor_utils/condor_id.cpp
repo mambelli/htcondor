@@ -20,7 +20,6 @@
 
 #include "condor_common.h"
 #include "condor_id.h"
-#include "condor_string.h"
 
 
 int compare(int a, int b) {
@@ -52,15 +51,10 @@ CondorID::ServiceDataCompare( const ServiceData* rhs ) const
 {
 	CondorID const* id_lhs = (CondorID const*)this;
 	CondorID const* id_rhs = (CondorID const*)rhs;
-	if( id_lhs && ! id_rhs ) {
+	if( !id_rhs ) {
 		return -1;
 	}
-	if( ! id_lhs && ! id_rhs ) {
-		return 0;
-	}
-	if( ! id_lhs && id_rhs ) {
-		return -1;
-	}
+	
 	return id_lhs->Compare( *id_rhs );
 }
 
@@ -77,15 +71,15 @@ static unsigned int reverse_bits(unsigned int x) {
 	return y;
 }
 
-unsigned int
+size_t
 CondorID::HashFn() const
 {
 		// Put the most variable (low) bits of _cluster and _proc
 		// at opposite ends of the hash integer so they are unlikely
 		// to overlap.  Put the low bits of _subproc near the center.
-	unsigned int a = _cluster;
-	unsigned int b = _proc;
-	unsigned int c = _subproc;
+	size_t a = _cluster;
+	size_t b = _proc;
+	size_t c = _subproc;
 	c = (c<<16) + (c>>(sizeof(unsigned int)*8-16));
 	return a + reverse_bits(b) + c;
 }

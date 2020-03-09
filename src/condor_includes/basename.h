@@ -44,6 +44,22 @@ extern "C" {
 const char* condor_basename( const char* path );
 
 /*
+  given a pointer to a file basename (see condor_basename) returns
+  a pointer to the file extension, if no extension returns a pointer
+  to the terminating null.
+  A file that contains only a single . at the beginning of the name is
+  considered to have no extension.
+*/
+const char* condor_basename_extension_ptr(const char* basename);
+
+/*
+  given a pointer to a full file pathname returns a pointer to the file extension
+  if no extension returns a pointer to the terminating null.
+*/
+#define condor_filename_extension_ptr(path) condor_basename_extension_ptr(condor_basename(path))
+
+
+/*
   A dirname() function that is happy on both Unix and NT.
   This allocates space for a new string that holds the path of the
   parent directory of the path it was given.  If the given path has no
@@ -52,17 +68,6 @@ const char* condor_basename( const char* path );
   with free().
 */
 char* condor_dirname( const char* path );
-
-/*
-  A dirname() function appropriate to URLs that is happy on both Unix
-  and NT.  This allocates space for a new string that holds the path
-  of the parent directory of the path it was given.   The returned
-  directory name ends with the last directory delimiter found in the
-  URL.  If the given path has no directory delimiters, or is NULL, we
-  just return ".".  In all cases, the string we return is new space,
-  and must be deallocated with free().
-*/
-char* condor_url_dirname( const char* path );
 
 /*
   DEPRECATED: just in case we need changes along the lines of
@@ -82,6 +87,8 @@ char* dirname( const char* path );
    return TRUE if the given path is a full pathname, FALSE if not.  by
    full pathname, we mean it either begins with "/" or "\" or "*:\"
    (something like "c:\..." on windoze).
+   This does NOT mean it is in any sort of absolute "canonical" format.
+   It may still contain references to ".." or to symlinks or whatever.
 */
 int fullpath( const char* path );
 

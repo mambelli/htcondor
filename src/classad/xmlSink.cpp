@@ -69,6 +69,21 @@ void ClassAdXMLUnParser::Unparse(
 }
 
 void ClassAdXMLUnParser::
+Unparse( std::string &buffer,
+	const ClassAd *ad,
+	const References &whitelist )
+{
+	if( !ad ) {
+		buffer = "<error:null expr>";
+		return;
+	}
+
+	vector< pair<string, ExprTree*> > attrs;
+	ad->GetComponents(attrs, whitelist);
+	UnparseAux(buffer, attrs, 0);
+}
+
+void ClassAdXMLUnParser::
 Unparse(
 	string   &buffer, 
 	const ExprTree *tree, 
@@ -81,9 +96,16 @@ Unparse(
 		
 		switch( tree->GetKind( ) ) {
 		case ExprTree::LITERAL_NODE: {
+#if 1
+			Value::NumberFactor factor;
+			const Value & cval = ((const Literal*)tree)->getValue(factor);
+			if (factor != Value::NumberFactor::NO_FACTOR) {
+				Unparse( buffer, cval, indent );
+				return;
+			}
+#endif
 			Value				val;
-			Value::NumberFactor	factor;
-			((Literal*)tree)->GetComponents(val, factor);
+			((Literal*)tree)->GetValue(val);
 			Unparse(buffer, val, indent);
 			break;
 		}
@@ -130,7 +152,7 @@ Unparse(
 void ClassAdXMLUnParser::
 Unparse(
 	string &buffer, 
-	Value  &val, 
+	const Value  &val, 
 	int    indent)
 {
 	char tempBuf[512];
@@ -229,6 +251,7 @@ Unparse(
 			add_tag(buffer, XMLLexer::tagID_RelativeTime, XMLLexer::tagType_End);
 			break;
 		}
+		case Value::SCLASSAD_VALUE:
 		case Value::CLASSAD_VALUE: {
 			ClassAd *ad = NULL;
 			vector< pair<string,ExprTree*> > attrs;
@@ -246,6 +269,8 @@ Unparse(
 			UnparseAux(buffer, exprs, indent);
 			break;
 		}
+		default:
+			break;
 	}
 }
 

@@ -23,7 +23,7 @@
 #include "condor_config.h"
 #include "condor_attributes.h"
 #include "condor_state.h"
-#include "Set.h"
+#include <set>
 #include "directory.h"
 #include "view_server.h"
 #include "extArray.h"
@@ -84,30 +84,30 @@ void ViewServer::Init()
 	// install command handlers for queries
 
     daemonCore->Register_Command(QUERY_HIST_STARTD,"QUERY_HIST_STARTD",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_STARTD_LIST,"QUERY_HIST_STARTD_LIST",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_SUBMITTOR,"QUERY_HIST_SUBMITTOR",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_SUBMITTOR_LIST,"QUERY_HIST_SUBMITTOR_LIST",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_SUBMITTORGROUPS,"QUERY_HIST_SUBMITTORGROUPS",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_SUBMITTORGROUPS_LIST,"QUERY_HIST_SUBMITTORGROUPS_LIST",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_GROUPS,"QUERY_HIST_GROUPS",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_GROUPS_LIST,"QUERY_HIST_GROUPS_LIST",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_CKPTSRVR,"QUERY_HIST_CKPTSRVR",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
     daemonCore->Register_Command(QUERY_HIST_CKPTSRVR_LIST,"QUERY_HIST_CKPTSRVR_LIST",
-        (CommandHandler)ReceiveHistoryQuery,"ReceiveHistoryQuery",NULL,READ);
+        ReceiveHistoryQuery,"ReceiveHistoryQuery",READ);
 
 	int InitialDelay=param_integer("UPDATE_INTERVAL",300);
 
 	// Add View Server Flag to class ad
-	ad->Insert("ViewServer = True");
+	ad->Assign("ViewServer",  true);
 
 	// Register timer for logging information to history files
 	HistoryTimer = daemonCore->Register_Timer(InitialDelay,HistoryInterval,
@@ -117,11 +117,11 @@ void ViewServer::Init()
 
 	for (int i=0; i<DataSetCount; i++) {
 		for (int j=0; j<HistoryLevels; j++) {
-			DataSet[i][j].AccData=new AccHash(1000,MyStringHash);
+			DataSet[i][j].AccData=new AccHash(hashFunction);
 		}
 	}
-	GroupHash = new AccHash(100,MyStringHash);
-	FileHash = new HashTable< MyString, int >(100,MyStringHash);
+	GroupHash = new AccHash(hashFunction);
+	FileHash = new HashTable< MyString, int >(hashFunction);
 	OffsetsArray = new ExtArray< ExtOffArray* >(30);
 	TimesArray = new ExtArray< ExtIntArray* >(30);
 
@@ -164,7 +164,7 @@ void ViewServer::Config()
 	if (!tmp) {
 		tmp=param("LOCAL_DIR");
 		if (!tmp) {
-			EXCEPT("No POOL_HISTORY_DIR or LOCAL_DIR directory specified in config file\n");
+			EXCEPT("No POOL_HISTORY_DIR or LOCAL_DIR directory specified in config file");
 		}
 		formatstr(history_dir_buf, "%s/ViewHist", tmp);
 	}
@@ -177,7 +177,7 @@ void ViewServer::Config()
 	dprintf(D_ALWAYS, "Configuration: SAMPLING_INTERVAL=%d, MAX_STORAGE=%d, MaxFileSize=%d, POOL_HISTORY_DIR=%s\n",HistoryInterval,MaxStorage,MaxFileSize,history_dir);
 
 	if(!IsDirectory(history_dir)) {
-		EXCEPT("POOL_HISTORY_DIR (%s) does not exist.\n",history_dir);
+		EXCEPT("POOL_HISTORY_DIR (%s) does not exist.",history_dir);
 	}
 
 	for (int i=0; i<DataSetCount; i++) {
@@ -219,7 +219,7 @@ void ViewServer::Shutdown()
 // HandleQuery to take care of replying to the query
 //-------------------------------------------------------------------
 
-int ViewServer::ReceiveHistoryQuery(Service* /*s*/, int command, Stream* sock)
+int ViewServer::ReceiveHistoryQuery(int command, Stream* sock)
 {
 	dprintf(D_ALWAYS,"Got history query %d\n",command);
 
@@ -271,19 +271,19 @@ int ViewServer::HandleQuery(Stream* sock, int command, int FromDate, int ToDate,
 	// Find out which data set type
 
 	switch(command) {
-		case QUERY_HIST_STARTD_LIST:			ListFlag=1;
+		case QUERY_HIST_STARTD_LIST:			ListFlag=1; //@fallthrough@
 		case QUERY_HIST_STARTD:					DataSetIdx=StartdData;
 												break;
-		case QUERY_HIST_SUBMITTOR_LIST: 		ListFlag=1;
+		case QUERY_HIST_SUBMITTOR_LIST: 		ListFlag=1; //@fallthrough@
 		case QUERY_HIST_SUBMITTOR:				DataSetIdx=SubmittorData;
 												break;
-		case QUERY_HIST_SUBMITTORGROUPS_LIST:	ListFlag=1;
+		case QUERY_HIST_SUBMITTORGROUPS_LIST:	ListFlag=1; //@fallthrough@
 		case QUERY_HIST_SUBMITTORGROUPS:		DataSetIdx=SubmittorGroupsData;
 												break;
-		case QUERY_HIST_GROUPS_LIST:			ListFlag=1;
+		case QUERY_HIST_GROUPS_LIST:			ListFlag=1; //@fallthrough@
 		case QUERY_HIST_GROUPS:					DataSetIdx=GroupsData;
 												break;
-		case QUERY_HIST_CKPTSRVR_LIST:			ListFlag=1;
+		case QUERY_HIST_CKPTSRVR_LIST:			ListFlag=1; //@fallthrough@
 		case QUERY_HIST_CKPTSRVR:				DataSetIdx=CkptData;
 												break;
 	}
@@ -330,7 +330,7 @@ int ViewServer::HandleQuery(Stream* sock, int command, int FromDate, int ToDate,
 	// Read file and send Data
 
 	if (ListFlag) {
-		Set<MyString> Names;
+		std::set<std::string> Names;
 		if (OldFlag) SendListReply(sock, DataSet[DataSetIdx][HistoryLevel].OldFileName,FromDate,ToDate,Names);
 		if (NewFlag) SendListReply(sock, DataSet[DataSetIdx][HistoryLevel].NewFileName,FromDate,ToDate,Names);
 	} else {
@@ -346,7 +346,7 @@ int ViewServer::HandleQuery(Stream* sock, int command, int FromDate, int ToDate,
 // requested time range
 //---------------------------------------------------------------------
 
-int ViewServer::SendListReply(Stream* sock,const MyString& FileName, int FromDate, int ToDate, Set<MyString>& Names) 
+int ViewServer::SendListReply(Stream* sock,const MyString& FileName, int FromDate, int ToDate, std::set<std::string>& Names) 
 {
 	char InpLine[200];
 	char OutLine[200];
@@ -414,9 +414,9 @@ int ViewServer::SendListReply(Stream* sock,const MyString& FileName, int FromDat
 			continue;
 		}
 		
-		if (!Names.Exist(Arg)) {
+		if (Names.count(Arg) == 0) {
 			// dprintf(D_ALWAYS,"Adding Name=%s\n",Arg.Value());
-			Names.Add(Arg);
+			Names.insert(Arg);
 			sprintf(OutLinePtr,"%s\n",Arg.Value());
 			if (!sock->code(OutLinePtr)) {
 				dprintf(D_ALWAYS,"Can't send information to client!\n");
@@ -768,7 +768,11 @@ void ViewServer::WriteHistory()
 				EXCEPT("Could not check data file size!!!");
 			}
 			if (statbuf.st_size>MaxFileSize) {
-				rename(DataSet[i][j].NewFileName.Value(),DataSet[i][j].OldFileName.Value());
+				int r = rename(DataSet[i][j].NewFileName.Value(),DataSet[i][j].OldFileName.Value());
+				if (r < 0) {
+					dprintf(D_ALWAYS,"Could not rename %s to %s (%d)\n", DataSet[i][j].OldFileName.Value(), DataSet[i][j].NewFileName.Value(), errno);
+					EXCEPT("Could not rename data file");
+				}
 				int newFileIndex = -1;
 				int oldFileIndex = -1;
 				if(FileHash->lookup(DataSet[i][j].OldFileName.Value(),
@@ -823,13 +827,13 @@ int ViewServer::SubmittorScanFunc(ClassAd* cad)
 
 	// Get Data From Class Ad
 
-	if (cad->LookupString(ATTR_NAME,Name,sizeof(Name))<0) return 1;
-	if (cad->LookupString(ATTR_MACHINE,Machine,sizeof(Machine))<0) return 1;
+	if (cad->LookupString(ATTR_NAME,Name,sizeof(Name))==false) return 1;
+	if (cad->LookupString(ATTR_MACHINE,Machine,sizeof(Machine))==false) return 1;
 	GroupName=Name;
 	strcat(Name,"/");
 	strcat(Name,Machine);
-	if (cad->LookupInteger(ATTR_RUNNING_JOBS,JobsRunning)<0) JobsRunning=0;
-	if (cad->LookupInteger(ATTR_IDLE_JOBS,JobsIdle)<0) JobsIdle=0;
+	if (cad->LookupInteger(ATTR_RUNNING_JOBS,JobsRunning)==false) JobsRunning=0;
+	if (cad->LookupInteger(ATTR_IDLE_JOBS,JobsIdle)==false) JobsIdle=0;
 
 	// Add to group Totals
 
@@ -941,9 +945,9 @@ int ViewServer::StartdScanFunc(ClassAd* cad)
 	// Get Group Name
 
 	char tmp[200];
-	if (cad->LookupString(ATTR_ARCH,tmp,sizeof(tmp))<0) strcpy(tmp,"Unknown");
+	if (cad->LookupString(ATTR_ARCH,tmp,sizeof(tmp))==false) strcpy(tmp,"Unknown");
 	MyString GroupName=MyString(tmp)+"/";
-	if (cad->LookupString(ATTR_OPSYS,tmp,sizeof(tmp))<0) strcpy(tmp,"Unknown");
+	if (cad->LookupString(ATTR_OPSYS,tmp,sizeof(tmp))==false) strcpy(tmp,"Unknown");
 	GroupName+=tmp;
 
 	// Add to group Totals
@@ -1022,14 +1026,14 @@ int ViewServer::CkptScanFunc(ClassAd* cad)
 	
 	// Get Data From Class Ad
 
-	if (cad->LookupString(ATTR_NAME,Name,sizeof(Name))<0) return 1;
-	if (cad->LookupInteger("BytesReceived",Bytes)<0) Bytes=0;
+	if (cad->LookupString(ATTR_NAME,Name,sizeof(Name))==false) return 1;
+	if (cad->LookupInteger("BytesReceived",Bytes)==false) Bytes=0;
 	BytesReceived=float(Bytes)/(1024*1024);
-	if (cad->LookupInteger("BytesSent",Bytes)<0) Bytes=0;
+	if (cad->LookupInteger("BytesSent",Bytes)==false) Bytes=0;
 	BytesSent=float(Bytes)/(1024*1024);
-	if (cad->LookupFloat("AvgReceiveBandwidth",AvgReceiveBandwidth)<0) AvgReceiveBandwidth=0;
+	if (cad->LookupFloat("AvgReceiveBandwidth",AvgReceiveBandwidth)==false) AvgReceiveBandwidth=0;
 	AvgReceiveBandwidth=AvgReceiveBandwidth/1024;
-	if (cad->LookupFloat("AvgSendBandwidth",AvgSendBandwidth)<0) AvgSendBandwidth=0;
+	if (cad->LookupFloat("AvgSendBandwidth",AvgSendBandwidth)==false) AvgSendBandwidth=0;
 	AvgSendBandwidth=AvgSendBandwidth/1024;
 
 	// Add to accumulated data

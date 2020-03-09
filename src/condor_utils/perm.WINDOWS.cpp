@@ -65,7 +65,7 @@ int perm::get_permissions( const char *file_name, ACCESS_MASK &AccessRights ) {
 			//	 thats will give us a permissions bitmask, or we run out of places
 			//	 to look (which shouldn't happen since c:\ should always give us
 			//	 SOMETHING...
-			int i = strlen( file_name ) - 1;
+			int i = (int)strlen( file_name ) - 1;
 			while ( i >= 0 && ( file_name[i] != '\\' && file_name[i] != '/' ) ) {
 				i--;
 			}
@@ -206,6 +206,7 @@ int perm::userInLocalGroup( const char *account, const char *domain, const char 
 	NET_API_STATUS status;
 	wchar_t group_name_unicode[MAX_GROUP_LENGTH+1];
 	_snwprintf(group_name_unicode, MAX_GROUP_LENGTH+1, L"%S", group_name);
+	group_name_unicode[MAX_GROUP_LENGTH] = 0;
 	
 	
 	DWORD_PTR resume_handle = 0;
@@ -290,6 +291,8 @@ int perm::userInGlobalGroup( const char *account, const char *domain, const char
 	wchar_t group_name_unicode[MAX_GROUP_LENGTH+1];	// groups limited to 256 chars
 	_snwprintf(group_domain_unicode, MAX_DOMAIN_LENGTH+1, L"%S", group_domain);
 	_snwprintf(group_name_unicode, MAX_GROUP_LENGTH+1, L"%S", group_name);
+	group_domain_unicode[MAX_DOMAIN_LENGTH] = 0;
+	group_name_unicode[MAX_GROUP_LENGTH] = 0;
 	
 	GROUP_USERS_INFO_0 *group_members;
 	unsigned long entries_read, total_entries;
@@ -536,7 +539,8 @@ bool perm::init( const char *accountname, const char *domain )
 
 		// no domain specified, so just copy the accountname.
 		Domain_name = NULL;
-		strncpy(qualified_account, accountname, 1023);
+		strncpy(qualified_account, accountname, 1024);
+		qualified_account[1024-1] = 0;
 	}
 
 	domainBufferSize = COUNTOF(domainBuffer);
@@ -694,7 +698,7 @@ bool perm::volume_has_acls( const char *filename )
 		}
 		else {
 			// found no fourth backslash; copy the whole string and tack one on
-			int len_to_copy = strlen(filename);
+			int len_to_copy = (int)strlen(filename);
 			root_path = (char*)malloc(len_to_copy + 2);
 			if (root_path == NULL) {
 				EXCEPT("Out of memory!");
@@ -775,7 +779,9 @@ perm::set_acls( const char *filename )
 	}
 
 	// first get the file's old DACL so we can copy it into the new one.
-
+	// NOTE: oldDACL will be a pointer into the pSD structure - the code below
+	// will eventually call LocalFree(pSD), but should not call LocalFree(oldDACL) because
+	// the oldDACL is deallocated when the pSD is deallocated.
 	err = GetNamedSecurityInfo((char*)filename, SE_FILE_OBJECT,
 			DACL_SECURITY_INFORMATION, NULL, NULL, &oldDACL, NULL, &pSD);
 

@@ -16,6 +16,7 @@
  # 
  ############################################################### 
 
+include_directories(${CONDOR_SCHEDD_SRC_DIR})
 
 file( GLOB starterRmvElements condor_pid_ns_init.cpp condor_rsh.cpp glexec_job_wrapper* )
 
@@ -23,7 +24,7 @@ if (UNIX)
 set_source_files_properties(jic_shadow.cpp PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations")
 endif(UNIX)
 
-condor_daemon( starter "${starterRmvElements}" "${CONDOR_LIBS};${LIBCGROUP_FOUND}" "${C_SBIN}" OFF)
+condor_daemon( starter "${starterRmvElements}" "${CONDOR_LIBS};${LIBCGROUP_FOUND}" "${C_SBIN}")
 
 if (HAVE_EXT_GLOBUS)
 	clone_install( condor_starter "${C_SBIN}" "condor_gridshell" "${C_SBIN}" )
@@ -46,3 +47,7 @@ endif(HAVE_SSH_TO_JOB)
 if (LINUX)
 	condor_exe(condor_pid_ns_init "condor_pid_ns_init.cpp" ${C_LIBEXEC} "${CONDOR_TOOL_LIBS}" OFF)
 endif()
+if (DOCKER_ALLOW_RUN_AS_ROOT)
+	set_source_files_properties(docker_proc.cpp PROPERTIES COMPILE_DEFINITIONS DOCKER_ALLOW_RUN_AS_ROOT=1)
+endif()
+

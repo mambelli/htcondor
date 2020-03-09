@@ -1,9 +1,14 @@
 #! /usr/bin/env perl
-use strict;
+#use strict;
 use warnings;
+use Cwd;
 use IPC::Open3;
 use Time::HiRes qw(tv_interval gettimeofday);
 use Archive::Tar;
+use IO::Socket;
+use IO::Socket::INET;
+use IO::Handle;
+use Socket;
 
 BEGIN {
 	if ($^O =~ /MSWin32/) {
@@ -19,7 +24,7 @@ my $btdebug = 0;
 
 use base 'Exporter';
 
-our @EXPORT = qw(runcmd FAIL PASS ANY SIGNALED SIGNAL async_read verbose_system Which TRUE FALSE is_cygwin_perl is_windows is_windows_native_perl is_cygwin_perl fullchomp CreateDir CopyIt TarCreate TarExtract MoveIt DirLs List WhereIsInstallDir);
+our @EXPORT = qw(runcmd FAIL PASS ANY SIGNALED SIGNAL async_read verbose_system Which TRUE FALSE is_cygwin_perl is_windows is_windows_native_perl is_cygwin_perl fullchomp CreateEmptyFile CreateDir CopyIt TarCreate TarExtract MoveIt GetDirList DirLs List WhereIsInstallDir quoteMyString MyHead GeneralServer GeneralClient DagmanReadFlowLog DryExtract GatherDryData LoadResults runCommandCarefully);
 
 sub TRUE{1};
 sub FALSE{0};
@@ -98,6 +103,7 @@ sub async_reader {
 			sub {
 				$Q->enqueue($_) while <$fh>;
 				$Q->enqueue(undef);
+				$Q->end();
 			}	
 		)->detach;
 
@@ -164,6 +170,7 @@ sub runcmd {
 		emit_string
 		use_system
 		sh_wrap
+		arguments
 		);
 
 	foreach my $key (keys %{$options}) {
@@ -210,7 +217,11 @@ sub runcmd {
 		$rc = system("$args");
 		$t1 = [Time::HiRes::gettimeofday];
 	} else {
-		$childpid = IPC::Open3::open3(\*IN, \*OUT, \*ERR, $args);
+		if( defined( ${$options}{arguments} ) ) {
+			$childpid = IPC::Open3::open3(\*IN, \*OUT, \*ERR, @{${$options}{arguments}} );
+		} else {
+			$childpid = IPC::Open3::open3(\*IN, \*OUT, \*ERR, $args);
+		}
 
 		my $bulkout = "";
 		my $bulkerror = "";
@@ -301,14 +312,18 @@ sub runcmd {
 
 		#print "$bulkout\n";
 		#print "\n++++++++++++++++++++++++++\n";
-		$bulkout =~ s/\\r\\n/\n/g;
+		#$bulkout =~ s/\\r\\n/\n/g;
 		#print "$bulkout\n";
 		#print "\n++++++++++++++++++++++++++\n";
 		@outlines = split /\n/, $bulkout;
+		map {$_ =~ s/^\\r//} @outlines;
+		map {$_ =~ s/\\r$//} @outlines;
 		map {$_.= "\n"} @outlines;
 
-		$bulkerror =~ s/\\r\\n/\n/g;
+		#$bulkerror =~ s/\\r\\n/\n/g;
 		@errlines = split /\n/, $bulkerror;
+		map {$_ =~ s/^\\r//} @errlines;
+		map {$_ =~ s/\\r$//} @errlines;
 		map {$_.= "\n"} @errlines;
 
 		die "ERROR: waitpid failed to reap pid $childpid!" 
@@ -367,6 +382,19 @@ sub runcmd {
 		#print "runcmd: Told Failure was OK\n";
 	}
 	return \%returnthings;
+}
+
+sub runCommandCarefully {
+	my $options = shift( @_ );
+	my @argv = @_;
+
+	my %altOptions;
+	if( ! defined( $options ) ) {
+		$options = \%altOptions;
+	}
+	${$options}{arguments} = \@argv;
+
+	return runcmd( $argv[0], $options );
 }
 
 sub ProcessReturn {
@@ -429,6 +457,10 @@ sub SetDefaults {
 	# sh_wrap: wrap the arguments to runcmd with "/bin/sh -c ..."
 	if(!(exists ${$options}{sh_wrap})) {
 		${$options}{sh_wrap} = TRUE;
+	}
+
+	if(!(exists ${$options}{arguments})) {
+		${$options}{arguments} = undef;
 	}
 
 }
@@ -590,6 +622,35 @@ sub is_windows_native_perl {
     return 0;
 }
 
+sub quoteMyString {
+	my $stringtoquote = shift;
+	my $returnstr = "";
+	print "Quote:$stringtoquote\n";
+	if(is_windows()) {
+		$_ = $stringtoquote;
+		s/%/\%/g;
+		s/"/\"/g;
+		if($stringtoquote =~ /\s+|&/) {
+			$returnstr = "\"" . $_ . "\"";
+		} else {
+			$returnstr = $_;
+		}
+	} else {
+		$_ = $stringtoquote;
+		s/'/\'/g;
+		$returnstr = "'$_'";
+	}
+	print "Returning:$returnstr\n";
+	return($returnstr);
+}
+
+sub CreateEmptyFile {
+	my $name = shift;
+	open(NF,">$name") or die "Failed to create:$name:$!\n";
+	print NF "";
+	close(NF);
+}
+
 sub CreateDir
 {
 	my $cmdline = shift;
@@ -597,18 +658,21 @@ sub CreateDir
 	my $cmdcount = @argsin;
 	my $ret = 0;
 	my $fullcmd = "";
-	#print  "CreateDir: $cmdline argcout:$cmdcount\n";
+	my $location = Cwd::getcwd();
+	#print  "\n\n\n\n\n******* CreateDir: $cmdline argcout:$cmdcount while here:$location *******\n\n\n\n\n";
 
 	my $amwindows = is_windows();
 
 	my $winpath = "";
 	if($amwindows == 1) {
 		if(is_windows_native_perl()) {
+			#print "CreateDir:windows_native_perl\n";
 			# what if a linux path first?
 			if($argsin[0] eq "-p") {
 				shift @argsin;
 			}
 			foreach my $dir (@argsin) {
+				#print "Want to make:$dir\n";
 				$_ = $dir;
 				s/\//\\/g;
 				s/\\/\\\\/g;
@@ -616,12 +680,22 @@ sub CreateDir
 				if(-d "$dir") {
 					next;
 				}
+				#print "$dir does not exist yet\n";
 				$fullcmd = "cmd /C mkdir $dir";
 				$ret = system("$fullcmd");
 				if($ret != 0) {
 					print "THIS:$fullcmd Failed\n";
+				} else {
+						#print "THIS:$fullcmd worked\n";
+						#print "If this worked, it should exist now.\n";
+						#if(-d $dir) {
+							#print "Perl says it does.\n";
+						#} else {
+							#print "Perl says it does NOT.\n";
+						#}
 				}
 			}
+			#print "CreateDir returning now: Return value from CreateDir:$ret\n";
 			return($ret);
 		} else {
 			if($argsin[0] eq "-p") {
@@ -656,42 +730,85 @@ sub CreateDir
 			return($ret);
 		}
 		$ret = system("$fullcmd");
+		#system("chmod 777 $cmdline");
 		#print "Tried to create dir got ret value:$ret path:$cmdline/$fullcmd\n";
 	}
 	return($ret);
 }
 
+# print information about a core file
+# 
+sub print_core_file_info
+{
+	my $core = shift;
+	if (-s $core) {
+		print "\tfound core file: $core\n";
+		if (CondorUtils::is_windows()) {
+			system("type $core");
+		} else {
+			my $fileinfo = `file $core`;
+			print "\t$fileinfo";
+			my ($execfn) = $fileinfo =~ m/execfn:\s*'(.*)'/;
+			if (defined $execfn) {
+				system("echo bt | gdb --quiet $execfn $core");
+			}
+		}
+	}
+}
+
+# pretty print a time string, if no args are passed uses localtime() as the time.
+# the output is formatted as YYYY-MM-DD HH:MM:SS (which is sortable)
+# if the last argument is 'T', then only the time is printed.
+sub TimeStr
+{
+	my $ac = scalar(@_);
+	my $T = $ac > 0 && $_[$ac-1] eq 'T';
+	if ($ac < 5) { @_ = localtime(); }
+	if ($T) { return sprintf "%02d:%02d:%02d", @_[reverse 0..2]; }
+	return sprintf '%d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, @_[reverse 0..3];
+}
+
+# portable way to get a directory listing
+# the command ls is optional, (sigh) because that's the way it's used...
 sub List
 {
     my $cmdline = shift;
-	my @allargs = split /\s/, $cmdline;
-    my $amwindows = is_windows();
-    my $fullcmd = "";
 	my $ret = 0;
+	# strip off leading ls command (it's ok if its not there)
+	if ($cmdline =~ /^\s*ls\s+/) { $cmdline =~ s/^\s*ls\s+//; }
 
-    if($amwindows == 1) {
-		$fullcmd = "cmd /C dir ";
-
-		foreach my $patharg (@allargs) {
-			if($patharg =~ /cygdrive/) {
-				my $winpath = `cygpath -w $patharg`;
-        		CondorUtils::fullchomp($winpath);
-				$_ = $winpath;
-        		s/\\/\\\\/g;
-				$winpath = $_;
-				$fullcmd = $fullcmd . " $winpath";
-			} else {
-				$fullcmd = $fullcmd . " $patharg";
-	}
+	# on native windows, we are translating ls to dir, so we also need to strip the options
+	if (is_windows_native_perl()) {
+		if ($cmdline =~ /^\-([a-zA-Z]+)\s+(.*)$/ ) {
+			# translate flags?
+			#my $flags = $1;
+			# translate path separators
+			$cmdline = $2;
 		}
-
-		$ret = system("$fullcmd");
-	} else {
-		$fullcmd = "ls $cmdline";
-
-		$ret = system("$fullcmd");
+		$cmdline =~ s/\//\\/g; # convert / to \ before passing to dir
+		$ret = system("cmd /C dir $cmdline");
+	} elsif (is_windows()) {
+		$cmdline =~ s/\\/\//g; # if windows, but not native, we need to convert \ to / before passing to ls.
+	}
+	else {
+		$ret = system("ls $cmdline");
 	}
 	return($ret);
+}
+
+sub GetDirList {
+	my $arrayref = shift;
+	my $targetdir = shift;
+	my $startdir = Cwd::getcwd();
+	chdir("$targetdir");
+	opendir DS, "." or die "Can not open dataset: $1\n";
+	foreach my $subfile (readdir DS)
+	{
+		next if $subfile =~ /^\.\.?$/;
+		push  @{$arrayref}, $subfile;
+	}
+	close(DS);
+	chdir("$startdir");
 }
 
 sub DirLs
@@ -758,24 +875,46 @@ sub CopyIt
     my @argsin = split /\s/, $cmdline;
     my $cmdcount = @argsin;
 
+	if($btdebug == 1) {
+		print "CopyIt command line passed in:$cmdline\n";
+	}
     if($amwindows == 1) {
-        $winsrc = `cygpath -w $argsin[0]`;
-        $windest = `cygpath -w $argsin[1]`;
-        CondorUtils::fullchomp($winsrc);
-        CondorUtils::fullchomp($windest);
-        $_ = $winsrc;
-        s/\\/\\\\/g;
-        $winsrc = $_;
-        $_ = $windest;
-        s/\\/\\\\/g;
-        $windest = $_;
-        $fullcmd = "xcopy $winsrc $windest /Y";
-        if($dashr eq "yes") {
-            $fullcmd = $fullcmd . " /s /e";
-        }
+		if(is_windows_native_perl()) {
+			#print "CopyIt: windows_native_perl\n";
+			$winsrc = $argsin[0];
+			$windest = $argsin[1];
+			#print "native perl:\n";
+			# check target
+			$windest =~ s/\//\\/g;
+        	$fullcmd = "xcopy $winsrc $windest /Y";
+        	if($dashr eq "yes") {
+            	$fullcmd = $fullcmd . " /s /e";
+				#print "native perl -r:$fullcmd\n";
+        	}
+			#print "native perl: $fullcmd\n";
+		} else {
+        	$winsrc = `cygpath -w $argsin[0]`;
+        	$windest = `cygpath -w $argsin[1]`;
+        	CondorUtils::fullchomp($winsrc);
+        	CondorUtils::fullchomp($windest);
+        	$_ = $winsrc;
+        	s/\\/\\\\/g;
+        	$winsrc = $_;
+        	$_ = $windest;
+        	s/\\/\\\\/g;
+        	$windest = $_;
+        	$fullcmd = "xcopy $winsrc $windest /Y";
+        	if($dashr eq "yes") {
+            	$fullcmd = $fullcmd . " /s /e";
+        	}
 
-        $ret = system("$fullcmd");
-		#print "Tried to create dir got ret value:$ret cmd:$fullcmd\n";
+		}
+		#print "CopyIt executing: $fullcmd\n";
+        #$ret = system("$fullcmd");
+		$ret = verbose_system("$fullcmd");
+		if($btdebug == 1) {
+			print "Tried to create dir got ret value:$ret cmd:$fullcmd\n";
+		}
     } else {
         $fullcmd = "cp ";
         if($dashr eq "yes") {
@@ -785,6 +924,10 @@ sub CopyIt
         $ret = system("$fullcmd");
 		#print "Tried to create dir got ret value:$ret path:$cmdline\n";
     }
+	if($btdebug == 1) {
+		print "CopyIt returning:$ret\n";
+	}
+	
     return($ret);
 }
 
@@ -805,16 +948,24 @@ sub MoveIt
 	my $cmdcount = @argsin;
 
 	if($amwindows == 1) {
-		$winsrc = `cygpath -w $argsin[0]`;
-		$windest = `cygpath -w $argsin[1]`;
-		CondorUtils::fullchomp($winsrc);
-		CondorUtils::fullchomp($windest);
-		$_ = $winsrc;
-		s/\\/\\\\/g;
-		$winsrc = $_;
-		$_ = $windest;
-		s/\\/\\\\/g;
-		$windest = $_;
+		if(is_windows_native_perl()) {
+			#print "MoveIt:windows_native_perl\n";
+			$winsrc =  $argsin[0];
+			$windest = $argsin[1];
+			$winsrc =~ s/\//\\/g;
+			$windest =~ s/\//\\/g;
+		} else {
+			$winsrc = `cygpath -w $argsin[0]`;
+			$windest = `cygpath -w $argsin[1]`;
+			CondorUtils::fullchomp($winsrc);
+			CondorUtils::fullchomp($windest);
+			$_ = $winsrc;
+			s/\\/\\\\/g;
+			$winsrc = $_;
+			$_ = $windest;
+			s/\\/\\\\/g;
+			$windest = $_;
+		}
 		$fullcmd = "cmd /C move $winsrc $windest";
 
 		$ret = system("$fullcmd");
@@ -839,9 +990,12 @@ sub TarExtract
 	my $winpath = "";
 	my $tarobject = Archive::Tar->new;
 	if($amwindows == 1) {
-		$winpath = `cygpath -w $archive`;
-		CondorUtils::fullchomp($winpath);
-		$archive = $winpath;
+		if( is_windows_native_perl() ) {
+        } else {
+            $winpath = `cygpath -w $archive`;
+            CondorUtils::fullchomp($winpath);
+            $archive = $winpath;
+        }
 	}
 	$tarobject->read($archive);
 	$tarobject->extract();
@@ -942,4 +1096,269 @@ sub WhereIsInstallDir {
 	my $paths = "$installdir" . ",$wininstalldir";
 	return($paths);
 }
+
+sub MyHead {
+	my $size = shift;
+	my $file = shift;
+
+	print "Request:head $size $file\n";
+
+	if($size =~ /\-/) {
+		$_ = $size;
+		s/\-//;
+		print "$_\n";
+		$size = $_;
+	}
+	my $counter = 0;
+	open(MH,"<$file") or die "Open of $file failed:$!\n";
+	while(<MH>) {
+		print "$_";
+		$counter += 1;
+		if($counter == $size) {
+			last;
+		}
+	}
+	close(MH);
+}
+
+sub GeneralServer {
+	my $SockAddr = shift;
+	my $LogFile = shift;
+	my $raw = shift;
+
+	print "general server log file is $LogFile\n";
+
+	#open(OLDOUT, ">&STDOUT");
+	#open(OLDERR, ">&STDERR");
+	open(STDOUT, ">$LogFile") or die "Could not open $LogFile: $!";
+	open(STDERR, ">&STDOUT");
+	select(STDERR); $| = 1;
+	select(STDOUT); $| = 1;
+
+#	if(is_windows()) {
+#		my $server = IO::Socket::INET->new(
+#			LocalPort => '0',
+#			Proto  => 'udp',
+#			) or die "ERROR in Socket Creation:$!\n";
+#		print "Server has a socket\n";
+
+#		#my $eport = $server->sockport();
+#		#print "I am listening on port:$eport\n";
+#		my $mysockaddr = getsockname($server);
+#		if(defined $mysockaddr) {
+#			print "getsockname return $mysockaddr\n";
+#		} else {
+#			print "getsockname return undefined\n";
+#		}
+#		my ($port, $myaddr) = Socket::sockaddr_in($mysockaddr);
+#		print "I am listening on port:$port\n";
+#		printf "Connect to %s [%s]\n",
+#			scalar gethostbyaddr($myaddr, Socket::AF_INET),
+#			inet_ntoa($myaddr);
+#		# set no options for now
+#		#$server->setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVBUF, 65440);
+
+#		while ( 1 )
+#		{
+#			my $newmsg;
+#			$server->recv($newmsg,1024) || die "Recv: $!";
+#			#$server->recv($newmsg,$MAXLEN);
+#			if($newmsg eq "quit")
+#			{
+#				exit(0);
+#			}
+#			if(defined($raw)) {
+#				print "$newmsg";
+#			} else {
+#				print "$newmsg\n";
+#			}
+#		}
+
+#		my $server = new Win32::Pipe($SockAddr);
+#		if(!(defined $server)) {
+#			die "Pipe not created:$SockAddr:$!\n";
+#		}
+
+#		while(1) {
+#			my $result = $server->Connect();
+#			if($result == 1) {
+#				my $newmsg = $server->Read();
+#				if($newmsg eq "quit")
+#				{
+#					exit(0);
+#				}
+#				if(defined($raw)) {
+#					print "$newmsg";
+#				} else {
+#					print "$newmsg\n";
+#				}
+#				my $disconnectres = $server->Disconnect();
+#				print "Disconnect res:$disconnectres:$!\n";
+#				# start with a single message
+#				 last;
+#			} else {
+#				print "Connect result:$result:$!\n";
+#			}
+#		}
+	#} else {
+		if(is_windows()) {
+		} else {
+			unlink($SockAddr);
+		}
+		print "About to NEW on $SockAddr\n";
+		my $server = IO::Socket::UNIX->new(Local => $SockAddr,
+									Type  => Socket::SOCK_DGRAM)
+		or die "Can't bind socket: $!\n";
+
+		$server->setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVBUF, 65440);
+
+		while ( 1 )
+		{
+			my $newmsg;
+			my $MAXLEN = 1024;
+			#$server->recv($newmsg,$MAXLEN) || die "Recv: $!";
+			$server->recv($newmsg,$MAXLEN);
+			if($newmsg eq "quit")
+			{
+				exit(0);
+			}
+			if(defined($raw)) {
+				print "$newmsg";
+			} else {
+				print "$newmsg\n";
+			}
+		}
+
+		my $stat = 0;
+		my $returnval = shift;
+	#}
+	print "Server exiting\n";
+}
+
+sub GeneralClient {
+	my $MAXLEN = 1024;
+	my $comchan = shift;
+	my $newmsg = shift;
+
+	print "$comchan for mesg $newmsg\n";
+	
+	#if(is_windows()) {
+#		my $ClientSockAddr = "\\\\.\\pipe\\$comchan";
+#		my $pipe = new Win32::Pipe("$ClientSockAddr");
+#		if(!(defined $pipe)) {
+#			die "Client pipe creation and connection failed:$ClientSockAddr:$!\n";
+#		}
+#		my $result = $pipe->Write($newmsg);
+#		print "Pipe write result:$result:$!\n";
+#		$pipe->Close();
+	#} else {
+		my $client = IO::Socket::UNIX->new(Peer => "$comchan",
+								Type  => Socket::SOCK_DGRAM,
+								Timeout => 10)
+		or die $@;
+
+		$client->send($newmsg);
+
+		my $stat = 0;
+		my $returnval = shift;
+	#}
+	print "client exiting\n";
+}
+
+sub DagmanReadFlowLog {
+	my $log = shift;
+	my $option = shift; # $option not currently used
+	#my $limit = 2;
+	my $limit = shift;
+	my $count = 0;
+	my $line;
+
+	#print "Log is $log, Option is $option and limit is $limit\n";
+
+	open(OLDOUT, "<$log") or die "Failed to open:$log:$!\n";
+	while(<OLDOUT>)
+	{
+		CondorUtils::fullchomp($_);
+		$line = $_;
+		#print "--$line--\n";
+		if( $line =~ /^\s*(open)\s*$/ )
+		{
+			$count++;
+			#print "Count now $count\n";
+			if($count > $limit)
+			{
+				#print "$count exceeds $limit\n";
+				print "$count";
+				return($count);
+			}
+		}
+		if( $line =~ /^\s*(close)\s*$/ )
+		{
+			$count--;
+			#print "Count now $count\n";
+		}
+	}
+
+	close(OLDOUT);
+	print "$count";
+	return(0);
+}
+
+sub DryExtract {
+    my $dryinarrayref = shift;
+    my $dryoutarrayref = shift;
+    my $extractstring = shift;
+    foreach my $dryline (@{$dryinarrayref}) {
+        chomp($dryline);
+        if($dryline =~ /\s*$extractstring\s*=/i) {
+            #print "DryExtract: found $dryline\n";
+            push @{$dryoutarrayref}, $dryline;
+		}
+	}
+}
+
+sub GatherDryData {
+    my $submitfile = shift;
+	my $targetfile = shift;
+	my @storage = ();
+	my @out = ();
+	my $res = 0;
+	@out = `condor_submit -dry-run $targetfile $submitfile`;
+	# my $res = system("$cmdtorun");
+	$res = $?;
+	if($res != 0) {
+		die "non-zero return from condor_submit\n";
+	} elsif ($targetfile eq "-") {
+		foreach (@out) {
+			fullchomp($_);
+			next if ($_ =~ /dry-run/i);
+			push @storage, $_;
+		}
+	} else {
+		open(TF,"<$targetfile") or die "Failed to open dry data file:$targetfile:$!\n";
+		while (<TF>) {
+			fullchomp($_);
+			push @storage, $_;
+		}
+		close(TF);
+	}
+	return(\@storage);
+}
+
+sub LoadResults {
+	my $arraytoload = shift;
+	my $filetoloadfrom = shift;
+
+	if(-f $filetoloadfrom) {
+		open(TF,"<$filetoloadfrom");
+		while (<TF>) {
+			fullchomp($_);
+			push @{$arraytoload}, $_;
+		}
+		close(TF);
+	} else {
+		die "LoadResults called with a file which does not exist:$filetoloadfrom:$!\n";
+	}
+}
+
 1;

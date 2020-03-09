@@ -27,8 +27,7 @@
 #include "condor_io.h"
 #include "condor_debug.h"
 #include "internet.h"
-#include "condor_socket_types.h"
-#include "condor_string.h"
+#include "condor_config.h"
 #include "condor_netdb.h"
 #include "selector.h"
 #include "condor_sockfunc.h"
@@ -40,67 +39,6 @@ unsigned long SafeSock::_deleted = 0;
 unsigned long SafeSock::_avgSwhole = 0;
 unsigned long SafeSock::_avgSdeleted = 0;
 
-/*
- * Below is Mersenne Twister, a random number generator from
- * http://en.literateprograms.org/Mersenne_twister_(C)
- *
- * It is used for fill out ip_addr, pid and time fields in _condorMsgId.
- * Instead of changing ip_addr to 16 bytes to be compatible with IPv6,
- * it fills out random numbers. Thus, we can make sure that it is still
- * compatible with older Condor but also probabilistically guarantee
- * safe handling of Condor packets.
- */
-
-#define MT_LEN 624
-static int mt_index;
-static unsigned long mt_buffer[MT_LEN];
-
-void mt_init() {
-    int i;
-    srand(time(NULL));
-    for (i = 0; i < MT_LEN; i++)
-        mt_buffer[i] = rand();
-    mt_index = 0;
-}
-
-static struct __static_initializer {
-	__static_initializer() { mt_init(); }
-} __static_init1;
-
-#define MT_IA           397
-#define MT_IB           (MT_LEN - MT_IA)
-#define UPPER_MASK      0x80000000
-#define LOWER_MASK      0x7FFFFFFF
-#define MATRIX_A        0x9908B0DF
-#define TWIST(b,i,j)    ((b)[i] & UPPER_MASK) | ((b)[j] & LOWER_MASK)
-#define MAGIC(s)        (((s)&1)*MATRIX_A)
-
-unsigned long mt_random() {
-    unsigned long * b = mt_buffer;
-    int idx = mt_index;
-    unsigned long s;
-    int i;
-
-    if (idx == MT_LEN*sizeof(unsigned long))
-    {
-        idx = 0;
-        i = 0;
-        for (; i < MT_IB; i++) {
-            s = TWIST(b, i, i+1);
-            b[i] = b[i + MT_IA] ^ (s >> 1) ^ MAGIC(s);
-        }
-        for (; i < MT_LEN-1; i++) {
-            s = TWIST(b, i, i+1);
-            b[i] = b[i - MT_IB] ^ (s >> 1) ^ MAGIC(s);
-        }
-
-        s = TWIST(b, MT_LEN-1, 0);
-        b[MT_LEN-1] = b[MT_IA-1] ^ (s >> 1) ^ MAGIC(s);
-    }
-    mt_index = idx + sizeof(unsigned long);
-    return *(unsigned long *)((unsigned char *)b + idx);
-    /* Here there is a commented out block in MB's original program */
-}
 
 /* 
    NOTE: All SafeSock constructors initialize with this, so you can
@@ -121,10 +59,10 @@ void SafeSock::init()
 		// [TODO:IPv6] Remove it!
 		//_outMsgID.ip_addr = (unsigned long)my_ip_addr();
 
-		_outMsgID.ip_addr = mt_random();
-		_outMsgID.pid = mt_random() % 65536; //(short)getpid();
-		_outMsgID.time = mt_random(); //(unsigned long)time(NULL);
-		_outMsgID.msgNo = (unsigned long)get_random_int();
+		_outMsgID.ip_addr = get_csrng_uint();
+		_outMsgID.pid = get_csrng_uint() % 65536;
+		_outMsgID.time = get_csrng_uint();
+		_outMsgID.msgNo = get_csrng_uint();
 	}
 
     mdChecker_     = NULL;
@@ -174,6 +112,11 @@ SafeSock::~SafeSock()
 	close();
 
     delete mdChecker_;
+}
+
+int SafeSock::close()
+{
+	return Sock::close();
 }
 
 
@@ -279,16 +222,14 @@ SafeSock::peek_end_of_message()
 
 MSC_DISABLE_WARNING(6262) // function uses 64k of stack
 const char *
-SafeSock::my_ip_str()
+SafeSock::my_ip_str() const
 {
-	//In order to call getSockAddr(_sock), we would need to call
-	//::connect() on _sock, which changes semantics on what other
-	//calls are valid on _sock (e.g. must use send() on some platforms
-	//instead of sendto()).  Therefore, we create a new sock and
-	//connect that one, so as to leave the main one undisturbed.
+	//
+	// FIXME: Do we still need to create and destroy a socket every time?
+	//
 
 	if(_state != sock_connect) {
-		dprintf(D_ALWAYS,"ERROR: SafeSock::sender_ip_str() called on socket tht is not in connected state\n");
+		dprintf(D_ALWAYS,"ERROR: SafeSock::my_ip_str() called on socket that is not in connected state\n");
 		return NULL;
 	}
 
@@ -298,12 +239,16 @@ SafeSock::my_ip_str()
 	}
 
 	SafeSock s;
-	s.bind(true);
+	if( ! s.bind(_who.get_protocol(), true, 0, false) )
+	{
+		dprintf(D_ALWAYS,"ERROR: SafeSock::my_ip_str()'s attempt to bind a new SafeSock failed.\n");
+		return NULL;
+	}
 
 	if (s._state != sock_bound) {
 		dprintf(D_ALWAYS,
 		        "SafeSock::my_ip_str() failed to bind: _state = %d\n",
-			  s._state); 
+			  s._state);
 		return NULL;
 	}
 
@@ -334,16 +279,21 @@ int SafeSock::connect(
 {
 	if (!host || port < 0) return FALSE;
 
-	_who.clear();
-	if (!Sock::guess_address_string(host, port, _who))
-		return FALSE;
+	std::string addr;
+	if( chooseAddrFromAddrs( host, addr ) ) {
+		host = addr.c_str();
+	} else {
+		_who.clear();
+		if (!Sock::guess_address_string(host, port, _who))
+			return FALSE;
 
-	if (host[0] == '<') {
-		set_connect_addr(host);
-		} else {
-		set_connect_addr(_who.to_sinful().Value());
+		if (host[0] == '<') {
+			set_connect_addr(host);
+			} else {
+			set_connect_addr(_who.to_sinful().Value());
+		}
+    	addr_changed();
 	}
-    addr_changed();
 
 	// now that we have set _who (useful for getting informative
 	// peer_description), see if we should do a reverse connect
@@ -357,7 +307,7 @@ int SafeSock::connect(
 	/* assigned to the stream if needed		*/
 	/* TRUE means this is an outgoing connection */
 	if (_state == sock_virgin || _state == sock_assigned) {
-		bind(true);
+		bind( _who.get_protocol(), true, 0, false );
 	}
 
 	if (_state != sock_bound) {
@@ -396,41 +346,37 @@ int SafeSock::connect(
  */
 int SafeSock::put_bytes(const void *data, int sz)
 {
-	int bytesPut, l_out;
-    unsigned char * dta = 0;
+	int bytesPut;
 
-    //char str[10000];
-    //str[0] = 0;
-    //for(int idx=0; idx<sz; idx++) { sprintf(&str[strlen(str)], "%02x,", ((char *)data)[idx]); }
-    //dprintf(D_NETWORK, "---> cleartext: %s\n", str);
 
     // Check to see if we need to encrypt
     // This works only because putn will actually put all 
     if (get_encryption()) {
-        if (!wrap((unsigned char *)const_cast<void*>(data), sz, dta , l_out)) { 
+		int l_out;
+		unsigned char * dta = 0;
+        if (!wrap((const unsigned char *)data, sz, dta , l_out)) {
             dprintf(D_SECURITY, "Encryption failed\n");
             return -1;  // encryption failed!
         }
-    }
-    else {
-        dta = (unsigned char *) malloc(sz);
-        memcpy(dta, data, sz);
-    }
-    
-    // Now, add to the MAC
-    if (mdChecker_) {
-        mdChecker_->addMD(dta, sz);
-    }
+			// Now, add to the MAC
+		if (mdChecker_) {
+			mdChecker_->addMD(dta, sz);
+		}
 
-    //str[0] = 0;
-    //for(int idx=0; idx<sz; idx++) { sprintf(&str[strlen(str)], "%02x,", dta[idx]); }
-    //dprintf(D_NETWORK, "---> ciphertext: %s\n", str);
+		bytesPut = _outMsg.putn((char *)dta, sz);
+    
+		free(dta);
+		return bytesPut;
 
-    bytesPut = _outMsg.putn((char *)dta, sz);
-    
-    free(dta);
-    
-	return bytesPut;
+    } else {
+			// Now, add to the MAC
+		if (mdChecker_) {
+			mdChecker_->addMD((const unsigned char *)data, sz);
+		}
+
+		bytesPut = _outMsg.putn((const char *)data, sz);
+		return bytesPut;
+	}
 }
 
 
@@ -457,54 +403,55 @@ int SafeSock::get_bytes(void *dta, int size)
 			if ( selector.timed_out() ) {
 				return 0;
 			} else if ( !selector.has_ready() ) {
-					dprintf(D_NETWORK, "select returns %d, recv failed\n",
-							selector.select_retval());
-					return 0;
+				dprintf(D_NETWORK, "select returns %d, recv failed\n",
+						selector.select_retval());
+				return 0;
 			}
 		}
 		(void)handle_incoming_packet();
 	}
 
-	char *tempBuf = (char *)malloc(size);
-    if (!tempBuf) { EXCEPT("malloc failed"); }
 	int readSize, length;
     unsigned char * dec;
 
-	if(_longMsg) {
-        // long message 
-        readSize = _longMsg->getn(tempBuf, size);
-    }
-	else { 
-        // short message
-        readSize = _shortMsg.getn(tempBuf, size);
-    }
+	if (get_encryption()) {
+		if(_longMsg) {
+				// long message 
+			readSize = _longMsg->getn((char *)dta, size);
+		}
+		else { 
+				// short message
+			readSize = _shortMsg.getn((char *)dta, size);
+		}
 
-    //char str[10000];
-    //str[0] = 0;
-    //for(int idx=0; idx<readSize; idx++) { sprintf(&str[strlen(str)], "%02x,", tempBuf[idx]); }
-    //dprintf(D_NETWORK, "<--- ciphertext: %s\n", str);
-
-	if(readSize == size) {
-            if (get_encryption()) {
-                unwrap((unsigned char *) tempBuf, readSize, dec, length);
-                memcpy(dta, dec, readSize);
-                free(dec);
-            }
-            else {
-                memcpy(dta, tempBuf, readSize);
-            }
-
-            //str[0] = 0;
-            //for(int idx=0; idx<size; idx++) { sprintf(&str[strlen(str)], "%02x,", ((char *)dta)[idx]); }
-            //dprintf(D_NETWORK, "<--- cleartext: %s\n", str);
-
-            free(tempBuf);
-            return readSize;
+		if (readSize == size) {
+			unwrap((unsigned char *) dta, readSize, dec, length);
+			memcpy(dta, dec, readSize);
+			free(dec);
+			return readSize;
+		} else {
+			dprintf(D_NETWORK,
+					"SafeSock::get_bytes - failed because bytes read is different from bytes requested\n");
+			return -1;
+		}
 	} else {
-		free(tempBuf);
-        dprintf(D_NETWORK,
-                "SafeSock::get_bytes - failed because bytes read is different from bytes requested\n");
-		return -1;
+			// no encryption
+		if(_longMsg) {
+				// long message 
+			readSize = _longMsg->getn((char *)dta, size);
+		}
+		else { 
+				// short message
+			readSize = _shortMsg.getn((char *)dta, size);
+		}
+
+		if (readSize == size) {
+			return readSize;
+		} else {
+			dprintf(D_NETWORK,
+					"SafeSock::get_bytes - failed because bytes read is different from bytes requested\n");
+			return -1;
+		}
 	}
 }
 
@@ -593,12 +540,6 @@ int SafeSock::peek(char &c)
 int SafeSock::handle_incoming_packet()
 {
 
-//#if defined(Solaris27) || defined(Solaris28) || defined(Solaris29) || defined(Solaris10) || defined(Solaris11)
-	/* SOCKET_ALTERNATE_LENGTH_TYPE is void on this platform, and
-		since noone knows what that void* is supposed to point to
-		in recvfrom, I'm going to predict the "fromlen" variable
-		the recvfrom uses is a size_t sized quantity since
-		size_t is how you count bytes right?  Stupid Solaris. */
 	bool last;
 	int seqNo, length;
 	_condorMsgID mID;
@@ -646,14 +587,10 @@ int SafeSock::handle_incoming_packet()
 		dprintf(D_NETWORK, "recvfrom failed: errno = %d\n", errno);
 		return FALSE;
 	}
-    char str[50];
-    sprintf(str, "%s", sock_to_string(_sock));
-    dprintf( D_NETWORK, "RECV %d bytes at %s from %s\n",
-			 received, str, _who.to_sinful().Value());
-    //char temp_str[10000];
-    //temp_str[0] = 0;
-    //for (int i=0; i<received; i++) { sprintf(&temp_str[strlen(temp_str)], "%02x,", _shortMsg.dataGram[i]); }
-    //dprintf(D_NETWORK, "<---packet [%d bytes]: %s\n", received, temp_str);
+
+	if (IsDebugLevel(D_NETWORK))
+    	dprintf( D_NETWORK, "RECV %d bytes at %s from %s\n",
+			 received, sock_to_string(_sock), _who.to_sinful().Value());
 
 	length = received;
     _shortMsg.reset(); // To be sure
@@ -713,7 +650,7 @@ int SafeSock::handle_incoming_packet()
     }   
     if(tempMsg != NULL) { // found
         if (seqNo == 0) {
-            tempMsg->set_sec(_shortMsg.isDataMD5ed(),
+            tempMsg->set_sec(_shortMsg.isDataHashed(),
                     _shortMsg.md(),
                     _shortMsg.isDataEncrypted());
         }
@@ -734,7 +671,7 @@ int SafeSock::handle_incoming_packet()
     } else { // not found
         if(prev) { // add a new message at the end of the chain
             prev->nextMsg = new _condorInMsg(mID, last, seqNo, length, data, 
-                                             _shortMsg.isDataMD5ed(), 
+                                             _shortMsg.isDataHashed(),
                                              _shortMsg.md(), 
                                              _shortMsg.isDataEncrypted(), prev);
             if(!prev->nextMsg) {    
@@ -744,7 +681,7 @@ int SafeSock::handle_incoming_packet()
             //prev->nextMsg->dumpMsg();
         } else { // first message in the bucket
             _inMsgs[index] = new _condorInMsg(mID, last, seqNo, length, data, 
-                                              _shortMsg.isDataMD5ed(), 
+                                              _shortMsg.isDataHashed(),
                                               _shortMsg.md(), 
                                               _shortMsg.isDataEncrypted(), NULL);
             if(!_inMsgs[index]) {
@@ -800,25 +737,19 @@ int SafeSock::attach_to_file_desc(int fd)
 
 char * SafeSock::serialize() const
 {
-	// here we want to save our state into a buffer
-
-	// first, get the state from our parent class
 	char * parent_state = Sock::serialize();
-	// now concatenate our state
-	char outbuf[50];
 
-    memset(outbuf, 0, 50);
+	MyString state;
+	formatstr( state, "%s%d*%s*", parent_state, _special_state, _who.to_sinful().Value() );
+	delete[] parent_state;
 
-	sprintf(outbuf,"%d*%s*", _special_state, _who.to_sinful().Value());
-	strcat(parent_state,outbuf);
-
-	return( parent_state );
+	return state.detach_buffer();
 }
 
-char * SafeSock::serialize(char *buf)
+const char * SafeSock::serialize(const char *buf)
 {
 	char * sinful_string = NULL;
-	char *ptmp, *ptr = NULL;
+	const char *ptmp, *ptr = NULL;
     
 	ASSERT(buf);
 	// here we want to restore our state from the incoming buffer
@@ -856,7 +787,7 @@ char * SafeSock::serialize(char *buf)
 	return NULL;
 }
 
-const char * SafeSock :: isIncomingDataMD5ed()
+const char * SafeSock :: isIncomingDataHashed()
 {
     char c;
     if (!peek(c)) {
@@ -865,10 +796,10 @@ const char * SafeSock :: isIncomingDataMD5ed()
     else {
         if(_longMsg) {
             // long message 
-            return _longMsg->isDataMD5ed();
+            return _longMsg->isDataHashed();
         }
         else { // short message
-            return _shortMsg.isDataMD5ed();
+            return _shortMsg.isDataHashed();
         }
     }
 }
@@ -998,4 +929,54 @@ SafeSock::sendTargetSharedPortID()
 bool
 SafeSock::msgReady() {
 	return _msgReady;
+}
+
+/* static */ int
+SafeSock::recvQueueDepth(int port) {
+	int depth = 0;
+#ifdef LINUX
+	FILE *f = NULL;
+
+	f = fopen("/proc/net/udp", "r");
+	if (!f) {
+		dprintf(D_ALWAYS, "Cannot open /proc/net/udp, no UDP statistics will be available\n");
+		return 0;
+	}
+	// /proc/net/udp entries look like
+	//   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             
+	// 1: 00000000:9C7E 00000000:0000 07 00000000:00000000 00:00000000 00000000 28297        0 570473 2 ffff8803b781fc00 0     
+
+	// skip first line, it is a header
+	char skipLine[256];
+	if (fgets(skipLine, sizeof(skipLine), f) == NULL) {
+		fclose(f);
+		return 0;
+	};
+
+	int sl = 0;
+	int localAddr = 0;
+	int localPort = 0;
+	int remoteAddr = 0;
+	int remotePort = 0;
+	int status = 0;
+	int tx_queue = 0;
+	int queueDepth = 0;
+	while (fscanf(f, "%d: %x:%x %x:%x %x %x:%x\n", &sl, &localAddr, &localPort, &remoteAddr, &remotePort, &status, &tx_queue, &queueDepth) > 1) {
+
+		if (localPort == port) {
+			depth = queueDepth;
+		}
+		// skip to beginning of next line
+		if (fgets(skipLine, sizeof(skipLine), f) == NULL) {
+			dprintf(D_ALWAYS, "Error skipping to end of in /proc/net/udp\n");
+			fclose(f);
+			return -1;
+		}
+	}
+	fclose(f);
+#else
+	// Shut the compiler up
+	(void)port;
+#endif
+	return depth;
 }

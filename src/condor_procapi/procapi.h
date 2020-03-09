@@ -33,19 +33,9 @@
 
 #ifndef WIN32 // all the below is for UNIX
 
-#include <strings.h>       // sprintf, atol
 #include <dirent.h>        // get /proc entries (directory stuff)
-#include <ctype.h>         // isdigit
-#include <errno.h>         // for perror
-#include <fcntl.h>         // open()
-#include <unistd.h>        // getpagesize()
 #include <sys/types.h>     // various types needed.
 #include <time.h>          // use of time() for process age. 
-
-#ifdef HPUX                // hpux has to be different, of course.
-#include <sys/param.h>     // used in pstat().
-#include <sys/pstat.h>
-#endif
 
 #ifdef Darwin
 #include <sys/sysctl.h>
@@ -63,18 +53,6 @@
 #include <sys/proc.h>
 #include <sys/user.h>
 #endif 
-
-#ifdef AIX
-#include <procinfo.h>
-#include <sys/types.h>
-BEGIN_C_DECLS
-/* For being the "new" interface for AIX, this isn't defined in the headers. */
-extern int getprocs64(struct procentry64*, int, struct fdsinfo64*, int,
-        pid_t*, int);
-END_C_DECLS
-/* AIX # defines the following symbol, which we use later as a formal param*/
-#undef l_name
-#endif
 
 #else // It's WIN32...
 // Warning: WIN32 stuff below.
@@ -190,7 +168,7 @@ typedef long birthday_t;
     calls don't have to be made.  All OS's support the given information,
     WITH THE EXCEPTION OF MAJ/MIN FAULTS:
     <ul>
-     <li> Linux and Hpux return a reasonable-looking number.
+     <li> Linux returns a reasonable-looking number.
      <li> Solaris 2.5.1 and 2.6 *Sometimes* returns small number of major 
         faults, and I've only seen a 0 for minor faults.  The documentation
         claims that they are inexact values, anyway.
@@ -355,9 +333,6 @@ struct pidlist {
 };
 typedef struct pidlist * pidlistPTR;
 
-const int PHBUCKETS = 101;  // why 101?  Well...it's slightly greater than
-                            // your average # of processes, and it's prime. 
-
 /** procHashNode is used to hold information in the hashtable.  It is used
     to save the state of certain things that need to be sampled over time.
     For instance, the number of page faults is always given as a number 
@@ -396,7 +371,7 @@ struct procHashNode {
  *  HashTable of processes. Other code may want to use it for their
  *  own pid-keyed HashTables. The condor_procd does.
  */
-unsigned int pidHashFunc ( const pid_t& pid );
+size_t pidHashFunc ( const pid_t& pid );
 
 /** The ProcAPI class returns information about running processes.  It is
     possible to get information for:
@@ -443,7 +418,7 @@ class ProcAPI {
 
   /** getProcInfo returns information about one process.  Information 
       can be retrieved on any process owned by the same user, and on some
-      systems (Linux, HPUX, Sol2.6) information can be gathered from all 
+      systems (Linux, Sol2.6) information can be gathered from all 
       processes.  
 
       @param pid The pid of the process you want info on.
@@ -701,7 +676,6 @@ private:
   /* Using condor's HashTable template class.  I'm storing a procHashNode, 
      hashed on a pid. */
   static HashTable <pid_t, procHashNode *> *procHash;
-  friend unsigned int pidHashFunc ( const pid_t& pid );
 
   // private data structures:
   static piPTR allProcInfos; // this will be a linked list of 

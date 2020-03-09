@@ -25,13 +25,13 @@
 #include <set>
 #include <map>
 #include <vector>
-#include <sstream>
-#include "classad/classad_stl.h"
+#include "classad/classad_containers.h"
 #include "classad/exprTree.h"
 
 namespace classad {
 
 typedef std::set<std::string, CaseIgnLTStr> References;
+typedef std::set<std::string, CaseIgnSizeLTStr> ReferencesBySize;
 typedef std::map<const ClassAd*, References> PortReferences;
 
 #if defined( EXPERIMENTAL )
@@ -52,22 +52,10 @@ bool ClassAdGetExpressionCaching();
 // This flag is only meant for use in Condor, which is transitioning
 // from an older version of ClassAds with slightly different evaluation
 // semantics. It will be removed without warning in a future release.
+// The function SetOldClassAdSemantics() should be used instead of
+// directly setting _useOldClassAdSemantics.
 extern bool _useOldClassAdSemantics;
-
-template <class T>
-void val_str(std::string & szOut, const T & tValue)
-{
-  std::stringstream foo;
-  foo<<tValue;
-  szOut = foo.str();
-}
-template<bool>
-void val_str(std::string & szOut, const bool & tValue)
-{
-  std::stringstream foo;
-  foo <<(tValue?"true":"false");
-  szOut = foo.str();
-}
+void SetOldClassAdSemantics(bool enable);
 
 /// The ClassAd object represents a parsed %ClassAd.
 class ClassAd : public ExprTree
@@ -110,10 +98,25 @@ class ClassAd : public ExprTree
 			@return true if the operation succeeded, false otherwise.
 			@see ExprTree::setParentScope
 		*/
-		bool Insert( const std::string& attrName, ExprTree *& pRef, bool cache=true);
-		bool Insert( const std::string& attrName, ClassAd *& expr, bool cache=true );
-		bool Insert( const std::string& serialized_nvp);
+		bool Insert( const std::string& attrName, ExprTree* expr);   // (ignores cache)
+		bool InsertLiteral(const std::string& attrName, Literal* lit); // (ignores cache)
 
+		// insert through cache if cache is enabled, otherwise just parse and insert
+		// parsing of the rhs expression is done use old ClassAds syntax
+		bool InsertViaCache( std::string& attrName, const std::string & rhs, bool lazy=false);
+
+		/** Insert an attribute/value into the ClassAd
+		 *  @param str A string of the form "Attribute = Value"
+		 *  InsertViaCache() is used to do the actual insertion, so the
+		 *    value is parsed into an ExprTree in old ClassAds syntax.
+		 */
+	bool Insert(const char *str);
+	bool Insert(const std::string &str);
+
+		/* Insert an attribute/value into the Classad.
+		 * The value is parsed into an ExprTree using old ClassAds syntax.
+		 */
+	bool AssignExpr(const std::string &name, const char *value);
 
 		/** Inserts an attribute into a nested classAd.  The scope expression is
 		 		evaluated to obtain a nested classad, and the attribute is 
@@ -135,13 +138,26 @@ class ClassAd : public ExprTree
 			@param value The integer value of the attribute.
 			@param f The multiplicative factor to be attached to value.
 			@see Value::NumberFactor
-e		*/
+		*/
 		bool InsertAttr( const std::string &attrName,int value, 
 				Value::NumberFactor f=Value::NO_FACTOR );
 		bool InsertAttr( const std::string &attrName,long value, 
 				Value::NumberFactor f=Value::NO_FACTOR );
 		bool InsertAttr( const std::string &attrName,long long value, 
-				Value::NumberFactor f=Value::NO_FACTOR );
+				Value::NumberFactor f );
+		bool InsertAttr( const std::string &attrName,long long value );
+		bool Assign(const std::string &name, int value)
+		{ return InsertAttr(name, value); }
+		bool Assign(const std::string &name, unsigned int value)
+		{ return InsertAttr(name, (long long)value); }
+		bool Assign(const std::string &name,long value)
+		{ return InsertAttr(name, value); }
+		bool Assign(const std::string &name, long long value)
+		{ return InsertAttr(name, value); }
+		bool Assign(const std::string &name, unsigned long value)
+		{ return InsertAttr(name, (long long)value); }
+		bool Assign(const std::string &name, unsigned long long value)
+		{ return InsertAttr(name, (long long)value); }
 
 		/** Inserts an attribute into a nested classad.  The scope expression 
 		 		is evaluated to obtain a nested classad, and the attribute is
@@ -171,7 +187,12 @@ e		*/
             @return true on success, false otherwise
 		*/
 		bool InsertAttr( const std::string &attrName,double value, 
-				Value::NumberFactor f=Value::NO_FACTOR);
+				Value::NumberFactor f);
+		bool InsertAttr( const std::string &attrName,double value);
+		bool Assign(const std::string &name, float value)
+		{ return InsertAttr(name, (double)value); }
+		bool Assign(const std::string &name, double value)
+		{ return InsertAttr(name, value); }
 
 		/** Inserts an attribute into a nested classad.  The scope expression
 		 		is evaluated to obtain a nested classad, and the insertion is
@@ -195,6 +216,8 @@ e		*/
 			@param value The boolean value of the attribute.
 		*/
 		bool InsertAttr( const std::string &attrName, bool value );
+		bool Assign(const std::string &name, bool value)
+		{ return InsertAttr(name, value); }
 
 		/** Inserts an attribute into a nested classad.  The scope expression
 		 		is evaluated to obtain a nested classad, and the insertion is
@@ -216,6 +239,9 @@ e		*/
 			@param value The string attribute
 		*/
 		bool InsertAttr( const std::string &attrName, const char *value );
+		bool InsertAttr( const std::string &attrName, const char * str, size_t len );
+		bool Assign(const std::string &name,char const *value)
+		{ if (value==NULL) return false; else return InsertAttr( name, value ); }
 
 		/** Inserts an attribute into a nested classad.  The scope expression
 		 		is evaluated to obtain a nested classad, and the insertion is
@@ -236,6 +262,8 @@ e		*/
 			@param value The string attribute
 		*/
 		bool InsertAttr( const std::string &attrName, const std::string &value );
+		bool Assign(const std::string &name, const std::string &value)
+		{ return InsertAttr(name, value); }
 
 		/** Inserts an attribute into a nested classad.  The scope expression
 		 		is evaluated to obtain a nested classad, and the insertion is
@@ -259,6 +287,17 @@ e		*/
 				otherwise.
 		*/
 		ExprTree *Lookup( const std::string &attrName ) const;
+		ExprTree* LookupExpr(const std::string &name) const
+		{ return Lookup( name ); }
+
+		/** Finds the expression bound to an attribute name, ignoring chained parent.
+		        Behaves just like Lookup(), except any parent ad chained to this
+				ad is ignored.
+			@param attrName The name of the attribute.
+			@return The expression bound to the name in the ClassAd, or NULL
+				otherwise.
+		*/
+		ExprTree *LookupIgnoreChain( const std::string &attrName ) const;
 
 		/** Finds the expression bound to an attribute name.  The lookup uses
 				the scoping structure (including <tt>super</tt> attributes) to 
@@ -408,6 +447,12 @@ e		*/
 		bool EvaluateAttrNumber( const std::string &attr, int& intValue ) const;
 		bool EvaluateAttrNumber( const std::string &attr, long& intValue ) const;
 		bool EvaluateAttrNumber( const std::string &attr, long long& intValue ) const;
+		bool LookupInteger(const std::string &name, int &value) const
+		{ return EvaluateAttrNumber(name, value); }
+		bool LookupInteger(const std::string &name, long &value) const
+		{ return EvaluateAttrNumber(name, value); }
+		bool LookupInteger(const std::string &name, long long &value) const
+		{ return EvaluateAttrNumber(name, value); }
 
 		/** Evaluates an attribute to a real.  If the attribute evaluated to an 
 				integer, it is promoted to a real.
@@ -418,6 +463,15 @@ e		*/
 			@return true if attrName evaluated to a number, false otherwise.
 		*/
 		bool EvaluateAttrNumber(const std::string &attr,double& realValue) const;
+		bool LookupFloat(const std::string &name, float &value) const
+		{
+			double dval;
+			bool rc = EvaluateAttrNumber(name, dval);
+			if ( rc ) value = dval;
+			return rc;
+		}
+		bool LookupFloat(const std::string &name, double &value) const
+		{ return EvaluateAttrNumber(name, value); }
 
 		/** Evaluates an attribute to a string.  If the string value does not 
 				fit into the buffer, only the portion that does fit is copied 
@@ -429,6 +483,15 @@ e		*/
 		*/
 		bool EvaluateAttrString( const std::string &attr, char *buf, int len) 
 				const;
+		bool LookupString(const std::string &name, char *value, int max_len) const
+		{ return EvaluateAttrString( name, value, max_len ); }
+		bool LookupString(const std::string &name, char **value) const
+		{
+			std::string sval;
+			bool rc = EvaluateAttrString(name, sval);
+			if ( rc ) *value = strdup(sval.c_str());
+			return rc;
+		}
 
 		/** Evaluates an attribute to a string.  If the string value does not 
 				fit into the buffer, only the portion that does fit is copied 
@@ -438,15 +501,28 @@ e		*/
 			@return true iff attrName evaluated to a string
 		*/
 		bool EvaluateAttrString( const std::string &attr, std::string &buf ) const;
+		bool LookupString(const std::string &name, std::string &value) const
+		{ return EvaluateAttrString( name, value ); }
 
-		/** Evaluates an attribute to a boolean.  A pointer to the string is 
-				returned.
+		/** Evaluates an attribute to a boolean.
 			@param attr The name of the attribute.
 			@param boolValue The value of the attribute.
 			@return true if attrName evaluated to a boolean value, false 
 				otherwise.
 		*/
 		bool EvaluateAttrBool( const std::string &attr, bool& boolValue ) const;
+
+		/** Evaluates an attribute to a boolean. If old ClassAd semantics
+				are enabled, then numerical values will be converted to the
+				appropriate boolean value.
+			@param attr The name of the attribute.
+			@param boolValue The value of the attribute.
+			@return true if attrName evaluated to a boolean value, false 
+				otherwise.
+		*/
+		bool EvaluateAttrBoolEquiv( const std::string &attr, bool& boolValue ) const;
+		bool LookupBool(const std::string &name, bool &value) const
+		{ return EvaluateAttrBoolEquiv(name, value); }
 
 		/** Evaluates an attribute to a ClassAd.  A pointer to the ClassAd is 
 				returned. You do not own the ClassAd--do not free it.
@@ -521,14 +597,16 @@ e		*/
 
         /** Return the number of attributes at the root level of this ClassAd.
          */
-        int size(void) const { return attrList.size(); }
+        int size(void) const { return (int)attrList.size(); }
 		//@}
 
+		void rehash(size_t s) { attrList.rehash(s);}
 		/** Deconstructor to get the components of a classad
 		 * 	@param vec A vector of (name,expression) pairs which are the
 		 * 		attributes of the classad
 		 */
 		void GetComponents( std::vector< std::pair< std::string, ExprTree *> > &vec ) const;
+		void GetComponents( std::vector< std::pair< std::string, ExprTree *> > &vec, const References &whitelist ) const;
 
         /** Make sure everything in the ad is in this ClassAd.
          *  This is different than CopyFrom() because we may have many 
@@ -557,6 +635,16 @@ e		*/
          */
 		ClassAd &operator=(const ClassAd &rhs);
 
+		ClassAd &operator=(ClassAd &&rhs) {
+			this->do_dirty_tracking = rhs.do_dirty_tracking;
+			this->chained_parent_ad = rhs.chained_parent_ad;
+			this->alternateScope = rhs.alternateScope;
+
+			this->dirtyAttrList = std::move(rhs.dirtyAttrList);
+			this->attrList = std::move(rhs.attrList);
+
+			return *this;
+		}
         /** Fill in this ClassAd with the contents of the other ClassAd.
          *  This ClassAd is cleared of its contents before the copy happens.
          *  @return true if the copy succeeded, false otherwise.
@@ -600,7 +688,7 @@ e		*/
          *  @param fullNames true if you want full names (like other.foo)
          *  @return true on success, false on failure. 
          */
-		bool GetExternalReferences( const ExprTree *tree, References &refs, bool fullNames );
+		bool GetExternalReferences( const ExprTree *tree, References &refs, bool fullNames ) const;
 
         /** Return a list of attribute references in the expression that are not 
          *  contained within this ClassAd.
@@ -609,7 +697,7 @@ e		*/
          *  @param refs The list of references
          *  @return true on success, false on failure. 
          */
-		bool GetExternalReferences(const ExprTree *tree, PortReferences &refs);
+		bool GetExternalReferences(const ExprTree *tree, PortReferences &refs) const;
 		//@}
 
 
@@ -618,10 +706,10 @@ e		*/
          *  @param tree The ExprTree for the expression that has references 
          *      that you wish to know about. 
          *  @param refs The list of references
-         *  @param fullNames true if you want full names (like other.foo)
+         *  @param fullNames ignored
          *  @return true on success, false on failure. 
          */
-        bool GetInternalReferences( const ExprTree *tree, References &refs, bool fullNames);
+        bool GetInternalReferences( const ExprTree *tree, References &refs, bool fullNames) const;
 
 #if defined( EXPERIMENTAL )
 		bool AddRectangle( const ExprTree *tree, Rectangles &r, 
@@ -645,7 +733,13 @@ e		*/
 		/** If there is a chained parent remove redundant entries.
 		 */
 		int 		PruneChildAd();
-		
+
+		/** If there is a chained parent remove this attribute from the child ad only
+		 *  if there is no chained parent ad, this function does nothing - you should use the Delete method in that case
+		 * @param if_child_matches, remove the attribute only if value in the child ad matches the value in the chained parent ad
+		 */
+		bool 		PruneChildAttr(const std::string & attrName, bool if_child_matches=true);
+
         /** If we are chained to a parent ad, remove the chain. 
          */
 		void		Unchain(void);
@@ -672,6 +766,10 @@ e		*/
 
 		/**@name Dirty Tracking */
         //@{
+		/** enable or disable dirty tracking for this ClassAd
+		 *  and return whether dirty track was previously enabled or disabled.
+		 */
+		bool       SetDirtyTracking(bool enable) { bool was_enabled = do_dirty_tracking; do_dirty_tracking = enable; return was_enabled; }
         /** Turn on dirty tracking for this ClassAd. 
          *  If tracking is on, every insert will label the attribute that was inserted
          *  as dirty. Dirty tracking is always turned off during Copy() and
@@ -687,7 +785,11 @@ e		*/
         /** Mark a particular attribute as dirty
          * @param name The attribute name
          */
-		void        MarkAttributeDirty(const std::string &name);
+
+		void        MarkAttributeDirty(const std::string &name) {
+			if (do_dirty_tracking) dirtyAttrList.insert(name);
+		}
+
         /** Mark a particular attribute as not dirty 
          * @param name The attribute name
          */
@@ -722,20 +824,22 @@ e		*/
 		 */
 		ClassAd *alternateScope;
 
+		virtual const ClassAd *GetParentScope( ) const { return( parentScope ); }
+
   	private:
 		friend 	class AttributeReference;
 		friend 	class ExprTree;
 		friend 	class EvalState;
 		friend 	class ClassAdIterator;
 
-		bool _GetExternalReferences( const ExprTree *, ClassAd *, 
-					EvalState &, References&, bool fullNames );
+		bool _GetExternalReferences( const ExprTree *, const ClassAd *, 
+					EvalState &, References&, bool fullNames ) const;
 
-		bool _GetExternalReferences( const ExprTree *, ClassAd *, 
-					EvalState &, PortReferences& );
+		bool _GetExternalReferences( const ExprTree *, const ClassAd *, 
+					EvalState &, PortReferences& ) const;
 
-        bool _GetInternalReferences(const ExprTree *expr, ClassAd *ad,
-            EvalState &state, References& refs, bool fullNames);
+        bool _GetInternalReferences(const ExprTree *expr, const ClassAd *ad,
+            EvalState &state, References& refs, bool fullNames) const;
 #if defined( EXPERIMENTAL )
 		bool _MakeRectangles(const ExprTree*,const std::string&,Rectangles&, bool);
 		bool _CheckRef( ExprTree *, const std::string & );
@@ -754,6 +858,7 @@ e		*/
 		DirtyAttrList dirtyAttrList;
 		bool          do_dirty_tracking;
 		ClassAd       *chained_parent_ad;
+		const ClassAd *parentScope;
 };
 
 } // classad

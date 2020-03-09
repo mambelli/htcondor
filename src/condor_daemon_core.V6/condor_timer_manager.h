@@ -101,11 +101,14 @@ typedef struct tagTimer Timer;
 class TimerManager
 {
   public:
-    
-    ///
-    TimerManager();
+
+    static TimerManager &GetTimerManager();
+
     ///
     ~TimerManager();
+
+    // Invoked by daemonCore on a reconfig and also on startup
+    void reconfig();
 
     /** Not_Yet_Documented.
         @param deltawhen      Not_Yet_Documented.
@@ -145,6 +148,16 @@ class TimerManager
                   TimerHandlercpp handler,
                   const char * event_descrip,
                   unsigned     period          =  0);
+
+    /** Create a timer using a timeslice object to control interval.
+        @param timeslice      Timeslice object specifying interval parameters
+        @param handler        Function to call when timer fires.
+        @param event_descrip  String describing the function.
+        @return The ID of the new timer, or -1 on failure
+    */
+    int NewTimer (const Timeslice &timeslice,
+                  TimerHandler handler,
+                  const char * event_descrip);
 
     /** Create a timer using a timeslice object to control interval.
         @param s              Service object of which function is a member.
@@ -201,6 +214,13 @@ class TimerManager
 	 */
 	bool GetTimerTimeslice(int id, Timeslice &timeslice);
 
+	/**
+	 * Get the time_t of when the given timer ID will fire.
+	 * @param tid The ID of the timer
+	 * @return Timestamp of when this will fire; 0 if there is no such timer.
+	 */
+	time_t GetNextRuntime(int id);
+
     /// Not_Yet_Documented.
     void CancelAllTimers();
 
@@ -216,6 +236,9 @@ class TimerManager
     void Start();
     
   private:
+
+    ///
+    TimerManager();
     
     int NewTimer (Service*   s,
                   unsigned   deltawhen,
@@ -244,6 +267,20 @@ class TimerManager
     Timer*  in_timeout;
     bool    did_reset;
 	bool    did_cancel;
+
+    /* max_timer_events_per_cycle sets the maximum number of timer handlers
+    we will invoke per call to Timeout().  This limit prevents timers
+    from starving other kinds other DC handlers (i.e. it make certain
+    that we make it back to the Driver() loop occasionally.  The higher
+    the number, the more "timely" timer callbacks will be.  The lower
+    the number, the more responsive non-timer calls (like commands)
+    will be in the face of many timers coming due.
+    A value of zero means invoke every timer callback that is due at the
+    time we first enter Timeout(), but do not invoke new timers registered/reset
+    during the timeout.
+    */
+    int max_timer_events_per_cycle;
+
 };
 
 #endif

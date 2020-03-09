@@ -25,6 +25,7 @@
 #include "condor_classad.h"
 #include "condor_attributes.h"
 #include "pool_allocator.h"
+#include "tokener.h"
 
 enum {
 	FormatOptionNoPrefix = 0x01,
@@ -33,28 +34,51 @@ enum {
 	FormatOptionAutoWidth = 0x08,
 	FormatOptionLeftAlign = 0x10,
 	FormatOptionAlwaysCall = 0x80,
+	FormatOptionHideMe    = 0x100,
+	FormatOptionFitToData = 0x200,	  // for use by the adjust_formats callback
+
+	FormatOptionSpecialBase = 0x1000, // for use by the adjust_formats callback
+	FormatOptionSpecialMask = 0xF000, // for use by the adjust_formats callback
+
+	AltQuestion = 0x10000,     // alt text is ?
+	AltStar     = 0x20000,     // alt text is *
+	AltDot      = 0x30000,     // alt text is .
+	AltDash     = 0x40000,     // alt text is -
+	AltUnder    = 0x50000,     // alt text is _
+	AltPound    = 0x60000,     // alt text is #
+	AltZero     = 0x70000,     // alt text is 0
+	AltMask     = 0x70000,     // mask to extract alt text type
+	AltWide     = 0x80000,     // alt text is the width of the field with [] around it
 };
 
-typedef const char *(*IntCustomFormat)(int,AttrList*,struct Formatter &);
-typedef const char *(*FloatCustomFormat)(double,AttrList*,struct Formatter &);
-typedef const char *(*StringCustomFormat)(const char*,AttrList*,struct Formatter &);
-typedef const char *(*AlwaysCustomFormat)(AttrList*,struct Formatter &);
-typedef const char *(*ValueCustomFormat)(const classad::Value & value, AttrList*,struct Formatter &);
+typedef const char *(*IntCustomFormat)(long long, struct Formatter &);
+typedef const char *(*FloatCustomFormat)(double, struct Formatter &);
+typedef const char *(*StringCustomFormat)(const char*, struct Formatter &);
+//typedef const char *(*AlwaysCustomFormat)(ClassAd*,struct Formatter &);
+typedef const char *(*ValueCustomFormat)(const classad::Value & value, struct Formatter &);
+typedef bool (*StringCustomRender)(std::string & str, ClassAd*, struct Formatter &);
+typedef bool (*IntCustomRender)(long long & lval, ClassAd*, struct Formatter &);
+typedef bool (*FloatCustomRender)(double & dval, ClassAd*, struct Formatter &);
+typedef bool (*ValueCustomRender)(classad::Value & value, ClassAd*, struct Formatter &);
 
 class CustomFormatFn {
 public:
-	enum FormatKind { PRINTF_FMT=0, INT_CUSTOM_FMT, FLT_CUSTOM_FMT, STR_CUSTOM_FMT, ALWAYS_CUSTOM_FMT, VALUE_CUSTOM_FMT };
+	enum FormatKind { PRINTF_FMT=0, INT_CUSTOM_FMT, FLT_CUSTOM_FMT, STR_CUSTOM_FMT, VALUE_CUSTOM_FMT, INT_CUSTOM_RENDER, FLT_CUSTOM_RENDER, STR_CUSTOM_RENDER, VALUE_CUSTOM_RENDER };
 	operator StringCustomFormat() const { return reinterpret_cast<StringCustomFormat>(pfn); }
 	char Kind() const { return (char)fn_type; }
 	bool IsString() const { return fn_type == STR_CUSTOM_FMT; }
 	bool IsNumber() const { return fn_type >= INT_CUSTOM_FMT && fn_type <= FLT_CUSTOM_FMT; }
 	bool Is(IntCustomFormat pf) const { return (void*)pf == pfn; } // This hack is for the condor_status code...
+	bool Is(IntCustomRender pf) const { return (void*)pf == pfn; } // This hack is for the condor_status code...
 	CustomFormatFn() : pfn(NULL), fn_type(PRINTF_FMT) {};
 	CustomFormatFn(StringCustomFormat pf) : pfn((void*)pf), fn_type(STR_CUSTOM_FMT) {};
 	CustomFormatFn(IntCustomFormat pf) : pfn((void*)pf), fn_type(INT_CUSTOM_FMT) {};
 	CustomFormatFn(FloatCustomFormat pf) : pfn((void*)pf), fn_type(FLT_CUSTOM_FMT) {};
-	CustomFormatFn(AlwaysCustomFormat pf) : pfn((void*)pf), fn_type(ALWAYS_CUSTOM_FMT) {};
 	CustomFormatFn(ValueCustomFormat pf) : pfn((void*)pf), fn_type(VALUE_CUSTOM_FMT) {};
+	CustomFormatFn(StringCustomRender pf) : pfn((void*)pf), fn_type(STR_CUSTOM_RENDER) {};
+	CustomFormatFn(IntCustomRender pf) : pfn((void*)pf), fn_type(INT_CUSTOM_RENDER) {};
+	CustomFormatFn(FloatCustomRender pf) : pfn((void*)pf), fn_type(FLT_CUSTOM_RENDER) {};
+	CustomFormatFn(ValueCustomRender pf) : pfn((void*)pf), fn_type(VALUE_CUSTOM_RENDER) {};
 private:
 	void * pfn;
 	FormatKind fn_type;
@@ -77,16 +101,31 @@ struct Formatter
 	char       fmt_letter;   // actual letter in the % escape
 	char       fmt_type;     // one of the the printf_fmt_t enum values.
 	char       fmtKind;      // identifies type type of the union
-	const char * altText;      // print this when attribute data is unavailable
+	char       altKind;      // identifies type of alt text to print when attribute cannot be fetched
 	const char * printfFmt;    // may be NULL if fmtKind != PRINTF_FMT
 	union {
 		StringCustomFormat	sf;
 		IntCustomFormat 	df;
 		FloatCustomFormat 	ff;
-		AlwaysCustomFormat	af;
+//		AlwaysCustomFormat	af;
 		ValueCustomFormat	vf;
+		StringCustomRender  sr;
+		IntCustomRender     dr;
+		FloatCustomRender   fr;
+		ValueCustomRender   vr;
 	};
 };
+
+typedef struct {
+	const char * key;           // keyword, table should be sorted by this.
+	const char * default_attr;  // default attribute to fetch
+	const char * printfFmt;     // optional % printf formatting after custom function is called
+	CustomFormatFn cust;        // custom format callback function
+	const char * extra_attribs; // other attributes that the custom format needs
+} CustomFormatFnTableItem;
+typedef case_sensitive_sorted_tokener_lookup_table<CustomFormatFnTableItem> CustomFormatFnTable;
+
+class MyRowOfValues; // forward ref
 
 class AttrListPrintMask
 {
@@ -100,39 +139,29 @@ class AttrListPrintMask
 	void SetOverallWidth(int wid);
 
 	// register a format and an attribute
-	void registerFormat (const char *fmt, int wid, int opts, const char *attr, const char*alt="");
-	//void registerFormat (const char *print, int wid, int opts, IntCustomFmt fmt, const char *attr, const char *alt="");
-	//void registerFormat (const char *print, int wid, int opts, FloatCustomFmt fmt, const char *attr, const char *alt="");
-	//void registerFormat (const char *print, int wid, int opts, StringCustomFmt fmt, const char *attr, const char *alt="");
-	void registerFormat (const char *print, int wid, int opts, const CustomFormatFn & fmt, const char *attr, const char *alt="");
+	void registerFormat (const char *print, int wid, int opts, const char *attr);
+	void registerFormat (const char *print, int wid, int opts, const CustomFormatFn & fmt, const char *attr);
+	void registerFormatF (const char *print, const char *attr, int opts=FormatOptionNoTruncate) { registerFormat(print, 0, opts, attr); }
+	void registerformat (const CustomFormatFn & fmt, const char *attr) { registerFormat(NULL, 0, 0, fmt, attr); }
 
-	void registerFormat (const char *fmt, const char *attr, const char*alt="") {
-		registerFormat(fmt, 0, 0, attr, alt);
-		}
-	void registerformat (const CustomFormatFn & fmt, const char *attr, const char*alt="") {
-		registerFormat(NULL, 0, 0, fmt, attr, alt);
-	}
-/*
-	void registerFormat (IntCustomFmt fmt, const char *attr, const char *alt="") {
-		registerFormat(NULL, 0, 0, fmt, attr, alt);
-		}
-	void registerFormat (FloatCustomFmt fmt, const char *attr, const char *alt="") {
-		registerFormat(NULL, 0, 0, fmt, attr, alt);
-		}
-	void registerFormat (StringCustomFmt fmt, const char *attr, const char *alt="") {
-		registerFormat(NULL, 0, 0, fmt, attr, alt);
-		}
-*/
 	// clear all formats
 	void clearFormats (void);
 	bool IsEmpty(void) { return formats.IsEmpty(); }
+	int  ColCount(void) { return formats.Length(); }
+
+	// for debugging, dump the current config
+	void dump(std::string & out, const CustomFormatFnTable * pFnTable, List<const char> * pheadings=NULL);
+	// for debugging, walk the current config
+	int walk(int (*pfn)(void*pv, int index, Formatter * fmt, const char * attr, const char * head), void* pv, const List<const char> * pheadings=NULL) const;
 
 	// display functions
-	int   display (FILE *, AttrList *, AttrList *target=NULL);		// output to FILE *
-	int   display (FILE *, AttrListList *, AttrList *target=NULL, List<const char> * pheadings=NULL); // output a list -> FILE *
-	char *display ( AttrList *, AttrList *target=NULL );			// return a string
-	int   calc_widths(AttrList *, AttrList *target=NULL );          // set column widths
-	int   calc_widths(AttrListList *, AttrList *target=NULL);		
+	int   display (FILE *, ClassAd *, ClassAd *target=NULL);		// output to FILE *
+	int   display (FILE *, ClassAdList *, ClassAd *target=NULL, List<const char> * pheadings=NULL); // output a list -> FILE *
+	int   display (std::string & out, ClassAd *, ClassAd *target=NULL ); // append to string out. return number of chars added
+	int   render (MyRowOfValues & row, ClassAd *, ClassAd *target=NULL ); // render columns to text and add to MyRowOfValues, returns number of cols
+	int   display (std::string & out, MyRowOfValues & row); // append to string out. return number of chars added
+	int   calc_widths(ClassAd *, ClassAd *target=NULL );          // set column widths
+	int   calc_widths(ClassAdList *, ClassAd *target=NULL);
 	int   display_Headings(FILE *, List<const char> & headings);
 	char *display_Headings(const char * pszzHead);
 	char *display_Headings(List<const char> & headings);
@@ -140,13 +169,15 @@ class AttrListPrintMask
 	char *display_Headings(void) { return display_Headings(headings); }
 	void set_heading(const char * heading);
 	bool has_headings() { return headings.Length() > 0; }
+	void clear_headings() { headings.Clear(); }
 	const char * store(const char * psz) { return stringpool.insert(psz); } // store a string in the local string pool.
+	// iterate formatter and attribs, calling pfn and allowing fmt to be changed until pfn returns < 0
+	int adjust_formats(int (*pfn)(void*pv, int index, Formatter * fmt, const char * attr), void* pv);
 
   private:
-	List<Formatter> formats;
-	List<char> 		attributes;
-	//List<char> 		alternates;
-	List<const char> headings;
+	mutable List<Formatter> formats;
+	mutable List<char> 		attributes;
+	mutable List<const char> headings;
 
 	void clearList (List<Formatter> &);
 	void clearList (List<char> &);
@@ -162,9 +193,84 @@ class AttrListPrintMask
 	ALLOCATION_POOL stringpool;
 
 	void PrintCol(MyString * pretval, Formatter & fmt, const char * value);
-	void commonRegisterFormat (int wid, int opts, const char *print, 
-		                       const CustomFormatFn & sf, const char *attr, const char *alt);
+	void commonRegisterFormat (int wid, int opts, const char *print, const CustomFormatFn & sf,
+							const char *attr
+							);
 };
+
+class MyRowOfValues
+{
+public:
+	MyRowOfValues() : pdata(NULL), pvalid(NULL), cols(0), cmax(0) {};
+	~MyRowOfValues();
+	int SetMaxCols(int max_cols);
+
+	int cat(const classad::Value & s);
+	classad::Value * next(int & index);
+	MyRowOfValues& operator+=(const classad::Value &S) { cat(S); return *this; }
+
+	MyRowOfValues& operator = ( const MyRowOfValues & rhs ) {
+		cols = rhs.cols;
+		cmax = rhs.cmax;
+
+		if( pvalid != NULL ) { delete pvalid; }
+		pvalid = new unsigned char[cmax];
+		memset( pvalid, '\0', cmax );
+
+		if( pdata != NULL ) { delete pdata; }
+		pdata = new classad::Value[cmax];
+		for( int i = 0; i < cmax; ++i ) {
+			pdata[i] = rhs.pdata[i];
+			pvalid[i] = rhs.pvalid[i];
+		}
+
+		return * this;
+	}
+
+	MyRowOfValues( const MyRowOfValues & in ) :
+	  pdata( NULL ), pvalid( NULL ), cols( 0 ), cmax( 0 ) { * this = in; }
+
+	bool empty() { return cols > 0; }
+	int ColCount() { return cols; }
+	classad::Value * Column(int index) {
+		if (index < 0) index = cols+index;
+		if (index >= 0 && index < cols) return &pdata[index];
+		return NULL;
+	}
+	unsigned char is_valid(int index) {
+		if (index < 0) index = cols+index;
+		if (index >= 0 && index < cols) return pvalid[index];
+		return 0;
+	}
+	unsigned char set_col_valid(int index, unsigned char states) {
+		if (index < 0) index = cols+index;
+		if (index >= 0 && index < cols) { 
+			unsigned char old = pvalid[index];
+			pvalid[index] = states;
+			return old;
+		}
+		return 0;
+	}
+	void set_valid(bool valid) { if (cols > 0 && cols <= cmax) pvalid[cols-1] = valid; }
+	void reset() { cols = 0; }
+
+private:
+	classad::Value * pdata; // pointer to data, an array of classad::Values
+	unsigned char  * pvalid; // point to array of flags per classad::Value
+	int           cols;
+	int           cmax;
+};
+
+// parse -af: options after the : and all of the included arguments up to the next -
+// returns the number of arguments consumed
+int parse_autoformat_args (
+	int /*argc*/,
+	const char* argv[],
+	int ixArg,
+	const char *popts,
+	AttrListPrintMask & print_mask,
+	classad::References & attrs, // out: returns attributes refereced by the expressions added to print_mask
+	bool diagnostic);
 
 // functions & classes in make_printmask.cpp
 
@@ -179,22 +285,6 @@ public:
 	bool        decending;
 };
 
-class tokener;
-typedef struct {
-	const char * key;           // keyword, table should be sorted by this.
-	const char * default_attr;  // default attribute to fetch
-	CustomFormatFn cust;        // custom format callback function
-	const char * extra_attribs; // other attributes that the custom format needs
-	bool operator<(const tokener & toke) const;
-} CustomFormatFnTableItem;
-template <class T> struct tokener_lookup_table {
-	size_t cItems;
-	bool is_sorted;
-	const T * pTable;
-	const T * find_match(const tokener & toke) const;
-};
-typedef tokener_lookup_table<CustomFormatFnTableItem> CustomFormatFnTable;
-#define SORTED_TOKENER_TABLE(tbl) { sizeof(tbl)/sizeof(tbl[0]), true, tbl }
 
 // used to return what kind of header and footers have been requested in the
 // file parsed by SetAttrListPrintMaskFromFile
@@ -205,6 +295,13 @@ enum printmask_headerfooter_t {
 	HF_NOSUMMARY=4,
 	HF_CUSTOM=8,
 	HF_BARE=15
+};
+
+// used to return what kind of printmask aggregation has been requested.
+enum printmask_aggregation_t {
+	PR_NO_AGGREGATION=0,
+	PR_COUNT_UNIQUE,
+	PR_FROM_AUTOCLUSTER, // For condor_q, select from autocluster set.
 };
 
 // interface for reading text one line at a time, used to abstract reading lines
@@ -250,7 +347,11 @@ public:
 		// skip over current end of line
 		const char* p = &lit[ix_eol];
 		if (*p == '\r') ++p;
-		if (*p == '\n') ++p;
+		if (*p == '\n') {
+			++p;
+			// If we hit end-of-file after skipping the current end of line, just return NULL.
+			if ( ! *p && ix_eol > 0) { ix_eol = p - lit; return NULL; }
+		}
 		++lines_read;
 
 		// remember this spot as the the start of line,
@@ -265,6 +366,30 @@ public:
 	}
 };
 
+
+// this structure is used to hold custom print format details
+// it is used by SetAttrListPrintMaskFromStream and by PrintPrintMask
+typedef struct PrintMaskMakeSettings {
+	std::string select_from;           // out: adtype name from SELECT
+	printmask_headerfooter_t headfoot; // out, header and footer flags set in SELECT or SUMMARY
+	printmask_aggregation_t aggregate; // out: aggregation mode in SELECT
+	std::string where_expression;      // out: classad expression from WHERE
+	classad::References attrs;        // out: ClassAd attributes referenced in mask or group_by outputs
+	classad::References scopes;       // out: scopes for ClassAd attributes referenced in mask or group_by outputs (i.e. target or job)
+	classad::References sumattrs;     // out: ClassAd attributes referenced in summary mask
+
+	PrintMaskMakeSettings() : headfoot(STD_HEADFOOT), aggregate(PR_NO_AGGREGATION) {}
+	void reset() {
+		select_from.clear();
+		where_expression.clear();
+		attrs.clear();
+		scopes.clear();
+		sumattrs.clear();
+		headfoot = STD_HEADFOOT;
+		aggregate = PR_NO_AGGREGATION;
+	}
+} PrintMaskMakeSettings;
+
 // Read a stream a line at a time, and parse it to fill out the print mask,
 // header, group_by, where expression, and projection attributes.
 // return is 0 on success, non-zero error code on failure.
@@ -272,12 +397,20 @@ public:
 int SetAttrListPrintMaskFromStream (
 	SimpleInputStream & stream, // in: fetch lines from this stream until nextline() returns NULL
 	const CustomFormatFnTable & FnTable, // in: table of custom output functions for SELECT
-	AttrListPrintMask & mask, // out: columns and headers set in SELECT
-	printmask_headerfooter_t & headfoot, // out, header and footer flags set in SELECT or SUMMARY
+	AttrListPrintMask & prmask, // out: columns and headers set in SELECT
+	PrintMaskMakeSettings & settings, // in,out: modifed by parsing the stream. BUT NOT CLEARED FIRST! (so the caller can set defaults)
 	std::vector<GroupByKeyInfo> & group_by, // out: ordered set of attributes/expressions in GROUP BY
-	std::string & where_expression, // out: classad expression from WHERE
-	StringList & attrs, // out ClassAd attributes referenced in mask or group_by outputs
+	AttrListPrintMask * summask, // out: columns and headers set in SUMMMARY
 	std::string & error_message // out, if return is non-zero, this will be an error message
 	);
 
-#endif
+int PrintPrintMask(std::string & output,
+	const CustomFormatFnTable & FnTable,  // in: table of custom output functions for SELECT
+	const AttrListPrintMask & mask,       // in: columns and headers set in SELECT
+	const List<const char> * pheadings,   // in: headings override
+	const PrintMaskMakeSettings & settings, // in: modifed by parsing the stream. BUT NOT CLEARED FIRST! (so the caller can set defaults)
+	const std::vector<GroupByKeyInfo> & group_by,
+	AttrListPrintMask * summask // out: columns and headers set in SUMMMARY
+	); // in: ordered set of attributes/expressions in GROUP BY
+
+#endif // __AD_PRINT_MASK__

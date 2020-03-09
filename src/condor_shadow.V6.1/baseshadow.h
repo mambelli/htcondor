@@ -28,7 +28,7 @@
 #include "write_user_log.h"
 #include "exit.h"
 #include "internet.h"
-#include "../condor_schedd.V6/qmgr_job_updater.h"
+#include <qmgr_job_updater.h>
 #include "condor_update_style.h"
 #include "file_transfer.h"
 
@@ -114,13 +114,12 @@ class BaseShadow : public Service
 			about it, and exit with a special status. 
 			@param reason Why we gave up (for UserLog, dprintf, etc)
 		*/
+	PREFAST_NORETURN
 	void reconnectFailed( const char* reason ); 
 
 	virtual bool shouldAttemptReconnect(RemoteResource *) { return true;};
 
-		/** Here, we param for lots of stuff in the config file.  Things
-			param'ed for are: SPOOL, FILESYSTEM_DOMAIN, UID_DOMAIN, 
-			USE_AFS, USE_NFS, and CKPT_SERVER_HOST.
+		/** Here, we param for lots of stuff in the config file.
 		*/
 	virtual void config();
 
@@ -128,6 +127,10 @@ class BaseShadow : public Service
 			@param reason The reason the job exited (JOB_BLAH_BLAH)
 		 */
 	virtual void shutDown( int reason );
+		/** Forces the starter to shutdown fast as well.<p>
+			@param reason The reason the job exited (JOB_BLAH_BLAH)
+		 */
+	virtual void shutDownFast( int reason );
 
 		/** Graceful shutdown method.  This is virtual so each kind of
 			shadow can do the right thing.
@@ -199,7 +202,7 @@ class BaseShadow : public Service
 			how the job exited. So this call places how the job exited into
 			the jobad, but doesn't write any events about it.
 		*/
-	void mockTerminateJob( MyString exit_reason, bool exited_by_signal, 
+	void mockTerminateJob( std::string exit_reason, bool exited_by_signal,
 		int exit_code, int exit_signal, bool core_dumped );
 
 		/** Set a timer to call terminateJob() so we retry
@@ -208,7 +211,7 @@ class BaseShadow : public Service
 	void retryJobCleanup( void );
 
 		/// DaemonCore timer handler to actually do the retry.
-	int retryJobCleanupHandler( void );
+	void retryJobCleanupHandler( void );
 
 		/** The job exited but it's not ready to leave the queue.  
 			We still want to log an evict event, possibly email the
@@ -218,6 +221,12 @@ class BaseShadow : public Service
 			universe-specific code before we exit.
 		*/
 	void evictJob( int reason );
+		/** It's possible to the shadow to initiate eviction, and in
+			some cases that means we need to wait around for the starter
+			to tell us what happened.
+		*/
+	virtual void exitAfterEvictingJob( int reason ) { DC_Exit( reason ); }
+	virtual bool exitDelayed( int & /*reason*/ ) { return false; }
 
 		/** The total number of bytes sent over the network on
 			behalf of this job.
@@ -275,12 +284,6 @@ class BaseShadow : public Service
 		 */
 	int handleUpdateJobAd(int sig);
 
-		/** This function returns a file pointer that one can 
-			write an email message into.
-			@return A mail message file pointer.
-		*/
-	FILE* emailUser( const char *subjectline );
-
 		/** This is used to tack on something (like "res #") 
 			after the header and before the text of a dprintf
 			message.
@@ -302,9 +305,9 @@ class BaseShadow : public Service
 		/// Returns the schedd address
 	char *getScheddAddr() { return scheddAddr; }
         /// Returns the current working dir for the job
-    char const *getIwd() { return iwd.Value(); }
+    char const *getIwd() { return iwd.c_str(); }
         /// Returns the owner of the job - found in the job ad
-    char const *getOwner() { return owner.Value(); }
+    char const *getOwner() { return owner.c_str(); }
 		/// Returns true if job requests graceful removal
 	bool jobWantsGracefulRemoval();
 
@@ -333,7 +336,7 @@ class BaseShadow : public Service
 
 	virtual int64_t getImageSize( int64_t & memory_usage, int64_t & rss, int64_t & pss ) = 0;
 
-	virtual int getDiskUsage( void ) = 0;
+	virtual int64_t getDiskUsage( void ) = 0;
 
 	virtual struct rusage getRUsage( void ) = 0;
 
@@ -348,6 +351,9 @@ class BaseShadow : public Service
 		*/
 	bool updateJobInQueue( update_t type );
 
+	// Called by updateJobInQueue() to generate file transfer events.
+	virtual void recordFileTransferStateChanges( ClassAd * jobAd, ClassAd * ftAd ) = 0;
+
 		/** Connect to the job queue and update one attribute */
 	virtual bool updateJobAttr( const char *name, const char *expr, bool log=false );
 
@@ -360,7 +366,7 @@ class BaseShadow : public Service
 		/** Do whatever cleanup (like killing starter(s)) that's
 			required before the shadow can exit.
 		*/
-	virtual void cleanUp( void ) = 0;
+	virtual void cleanUp( bool graceful=false ) = 0;
 
 		/** Did this shadow's job exit by a signal or not?  This is
 			virtual since each kind of shadow will need to implement a
@@ -379,14 +385,15 @@ class BaseShadow : public Service
 			method to supply this information. */
 	virtual int exitCode( void ) = 0;
 
-		// make UserLog static so it can be accessed by EXCEPTION handler
-	static WriteUserLog uLog;
+	WriteUserLog uLog;
 
 	void evalPeriodicUserPolicy( void );
 
 	const char* getCoreName( void );
 
 	virtual void resourceBeganExecution( RemoteResource* rr ) = 0;
+
+	virtual void resourceDisconnected( RemoteResource* rr ) = 0;
 
 	virtual void resourceReconnected( RemoteResource* rr ) = 0;
 
@@ -400,6 +407,16 @@ class BaseShadow : public Service
 	virtual void logDisconnectedEvent( const char* reason ) = 0;
 
 	char const *getTransferQueueContactInfo() {return m_xfer_queue_contact_info.Value();}
+
+		/** True if attemping a reconnect from startup, i.e. if
+			reconnecting based upon command-line flag -reconnect. 
+			Used to determine if shadow exits with RECONNECT_FAILED
+			or just with JOB_SHOULD_REQUEUE. */
+	bool attemptingReconnectAtStartup;
+
+	bool isDataflowJob = false;
+
+	void logDataflowJobSkippedEvent();
 
  protected:
 
@@ -462,9 +479,9 @@ class BaseShadow : public Service
 	int cluster;
 	int proc;
 	char* gjid;
-	MyString owner;
-	MyString domain;
-	MyString iwd;
+	std::string owner;
+	std::string domain;
+	std::string iwd;
 	char *scheddAddr;
 	char *core_file_name;
 	MyString m_xfer_queue_contact_info;
@@ -481,10 +498,16 @@ class BaseShadow : public Service
 		/// How long to delay between attempts to retry job cleanup.
 	int m_cleanup_retry_delay;
 
+		// Insist on a fast shutdown of the starter?
+	bool m_force_fast_starter_shutdown;
+
+		// Has CommittedTime in the job ad been updated to reflect
+		// job termination?
+	bool m_committed_time_finalized;
+
 		// This makes this class un-copy-able:
 	BaseShadow( const BaseShadow& );
 	BaseShadow& operator = ( const BaseShadow& );
-
 };
 
 extern void dumpClassad( const char*, ClassAd*, int );
@@ -493,6 +516,9 @@ extern void dumpClassad( const char*, ClassAd*, int );
 // and restart this shadow with a new job.
 // Returns false if no new job found.
 extern bool recycleShadow(int previous_job_exit_reason);
+
+// fix the update ad from the starter to work around starter bugs.
+extern void fix_update_ad(ClassAd & update_ad);
 
 extern BaseShadow *Shadow;
 

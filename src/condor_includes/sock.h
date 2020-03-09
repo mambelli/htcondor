@@ -22,11 +22,12 @@
 #define SOCK_H
 
 #include "condor_common.h"
-#include "condor_socket_types.h"
 #include "stream.h"
 #include "CondorError.h"
 #include "condor_perms.h"
 #include "condor_sockaddr.h"
+
+#include <unordered_set>
 
 // retry failed connects for CONNECT_TIMEOUT seconds
 #define CONNECT_TIMEOUT 10
@@ -56,11 +57,9 @@ class SockInitializer {
 };
 #endif  /* of WIN32 */
 
-/*
-We want to define a callback function to be invoked when certain actions happen upon a stream.  CedarHandler is the type of a callback function.   The following notation is a little strange.  It reads: Define a new type called "CedarHandler" to be "a function returning void with single argument pointer to Stream"
-*/
-
-typedef void (CedarHandler) (Stream *s);
+namespace classad {
+class ClassAd;
+}
 
 /*
 **	B A S E    S O C K
@@ -86,6 +85,7 @@ public:
 	friend class SecManStartCommand;
 	friend class SharedPortListener;
 	friend class SharedPortEndpoint;
+	friend class DockerProc;
 
 	/*
 	**	Methods
@@ -95,7 +95,7 @@ public:
 	virtual int handle_incoming_packet() = 0;
 
 	/** Connect the socket to a remote peer.
-		@param host Hostname of peer, either a DNS name or an IP address, or 
+		@param host Hostname of peer, either a DNS name or an IP address, or
 		an IP address and port together in the format "&lt;IP:PORT&gt;", such as 
 		<p> &lt;128.105.44.66:3354&gt;
 		<b>Note:</b> The "&lt;" and "&gt;" are required when giving both the
@@ -104,18 +104,24 @@ public:
 		then the port parameter is ignored.
 		@param do_not_block If false, then the connect call will block until
 		completion or until timeout.  If true, then the connect call will
-		return immediately with TRUE, FALSE, or CEDAR_EWOULDBLOCK.  If 
-		CEDAR_EWOULDBLOCK is returned, the user should call 
-		do_connect_finish() when select says this socket is writeable to 
-		find out if the CEDAR connection process has really completed.  
+		return immediately with TRUE, FALSE, or CEDAR_EWOULDBLOCK.  If
+		CEDAR_EWOULDBLOCK is returned, the user should call
+		do_connect_finish() when select says this socket is writeable to
+		find out if the CEDAR connection process has really completed.
 		In Condor this is usually accomplished by calling DaemonCore's
 		Register_Socket() method.
-		@return TRUE if connection succeeded, FALSE on failure, or 
-		CEDAR_EWOULDBLOCK if parameter do_not_block is set to true and 
+		@return TRUE if connection succeeded, FALSE on failure, or
+		CEDAR_EWOULDBLOCK if parameter do_not_block is set to true and
 		the call would block.
 		@see do_connect_finish
 	*/
 	virtual int connect(char const *host, int port=0, bool do_not_block = false) = 0;
+
+	/** Close the socket.  Note that reusing the socket after closing it is not
+		recommended; instead simply delete the Socket (it will be closed in the
+		destructor), and reallocate a new one.
+	*/
+	virtual int close();
 
 	/** Connect the socket to a remote peer.
 		@param host Hostname of the peer, either a DNS name or IP address.
@@ -123,34 +129,56 @@ public:
 		which can be passed to getportbyserv().
 	*/
 	inline int connect(char const *host, char *service, bool do_not_block = false) { 
-		return connect(host,getportbyserv(service),do_not_block); 
+		return connect(host,getportbyserv(service),do_not_block);
 	}
 
 
-	/** Install this function as the asynchronous handler.  When a handler is installed, it is invoked whenever data arrives on the socket.  Setting the handler to zero disables asynchronous notification.  */
-
-	int set_async_handler( CedarHandler *handler );
-
-	
-	//	Socket services
+	//
+	// This set of functions replaces assign().
+	//
+	// assignSocket() specifies a socket FD for this socket to use.  It
+	// must have been created with AF_INET or AF_INET6.  The socket's protocol
+	// and type MUST match the Sock's protocol and type.
+	//
+	// assignInvalidSocket() should probably be called reinitialize(); it
+	// calls socket() as appropriate for its existing type and protocol.  The
+	// Sock MUST have an existing protocol.
+	//
+	// assignDomainSocket() specifies a (unix) domain socket FD for this
+	// socket to use.  It must have been created with AF_UNX (AF_LOCAL).
 	//
 
-//PRAGMA_REMIND("adesmet: DEPRECATED")
-	int assign(SOCKET =INVALID_SOCKET);
+	//
+	// These functions should probably be pruned and replace by a smaller
+	// set of protected functions and a constructor which accepts a
+	// socket FD; we could then use a placement constructor if necessary.
+	//
 
-	int assign(condor_protocol proto, SOCKET =INVALID_SOCKET);
+	int assignSocket( SOCKET s );
+	int assignSocket( condor_protocol proto, SOCKET s );
+	int assignInvalidSocket();
+	int assignInvalidSocket( condor_protocol proto );
+	int assignDomainSocket( SOCKET s );
+	//
+	// Normally, we verify that the socket (fd) you're assigning to this
+	// Sock (object) has the same address family (protocol).  However,
+	// when using CCB, this restriction must be relaxed.  Consider an
+	// IPv4-only schedd matches against a mixed-mode startd using a
+	// mixed-mode CCB.  If the mixed-mode startd prefers its IPv6 address,
+	// and the schedd is configured to respect that preference, it will
+	// attempt to connect to the IPv6 address via CCB.  However, since the
+	// schedd connected to CCB using IPv4, CCB will ask the startd to
+	// also connect over IPv4, leading to a reverse connection over IPv4
+	// for an IPv6 address.
+	//
+	int assignCCBSocket( SOCKET s );
 #if defined(WIN32) && defined(_WINSOCK2API_)
 	int assign(LPWSAPROTOCOL_INFO);		// to inherit sockets from other processes
 #endif
 
-//PRAGMA_REMIND("adesmet: DEPRECATED")
-	int bind(bool outbound, int port=0, bool loopback=false);
+	int bind(condor_protocol proto, bool outbound, int port, bool loopback, condor_sockaddr *bindTo = NULL);
 
-	int bind(condor_protocol proto, bool outbound, int port, bool loopback);
-
-	bool bind_to_loopback(bool outbound=false, int port=0);
-
-    int setsockopt(int, int, const void*, int); 
+    int setsockopt(int, int, const void*, int);
 
 	/**  Set the size of the operating system buffers (in the IP stack) for
 		 this socket.
@@ -169,10 +197,6 @@ public:
 	*/
 	bool set_keepalive();
 
-//PRAGMA_REMIND("adesmet: deprecated")
-	inline int bind(bool outbound, char *s) { return bind(outbound, getportbyserv(s)); }
-
-	int close();
 	/** if any operation takes more than sec seconds, timeout
         call timeout(0) to set blocking mode (default)
         @param sec the number of seconds to wait before timing out
@@ -189,12 +213,12 @@ public:
 	int timeout_no_timeout_multiplier(int sec);
     
 	/** Returns the timeout with timeout multiplier applied. */
-	int get_timeout_raw();
+	int get_timeout_raw() const;
 
 	/** get the number of bytes available to read without blocking.
 		@return number of bytes, or -1 on failure
 	*/
-	int bytes_available_to_read();
+	int bytes_available_to_read() const;
 
 	/**	@return true if > 0 bytes ready to read without blocking
 	*/
@@ -214,7 +238,7 @@ public:
         // RETURNS: true -- success; false -- failure
         //------------------------------------------
 
-        bool wrap(unsigned char* input, int input_len, 
+        bool wrap(const unsigned char* input, int input_len,
                   unsigned char*& output, int& outputlen);
         //------------------------------------------
         // PURPOSE: encrypt some data
@@ -223,7 +247,7 @@ public:
         // RETURNS: TRUE -- success, FALSE -- failure
         //------------------------------------------
 
-        bool unwrap(unsigned char* input, int input_len, 
+        bool unwrap(const unsigned char* input, int input_len,
                     unsigned char*& output, int& outputlen);
         //------------------------------------------
         // PURPOSE: decrypt some data
@@ -246,7 +270,7 @@ public:
         // RETURNS: true -- success; false -- false
         //------------------------------------------
 
-        bool isOutgoing_MD5_on() const { return (mdMode_ == MD_ALWAYS_ON); }
+        bool isOutgoing_Hash_on() const { return (mdMode_ == MD_ALWAYS_ON); }
         //------------------------------------------
         // PURPOSE: whether MD is turned on or not
         // REQUIRE: None
@@ -254,13 +278,13 @@ public:
         //          false -- MD is off
         //------------------------------------------
 
-        virtual const char * isIncomingDataMD5ed() = 0;
+        virtual const char * isIncomingDataHashed() = 0;
         //------------------------------------------
         // PURPOSE: To check to see if incoming data
-        //          has MD5 checksum/. NOTE! Currently,
+        //          has checksum/. NOTE! Currently,
         //          this method should be used with UDP only!
         // REQUIRE: None
-        // RETURNS: NULL -- data does not contain MD5
+        // RETURNS: NULL -- data does not contain hash
         //          key id -- if the data is checksumed
         //------------------------------------------
 
@@ -269,57 +293,59 @@ public:
 	*/
 
     /// peer's port and IP address in a struct sockaddr_in.
-	condor_sockaddr peer_addr();
+	condor_sockaddr peer_addr() const;
 
 	/// peer's port number 
-	int peer_port();
+	int peer_port() const;
 
 	/// peer's IP address, string verison (e.g. "128.105.101.17")
-	const char* peer_ip_str();
+	const char* peer_ip_str() const;
 
 	/// peer's IP address, integer version (e.g. 2154390801)
 
 	/// is peer a local interface, aka did this connection originate from a local process?
-	bool peer_is_local();
+	bool peer_is_local() const;
 
     /// my port and IP address in a class condor_sockaddr
-	condor_sockaddr my_addr();
+	condor_sockaddr my_addr() const;
+	condor_sockaddr my_addr_wildcard_okay() const;
+
 
 	/// my IP address, string version (e.g. "128.105.101.17")
-	virtual const char* my_ip_str();
+	virtual const char* my_ip_str() const;
 
 	/// local port number
-	int get_port();
+	int get_port() const;
 
     /// sinful address of mypoint() in the form of "<a.b.c.d:pppp>"
-    char const * get_sinful();
+    char const * get_sinful() const;
 
 	/// Sinful address for access from outside of our private network.
 	/// This takes into account TCP_FORWARDING_HOST.
-	char const *get_sinful_public();
+	char const *get_sinful_public() const;
 
 	/// sinful address of peer in form of "<a.b.c.d:pppp>"
-	char * get_sinful_peer();
+	char * get_sinful_peer() const;
 
 		// Address that was passed to connect().  This is useful in cases
 		// such as CCB or shared port where our peer address is not the
 		// address one would use to actually connect to the peer.
 		// Returns NULL if connect was never called.
-	char const *get_connect_addr();
+	char const *get_connect_addr() const;
 
 	/// sinful address of peer, suitable for passing to dprintf() (never NULL)
-	virtual char const *default_peer_description();
+	virtual char const *default_peer_description() const;
 
 	/// local file descriptor (fd) of this socket
-	int get_file_desc() { return _sock; }
+	int get_file_desc() const { return _sock; }
 
 	/// is a non-blocking connect outstanding?
-	bool is_connect_pending() { return _state == sock_connect_pending || _state == sock_connect_pending_retry || _state == sock_reverse_connect_pending; }
+	bool is_connect_pending() const { return _state == sock_connect_pending || _state == sock_connect_pending_retry || _state == sock_reverse_connect_pending; }
 
-	bool is_reverse_connect_pending() { return _state == sock_reverse_connect_pending; }
+	bool is_reverse_connect_pending() const { return _state == sock_reverse_connect_pending; }
 
 	/// is the socket connected?
-	bool is_connected() { return _state == sock_connect; }	
+	bool is_connected() const { return _state == sock_connect; }
 
     /// 
 	virtual ~Sock();
@@ -340,16 +366,25 @@ public:
 	void setFullyQualifiedUser(char const *fqu);
 
 	void setAuthenticationMethodUsed(char const *auth_method);
-	const char *getAuthenticationMethodUsed();
+	const char *getAuthenticationMethodUsed() const;
 
 	void setAuthenticationMethodsTried(char const *auth_methods);
-	const char *getAuthenticationMethodsTried();
+	const char *getAuthenticationMethodsTried() const;
 
 	void setAuthenticatedName(char const *auth_name);
-	const char *getAuthenticatedName();
+	const char *getAuthenticatedName() const;
+
+	bool isAuthorizationInBoundingSet(const std::string &);
 
 	void setCryptoMethodUsed(char const *crypto_method);
-	const char* getCryptoMethodUsed();
+	const char* getCryptoMethodUsed() const;
+
+	void setSessionID(const std::string &session_id) {_session = session_id;}
+	const std::string &getSessionID() const {return _session;}
+
+	void getPolicyAd(classad::ClassAd &ad) const;
+	const classad::ClassAd *getPolicyAd() const {return _policy_ad;}
+	void setPolicyAd(const classad::ClassAd &ad);
 
 		/// True if socket has tried to authenticate or socket is
 		/// using a security session that tried to authenticate.
@@ -362,6 +397,15 @@ public:
 
 	void setTriedAuthentication(bool toggle) { _tried_authentication = toggle; }
 
+		// True if the socket failed to authenticate with the remote
+		// server but may succeed with a token request workflow.
+	bool shouldTryTokenRequest() const { return _should_try_token_request; }
+	void setShouldTryTokenRequest(bool val) { _should_try_token_request = val; }
+
+		// Trust domain of the remote host (empty if unknown).
+	void setTrustDomain(const std::string &trust_domain) { _trust_domain = trust_domain; }
+	const std::string &getTrustDomain() const { return _trust_domain; }
+
 		/// Returns true if the fully qualified user name is
 		/// a non-anonymous user name (i.e. something not from
 		/// the unmapped domain)
@@ -372,18 +416,28 @@ public:
 	bool isAuthenticated() const;
 
     ///
-	virtual int authenticate(const char * auth_methods, CondorError* errstack, int timeout);
+	virtual int authenticate(const char * auth_methods, CondorError* errstack, int timeout, bool non_blocking);
     ///
 	// method_used should be freed by the caller when finished with it
-	virtual int authenticate(KeyInfo *&ki, const char * auth_methods, CondorError* errstack, int timeout, char **method_used=NULL);
+	virtual int authenticate(KeyInfo *&ki, const char * auth_methods, CondorError* errstack, int timeout, bool non_blocking, char **method_used);
+
+	// method_used should be freed by the caller when finished with it
+	virtual int authenticate_continue(CondorError* errstack, bool non_blocking, char **method_used);
 
 	/// if we are connecting, merges together Stream::get_deadline
 	/// and connect_timeout_time()
-	virtual time_t get_deadline();
+	virtual time_t get_deadline() const;
 
 	void invalidateSock();
 
-	unsigned int getUniqueId() { return m_uniqueId; }
+	unsigned int getUniqueId() const { return m_uniqueId; }
+
+#ifdef WIN32
+	int set_inheritable( int flag );
+#else
+	// On unix, sockets are always inheritable
+	inline int set_inheritable( int ) { return TRUE; }
+#endif
 
 //	PRIVATE INTERFACE TO ALL SOCKS
 //
@@ -439,17 +493,17 @@ protected:
 
 	virtual int do_reverse_connect(char const *ccb_contact,bool nonblocking) = 0;
 	virtual void cancel_reverse_connect() = 0;
-	virtual int do_shared_port_local_connect( char const *shared_port_id,bool nonblocking ) = 0;
+	virtual int do_shared_port_local_connect( char const *shared_port_id,bool nonblocking,char const *sharedPortIP ) = 0;
 
 	void set_connect_addr(char const *addr);
 
 	inline SOCKET get_socket (void) { return _sock; }
-	char * serialize(char *);
+	const char * serialize(const char *);
 	static void close_serialized_socket(char const *buf);
 	char * serialize() const;
-    char * serializeCryptoInfo(char * buf);
+    const char * serializeCryptoInfo(const char * buf);
     char * serializeCryptoInfo() const;
-    char * serializeMdInfo(char * buf);
+    const char * serializeMdInfo(const char * buf);
     char * serializeMdInfo() const;
         
 	virtual int encrypt(bool);
@@ -459,17 +513,11 @@ protected:
 	virtual bool is_hdr_encrypt();
     ///
 	virtual bool is_encrypt();
-#ifdef WIN32
-	int set_inheritable( int flag );
-#else
-	// On unix, sockets are always inheritable
-	inline int set_inheritable( int ) { return TRUE; }
-#endif
 
     ///
 	bool test_connection();
 	/// get timeout time for pending connect operation;
-	time_t connect_timeout_time();
+	time_t connect_timeout_time() const;
 
 	///
 	int move_descriptor_up();
@@ -487,7 +535,7 @@ protected:
 	const KeyInfo& get_crypto_key() const;
 	const KeyInfo& get_md_key() const;
 	void resetCrypto();
-	virtual bool canEncrypt();
+	virtual bool canEncrypt() const;
 
 	/*
 	**	Data structures
@@ -505,12 +553,17 @@ protected:
 	char *          _auth_methods;
 	char *          _auth_name;
 	char *          _crypto_method;
+	std::string     _session;
+	classad::ClassAd *_policy_ad;
 	bool            _tried_authentication;
+	bool            _should_try_token_request{false};
+	std::string	_trust_domain;
+	std::unordered_set<std::string> m_authz_bound;
 
 	bool ignore_connect_timeout;	// Used by HA Daemon
 
 	// Buffer to hold the string version of our own IP address. 
-	char _my_ip_buf[IP_STRING_BUF_SIZE];	
+	mutable char _my_ip_buf[IP_STRING_BUF_SIZE];
 
 	Condor_Crypt_Base * crypto_;         // The actual crypto
 	CONDOR_MD_MODE      mdMode_;        // MAC mode
@@ -520,6 +573,11 @@ protected:
 
 	unsigned int m_uniqueId;
 	static unsigned int m_nextUniqueId;
+
+	// Helper function: if host is a Sinful string with an addrs attribute,
+	// return a Sinful string in addr with the primary address rewritten to
+	// be the best address in addrs.
+	bool chooseAddrFromAddrs( const char * host, std::string & addr );
 
 private:
 	bool initialize_crypto(KeyInfo * key);
@@ -531,19 +589,19 @@ private:
 
 	int _condor_read(SOCKET fd, char *buf, int sz, int timeout);
 	int _condor_write(SOCKET fd, const char *buf, int sz, int timeout);
-	int bindWithin(condor_protocol proto, const int low, const int high, bool outbound);
+	int bindWithin(condor_protocol proto, const int low, const int high);
 	///
 	// Buffer to hold the string version of our peer's IP address. 
-	char _peer_ip_buf[IP_STRING_BUF_SIZE];	
+	mutable char _peer_ip_buf[IP_STRING_BUF_SIZE];
 
 	// Buffer to hold the sinful address of our peer
-	char _sinful_peer_buf[SINFUL_STRING_BUF_SIZE];
+	mutable char _sinful_peer_buf[SINFUL_STRING_BUF_SIZE];
 
 	// Buffer to hold the sinful address of ourself
-	std::string _sinful_self_buf;
+	mutable std::string _sinful_self_buf;
 
 	// Buffer to hold the public sinful address of ourself
-	std::string _sinful_public_buf;
+	mutable std::string _sinful_public_buf;
 
 	// struct to hold state info for do_connect() method
 	struct connect_state_struct {
@@ -607,17 +665,8 @@ private:
 	   connection attempt.
 	 **/
 	void cancel_connect();
-
-	/**
-	   Private helper that sees if we're CCB enabled, if we're doing
-	   an outbound connection, and if so, uses CCB_local_bind() to
-	   avoid pounding the CCB broker for all outbound connections.
-	*/
-	//int _bind_helper(int fd, SOCKET_ADDR_CONST_BIND SOCKET_ADDR_TYPE addr,
-	//	SOCKET_LENGTH_TYPE len, bool outbound, bool loopback);
-	int _bind_helper(int fd, const condor_sockaddr& addr, bool outbound, bool loopback);
 };
 
-void dprintf ( int flags, Sock & sock, const char *fmt, ... ) CHECK_PRINTF_FORMAT(3,4);
+void dprintf ( int flags, const Sock & sock, const char *fmt, ... ) CHECK_PRINTF_FORMAT(3,4);
 
 #endif /* SOCK_H */

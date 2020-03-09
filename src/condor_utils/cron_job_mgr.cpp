@@ -24,7 +24,6 @@
 #include "condor_debug.h"
 #include "condor_daemon_core.h"
 #include "condor_config.h"
-#include "condor_string.h"
 #include "simplelist.h"
 #include "condor_cron_job_list.h"
 #include "condor_cron_job_mgr.h"
@@ -130,7 +129,7 @@ int CronJobMgr::SetParamBase( const char *param_base,
 	}
 
 	// Calc length & allocate
-	int		len = strlen( param_base ) + strlen( param_ext ) + 1;
+	size_t len = strlen( param_base ) + strlen( param_ext ) + 1;
 	char *tmp = (char * ) malloc( len );
 	if ( NULL == tmp ) {
 		return -1;
@@ -220,7 +219,7 @@ CronJobMgr::JobExited( const CronJob & /*job*/ )
 	if (  (m_cur_job_load < GetMaxJobLoad()) && (m_schedule_timer < 0)  ) {
 		m_schedule_timer = daemonCore->Register_Timer(
 			0,
-			(TimerHandlercpp)& CronJobMgr::ScheduleJobsTimer,
+			(TimerHandlercpp)& CronJobMgr::ScheduleJobsFromTimer,
 			"ScheduleJobs",
 			this );
 		if ( m_schedule_timer < 0 ) {
@@ -232,11 +231,11 @@ CronJobMgr::JobExited( const CronJob & /*job*/ )
 }
 
 // Schedule all jobs
-int
-CronJobMgr::ScheduleJobsTimer( void )
+void
+CronJobMgr::ScheduleJobsFromTimer( void )
 {
 	m_schedule_timer = -1;		// I've fired; reset for next time I'm needed
-	return ScheduleAllJobs( ) ? 0 : -1;
+	ScheduleAllJobs();
 }
 
 // Schedule all jobs
@@ -318,7 +317,13 @@ CronJobMgr::ParseJobList( const char *job_list_string )
 			 job_list_string );
 
 	// Break it into a string list
-	StringList	job_list( job_list_string );
+	StringList job_list;
+	StringTokenIterator it( job_list_string );
+	for( const char * item = it.first(); item; item = it.next() ) {
+		if( job_list.contains_anycase( item ) ) { continue; }
+		job_list.insert( item );
+	}
+
 	job_list.rewind( );
 
 	// Parse out the job names

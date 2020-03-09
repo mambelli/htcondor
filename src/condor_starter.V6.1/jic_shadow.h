@@ -137,7 +137,7 @@ public:
    			completely cleaned up.  We don't care, since we just wait
 			for the shadow to tell the startd to tell us to go away. 
 		*/
-	void allJobsGone( void ) {};
+	void allJobsGone( void );
 
 		/** The starter has been asked to shutdown fast.  Disable file
 			transfer, since we don't want that on fast shutdowns.
@@ -149,6 +149,8 @@ public:
 		 */
 	int reconnect( ReliSock* s, ClassAd* ad );
 
+		/// Disconnect from the shadow - jic virtual method handler
+	void disconnect();
 
 		// // // // // // // // // // // //
 		// Notfication to the shadow
@@ -234,7 +236,10 @@ public:
 		    to shadow by using file transfer
 		*/
 	bool uploadWorkingFiles(void);
-	
+
+		/** Send checkpoint files to shadow */
+	bool uploadCheckpointFiles();
+
 		/* Update Job ClassAd with checkpoint info and log it */
 	void updateCkptInfo(void);
 
@@ -242,7 +247,7 @@ public:
 	bool recordDelayedUpdate( const std::string &name, const classad::ExprTree &expr );
 
 		/* Return an attribute from the combination of the delayed ad and the starter */
-	std::auto_ptr<classad::ExprTree> getDelayedUpdate( const std::string &name );
+	std::unique_ptr<classad::ExprTree> getDelayedUpdate( const std::string &name );
 
 	virtual bool wroteChirpConfig() { return m_wrote_chirp_config; }
 	virtual const std::string chirpConfigFilename() { return m_chirp_config_filename; }
@@ -257,10 +262,13 @@ private:
 			the shadow
 			@param ad ClassAd pointer to publish into
 			@return true if success, false if failure
-		*/ 
+		*/
 	bool publishUpdateAd( ClassAd* ad );
 
 	bool publishJobExitAd( ClassAd* ad );
+
+	// Should only be called from publish[Update|JobExit]Ad().
+	bool publishStartdUpdates( ClassAd* ad );
 
 		/** Send an update ClassAd to the shadow.  The "insure_update"
 			just means do we make sure the update gets there.  It has
@@ -405,6 +413,9 @@ private:
 		// for file transfer and reconnect, do it.
 	void initMatchSecuritySession();
 
+		/// If the job ad says so, acquire user credentials
+	bool initUserCredentials();
+
 		/** Compare our own UIDDomain vs. where the job came from.  We
 			check in the job ClassAd for ATTR_UID_DOMAIN and compare
 			it to info we have about the shadow and the local machine.
@@ -430,7 +441,14 @@ private:
 	void setX509ProxyExpirationTimer();
 
 		// The proxy is about to expire, do something!
-	int proxyExpiring();
+	void proxyExpiring();
+
+	bool refreshSandboxCredentialsKRB();
+	void refreshSandboxCredentialsKRB_from_timer() { (void)refreshSandboxCredentialsKRB(); }
+	bool refreshSandboxCredentialsOAuth();
+	void refreshSandboxCredentialsOAuth_from_timer() { (void)refreshSandboxCredentialsOAuth(); }
+
+	bool shadowDisconnected() { return syscall_sock_lost_time > 0; };
 
 		// // // // // // // //
 		// Private Data Members
@@ -440,6 +458,10 @@ private:
 
 		/** The version of the shadow if known; otherwise NULL */
 	CondorVersionInfo* shadow_version;
+
+		/// timer id of the credential checking timer
+	int m_refresh_sandbox_creds_tid;
+	time_t m_sandbox_creds_last_update;
 
 		/// timer id of the proxy expiration timer
 	int m_proxy_expiration_tid;
@@ -463,13 +485,17 @@ private:
 	char *m_reconnect_sec_session;
 
 	/// if true, transfer files at vacate time (in addtion to job exit)
+	// but only if we get to the point of starting the job
 	bool transfer_at_vacate;
+	bool m_job_setup_done;
 
 	bool wants_file_transfer;
+	bool wants_x509_proxy;
 
 	char* uid_domain;
 	char* fs_domain;
 	bool trust_uid_domain;
+	bool trust_local_uid_domain;
 
 	std::string m_chirp_config_filename;
 	bool m_wrote_chirp_config;
@@ -482,6 +508,24 @@ private:
 		*/
 	bool job_cleanup_disconnected;
 
+		/** A flag to keep track of if the syscall_sock is registered
+			with daemonCore for read.  We do this so we notice asap
+			when this socket is closed, ie due to failed TCP keep alives.
+		*/
+	bool syscall_sock_registered;
+		/** handler for read callbacks on syscall sock, to notice if it closes */
+	int syscall_sock_handler(Stream *s);
+		/** epoch time when the syscall_sock got closed (shadow disappeared) */
+	time_t syscall_sock_lost_time;
+		/** timer id of timer to invoke job_lease_expired() when syscall_sock closed */
+	int syscall_sock_lost_tid;
+		/** invoked when job lease expired - exits w/ well known status */
+	void job_lease_expired();
+		/** must be invoked whenever our syscall_sock is reconnected */
+	void syscall_sock_reconnect();
+		/** must be invoked whenever we notice our syscall_sock is borked */
+	void syscall_sock_disconnect();
+
 	Stream *m_job_startd_update_sock;
 
 		/** A list of output files that have been dynamically added
@@ -493,6 +537,12 @@ private:
 			job submitter. (e.g. the job's executable itself)
 		*/
 	StringList m_removed_output_files;
+
+		/** A list of attributes to copy from the update ad to the job
+			ad every time we update the shadow.
+		*/
+	bool m_job_update_attrs_set;
+	StringList m_job_update_attrs;
 };
 
 

@@ -75,7 +75,13 @@ void ExprTree::debug_format_value(Value &value, double time) const {
 				result += "NULL\n";
 				break;
 			case Value::ERROR_VALUE:
-				result += "ERROR\n";
+				if ((FN_CALL_NODE == GetKind()) && !static_cast<const FunctionCall*>(this)->FunctionIsDefined()) {
+					result += "ERROR (function is not defined)\n";
+				} else if (classad::CondorErrMsg.size()) {
+					result += "ERROR (" + classad::CondorErrMsg + ")\n";
+				} else {
+					result += "ERROR\n";
+				}
 				break;
 			case Value::UNDEFINED_VALUE:
 				result += "UNDEFINED\n";
@@ -92,7 +98,7 @@ void ExprTree::debug_format_value(Value &value, double time) const {
 					result += "\n";
 				}
 				break;
-					
+
 			case Value::REAL_VALUE:
 				if(value.IsRealValue(doubleValue)) {
 							char buf[24];
@@ -109,12 +115,15 @@ void ExprTree::debug_format_value(Value &value, double time) const {
 				break;
 			case Value::STRING_VALUE:
 				if(value.IsStringValue(stringValue)) {
-					result += stringValue;	
+					result += stringValue;
 					result += "\n";
 				}
 				break;
 			case Value::CLASSAD_VALUE:
 				result += "CLASSAD\n";
+				break;
+			case Value::SCLASSAD_VALUE:
+				result += "SCLASSAD\n";
 				break;
 			case Value::LIST_VALUE:
 				result += "LIST\n";
@@ -122,29 +131,10 @@ void ExprTree::debug_format_value(Value &value, double time) const {
 			case Value::SLIST_VALUE:
 				result += "SLIST\n";
 				break;
+			default:
+				break;
 		}
 		debug_print(result.c_str());
-}
-
-ExprTree::
-ExprTree ()
-{
-	parentScope = NULL;
-}
-
-
-ExprTree::
-~ExprTree()
-{
-}
-
-void ExprTree::
-CopyFrom(const ExprTree &tree)
-{
-    if (this != &tree) {
-        parentScope = tree.parentScope;
-    }
-    return;
 }
 
 bool ExprTree::
@@ -207,7 +197,6 @@ Evaluate( EvalState &state, Value &val, ExprTree *&sig ) const
 void ExprTree::
 SetParentScope( const ClassAd* scope ) 
 {
-	parentScope = scope;
 	_SetParentScope( scope );
 }
 
@@ -217,13 +206,8 @@ Evaluate( Value& val ) const
 {
 	EvalState 	state;
 
-	if (parentScope == NULL) {
-		val.SetErrorValue();
-		return false;
-	} else {
-		state.SetScopes( parentScope );
-		return( Evaluate( state, val ) );
-	}
+	state.SetScopes( GetParentScope() );
+	return( Evaluate( state, val ) );
 }
 
 
@@ -232,7 +216,7 @@ Evaluate( Value& val, ExprTree*& sig ) const
 {
 	EvalState 	state;
 
-	state.SetScopes( parentScope );
+	state.SetScopes( GetParentScope() );
 	return( Evaluate( state, val, sig  ) );
 }
 
@@ -242,7 +226,7 @@ Flatten( Value& val, ExprTree *&tree ) const
 {
 	EvalState state;
 
-	state.SetScopes( parentScope );
+	state.SetScopes( GetParentScope() );
 	return( Flatten( state, val, tree ) );
 }
 
@@ -270,6 +254,7 @@ bool ExprTree::isClassad(ClassAd ** ptr)
 	return (bRet);
 }
 
+SAL_Ret_notnull
 const ExprTree* ExprTree::self() const
 {
 	const ExprTree * pRet=this;
@@ -279,6 +264,7 @@ const ExprTree* ExprTree::self() const
 /* This version is for shared-library compatibility.
  * Remove it the next time we have to bump the ClassAds SO version.
  */
+SAL_Ret_notnull
 const ExprTree* ExprTree::self()
 {
 	const ExprTree * pRet=this;
@@ -317,6 +303,7 @@ EvalState( )
 	depth_remaining = MAX_CLASSAD_RECURSION;
 	flattenAndInline = false;	// NAC
 	debug = false;
+	inAttrRefScope = false;
 }
 
 EvalState::
@@ -354,6 +341,7 @@ SetRootScope( )
         
         while( curScope ) {
             if( curScope == curAd ) {	// NAC - loop detection
+                rootAd = NULL;
                 return;					// NAC
             }							// NAC
             prevScope = curScope;
@@ -363,17 +351,6 @@ SetRootScope( )
         rootAd = prevScope;
     }
     return;
-}
-
-ostream& operator<<(ostream &stream, const ExprTree *expr)
-{
-	ClassAdUnParser unparser;
-	string      string_representation;
-
-	unparser.Unparse(string_representation, expr);
-	stream << string_representation;
-	
-	return stream;
 }
 
 bool operator==(const ExprTree &tree1, const ExprTree &tree2)

@@ -29,11 +29,11 @@
 #include "string_list.h"
 #include "classad/classad_distribution.h"
 
+#include "submit_job.h"
 
 bool VanillaToGrid::vanillaToGrid(classad::ClassAd * ad, int target_universe, const char * gridresource, bool is_sandboxed)
 {
 	ASSERT(ad);
-	ASSERT(gridresource);
 
 	/* TODO:
 		- If job fails to specify transfer_input_files but has some (relying on
@@ -56,7 +56,7 @@ bool VanillaToGrid::vanillaToGrid(classad::ClassAd * ad, int target_universe, co
 		side
 	*/
 
-	MyString remoteattr;
+	std::string remoteattr;
 	remoteattr = "Remote_";
 	remoteattr += ATTR_JOB_UNIVERSE;
 
@@ -69,23 +69,30 @@ bool VanillaToGrid::vanillaToGrid(classad::ClassAd * ad, int target_universe, co
 	ad->Delete(ATTR_BUFFER_SIZE);
 	ad->Delete(ATTR_BUFFER_SIZE);
 	ad->Delete("CondorPlatform"); // TODO: Find #define
-	ad->Delete("CondorVersion");  // TODO: Find #define
+	ad->Delete(ATTR_CONDOR_VERSION);  // TODO: Find #define
 	ad->Delete(ATTR_CORE_SIZE);
 	ad->Delete(ATTR_GLOBAL_JOB_ID); // Store in different ATTR here?
-	//ad->Delete(ATTR_OWNER); // How does schedd filter? 
+	//ad->Delete(ATTR_OWNER); // How does schedd filter?
+	ad->Delete(ATTR_USER); // Schedd will set this with the proper UID_DOMAIN
 	ad->Delete(ATTR_Q_DATE);
 	ad->Delete(ATTR_JOB_REMOTE_WALL_CLOCK);
 	ad->Delete(ATTR_SERVER_TIME);
 	ad->Delete(ATTR_AUTO_CLUSTER_ID);
 	ad->Delete(ATTR_AUTO_CLUSTER_ATTRS);
+	ad->Delete(ATTR_TOTAL_SUBMIT_PROCS);
 	ad->Delete( ATTR_STAGE_IN_FINISH );
 	ad->Delete( ATTR_STAGE_IN_START );
+	ad->Delete( ATTR_ULOG_FILE );
+	ad->Delete( ATTR_ULOG_USE_XML );
+	ad->Delete( ATTR_DAGMAN_WORKFLOW_LOG );
+	ad->Delete( ATTR_DAGMAN_WORKFLOW_MASK );
 
-	if( is_sandboxed ) {
-		char attr_name[100];
-		snprintf(attr_name,100,"SUBMIT_%s",ATTR_JOB_IWD);
-		ad->Delete(attr_name);  // the presence of this would prevent schedd from rewriting spooled iwd
-	}
+	// We aren't going to forward updates to this attribute,
+	// so strip it out.
+	// We do evaluate it locally in the source job ad.
+	ad->Delete(ATTR_TIMER_REMOVE_CHECK);
+
+	ad->Delete("SUBMIT_" ATTR_JOB_IWD); // the presence of this would prevent schedd from rewriting spooled iwd
 
 	// Stuff to reset
 	ad->InsertAttr(ATTR_JOB_STATUS, 1); // Idle
@@ -123,7 +130,7 @@ bool VanillaToGrid::vanillaToGrid(classad::ClassAd * ad, int target_universe, co
 	}
 
 	ad->InsertAttr(ATTR_JOB_UNIVERSE, target_universe);
-	ad->Insert(remoteattr.Value(), olduniv, false);
+	ad->Insert(remoteattr, olduniv);
 		// olduniv is now controlled by ClassAd
 
 	if( target_universe == CONDOR_UNIVERSE_GRID ) {
@@ -233,13 +240,19 @@ static bool set_job_status_simple(classad::ClassAd const &orig,classad::ClassAd 
 }
 
 static void set_job_status_idle(classad::ClassAd const &orig, classad::ClassAd &update) {
-	set_job_status_simple(orig,update,IDLE);
+	int old_update_status = IDLE;
+	update.EvaluateAttrInt( ATTR_JOB_STATUS, old_update_status );
+	if ( set_job_status_simple(orig,update,IDLE) && old_update_status == RUNNING ) {
+		WriteEvictEventToUserLog( orig );
+	}
 }
 
 static void set_job_status_running(classad::ClassAd const &orig, classad::ClassAd &update) {
-	set_job_status_simple(orig,update,RUNNING);
-	// TODO: For new_status=RUNNING and set_job_status_simple()
-	// returned true, should we be calling WriteExecuteEventToUserLog?
+	int old_update_status = IDLE;
+	update.EvaluateAttrInt( ATTR_JOB_STATUS, old_update_status );
+	if ( set_job_status_simple(orig,update,RUNNING) && old_update_status == IDLE ) {
+		WriteExecuteEventToUserLog( orig );
+	}
 }
 
 static void set_job_status_held(classad::ClassAd const &orig,classad::ClassAd &update,const char * hold_reason, int hold_code, int hold_subcode)
@@ -263,7 +276,7 @@ static void set_job_status_held(classad::ClassAd const &orig,classad::ClassAd &u
 	classad::ExprTree * origexpr = update.Lookup(ATTR_RELEASE_REASON);
 	if(origexpr) {
 		classad::ExprTree * toinsert = origexpr->Copy(); 
-		update.Insert(ATTR_LAST_RELEASE_REASON, toinsert, false);
+		update.Insert(ATTR_LAST_RELEASE_REASON, toinsert);
 	}
 	update.Delete(ATTR_RELEASE_REASON);
 
@@ -293,19 +306,30 @@ bool update_job_status( classad::ClassAd const & orig, classad::ClassAd & newgri
 		ATTR_ON_EXIT_CODE,
 		ATTR_EXIT_REASON,
 		ATTR_JOB_CURRENT_START_DATE,
+		ATTR_JOB_CURRENT_START_EXECUTING_DATE,
+		ATTR_JOB_LAST_START_DATE,
+		ATTR_SHADOW_BIRTHDATE,
 		ATTR_JOB_LOCAL_SYS_CPU,
 		ATTR_JOB_LOCAL_USER_CPU,
 		ATTR_JOB_REMOTE_SYS_CPU,
 		ATTR_JOB_REMOTE_USER_CPU,
 		ATTR_NUM_CKPTS,
 		ATTR_NUM_GLOBUS_SUBMITS,
+		ATTR_NUM_JOB_STARTS,
+		ATTR_NUM_JOB_RECONNECTS,
+		ATTR_NUM_SHADOW_EXCEPTIONS,
+		ATTR_NUM_SHADOW_STARTS,
 		ATTR_NUM_MATCHES,
 		ATTR_NUM_RESTARTS,
 		ATTR_JOB_REMOTE_WALL_CLOCK,
 		ATTR_JOB_CORE_DUMPED,
 		ATTR_EXECUTABLE_SIZE,
 		ATTR_IMAGE_SIZE,
-		ATTR_SHADOW_BIRTHDATE,
+		ATTR_MEMORY_USAGE,
+		ATTR_RESIDENT_SET_SIZE,
+		ATTR_PROPORTIONAL_SET_SIZE,
+		ATTR_DISK_USAGE,
+		ATTR_SCRATCH_DIR_FILE_COUNT,
 		ATTR_SPOOLED_OUTPUT_FILES,
 		NULL };		// list must end with a NULL
 		// ATTR_JOB_STATUS
@@ -374,7 +398,7 @@ bool update_job_status( classad::ClassAd const & orig, classad::ClassAd & newgri
 		classad::ExprTree * newgridexpr = newgrid.Lookup(attrs_to_copy[index]);
 		if( newgridexpr != NULL && (origexpr == NULL || ! (*origexpr == *newgridexpr) ) ) {
 			classad::ExprTree * toinsert = newgridexpr->Copy(); 
-			update.Insert(attrs_to_copy[index], toinsert, false);
+			update.Insert(attrs_to_copy[index], toinsert);
 		}
 	}
 
@@ -387,7 +411,7 @@ bool update_job_status( classad::ClassAd const & orig, classad::ClassAd & newgri
 			classad::ExprTree * newgridexpr = newgrid.Lookup(attr);
 			if( newgridexpr != NULL && (origexpr == NULL || ! (*origexpr == *newgridexpr) ) ) {
 				classad::ExprTree * toinsert = newgridexpr->Copy(); 
-				update.Insert(attr, toinsert, false);
+				update.Insert(attr, toinsert);
 			}
 		}
 	}

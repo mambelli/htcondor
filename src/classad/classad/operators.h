@@ -105,25 +105,12 @@ class Operation : public ExprTree
 			__LAST_OP__             = __MISC_END__
 		};
 
-#ifdef TJ_REFACTOR
-        /// Copy Constructor
-        Operation(const Operation &op);
-#endif
-
 		/// Destructor
 		virtual ~Operation ();
 
-#ifdef TJ_REFACTOR
-        /// Assignment operator
-        Operation &operator=(const Operation &op);
-#endif
-
 		/// node type
 		virtual NodeKind GetKind (void) const { return OP_NODE; }
-#ifdef TJ_REFACTOR
-#else
 		virtual OpKind GetOpKind(void) const { return __NO_OP__; }
-#endif
 
 		/** Factory method to create an operation expression node
 			@param kind The kind of operation.
@@ -141,11 +128,7 @@ class Operation : public ExprTree
 			@param e2 The second sub-expression child of the node (if any).
 			@param e3 The third sub-expression child of the node (if any).
 		*/
-#ifdef TJ_REFACTOR
-		void GetComponents( OpKind&, ExprTree*&, ExprTree*&, ExprTree *& )const;
-#else
 		virtual void GetComponents( OpKind&, ExprTree*&, ExprTree*&, ExprTree *& )const;
-#endif
 
 		// public access to operation function
 		/** Convenience method which operates on binary operators.
@@ -184,29 +167,19 @@ class Operation : public ExprTree
 		/// Make a deep copy of the expression
 		virtual ExprTree* Copy( ) const;
 
-#ifdef TJ_REFACTOR
-        bool CopyFrom(const Operation &op);
-#endif
-
         virtual bool SameAs(const ExprTree *tree) const;
 
         friend bool operator==(const Operation &op1, const Operation &op2);
 
+		virtual const ClassAd *GetParentScope( ) const { return( parentScope ); }
+
 	protected:
 		/// Constructor
-#ifdef TJ_REFACTOR
-		Operation ();
-#else
-		Operation() {};
-#endif
+		Operation() : parentScope(NULL) {};
 
   	private:
-#ifdef TJ_REFACTOR
-        bool SameChild(const ExprTree *tree1, const ExprTree *tree2) const;
-#else
         static bool SameChild(const ExprTree *tree1, const ExprTree *tree2);
         static bool SameChildren(const Operation * op1, const Operation * op2);
-#endif
 
 		virtual void _SetParentScope( const ClassAd* );
 		virtual bool _Evaluate( EvalState &, Value &) const;
@@ -236,30 +209,24 @@ class Operation : public ExprTree
 		static int 	doBitwise 			(OpKind, Value&, Value&, Value&); 
 		static int 	doRealArithmetic	(OpKind, Value&, Value&, Value&);
 		static int 	doTimeArithmetic	(OpKind, Value&, Value&, Value&);
-		static void compareStrings		(OpKind, Value&, Value&, Value&,bool);
+		static void compareStrings		(OpKind, Value&, Value&, Value&);
 		static void compareReals		(OpKind, Value&, Value&, Value&);
 		static void compareBools		(OpKind, Value&, Value&, Value&);
 		static void compareIntegers		(OpKind, Value&, Value&, Value&);
 		static void compareAbsoluteTimes(OpKind, Value&, Value&, Value&);
 		static void compareRelativeTimes(OpKind, Value&, Value&, Value&);
 
-		// operation specific information
-#ifdef TJ_REFACTOR
-		OpKind		operation;
-		ExprTree 	*child1;
-		ExprTree	*child2;
-		ExprTree	*child3;
-#else
-		//ExprTree 	*child1;
+		const ClassAd *parentScope;
+
+		// No Operation-specific data members.
+		// Everything is in child classes
+
 		friend class Operation1;
 		friend class OperationParens;
 		friend class Operation2;
 		friend class Operation3;
-#endif
 };
 
-#ifdef TJ_REFACTOR
-#else
 
 class Operation1 : public Operation
 {
@@ -321,6 +288,7 @@ class OperationParens : public Operation
 
 		/// Make a deep copy of the expression
 		virtual ExprTree* Copy( ) const;
+		virtual bool _Evaluate( EvalState &, Value &) const;
 
 	protected:
 		/// Constructor
@@ -431,8 +399,6 @@ class Operation3 : public Operation
 		ExprTree	*child2;
 		ExprTree	*child3;
 };
-
-#endif // TJ_REFACTOR
 
 } // classad
 

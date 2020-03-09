@@ -69,7 +69,7 @@ NAMETABLE_DIRECTIVE:TABLE:DCTranslation
 //#define STARTD_INFO			(SCHED_VERS+14)		/* Not used */
 //#define SCHEDD_INFO			(SCHED_VERS+15)		/* Not used */
 #define NEGOTIATE			(SCHED_VERS+16) // 7.5.4+ negotiation command
-#define SEND_JOB_INFO		(SCHED_VERS+17)
+#define SEND_JOB_INFO		(SCHED_VERS+17)     // used in negotiation protocol
 #define NO_MORE_JOBS		(SCHED_VERS+18)		// used in negotiation protocol
 #define JOB_INFO			(SCHED_VERS+19)		// used in negotiation protocol
 //#define GIVE_STATUS			(SCHED_VERS+20)		/* Not used */
@@ -81,7 +81,7 @@ NAMETABLE_DIRECTIVE:TABLE:DCTranslation
 #define REJECTED			(SCHED_VERS+26)
 #define X_EVENT_NOTIFICATION		(SCHED_VERS+27)
 //#define RECONFIG			(SCHED_VERS+28)			/* Not used */
-//#define GET_HISTORY			(SCHED_VERS+29)		/* Not used */
+#define GET_HISTORY			(SCHED_VERS+29)		/* repurposed in 8.9.6 to be query startd history */
 //#define UNLINK_HISTORY_FILE			(SCHED_VERS+30)	/* Not used */
 //#define UNLINK_HISTORY_FILE_DONE	(SCHED_VERS+31)		/* Not used */
 //#define DO_NOT_UNLINK_HISTORY_FILE	(SCHED_VERS+32)	/* Not used */
@@ -176,6 +176,15 @@ NAMETABLE_DIRECTIVE:TABLE:DCTranslation
 #define QUERY_SCHEDD_HISTORY (SCHED_VERS+115)
 #define QUERY_JOB_ADS (SCHED_VERS+116)
 #define SWAP_CLAIM_AND_ACTIVATION (SCHED_VERS+117) // swap claim & activation between two STARTD resources, for moving a job into a 'transfer' slot.
+#define SEND_RESOURCE_REQUEST_LIST	(SCHED_VERS+118)     // used in negotiation protocol
+#define QUERY_JOB_ADS_WITH_AUTH (SCHED_VERS+119) // Same as QUERY_JOB_ADS but requires authentication
+#define FETCH_PROXY_DELEGATION (SCHED_VERS+120)
+
+#define REASSIGN_SLOT (SCHED_VERS+121) // Given two job IDs, deactivate the victim job's claim and reactivate it running the beneficiary job.
+#define COALESCE_SLOTS (SCHED_VERS+122) // Given a resource request (job ad) and k claim IDs, invalidate them, merge them into one slot, and return that slot's new claim ID and machine ad.  The resource request is used to compute left-overs.
+
+// Given a token request from a trusted collector, generate an identity token.
+#define COLLECTOR_TOKEN_REQUEST (SCHED_VERS+123)
 
 // values used for "HowFast" in the draining request
 #define DRAIN_GRACEFUL 0
@@ -199,6 +208,7 @@ NAMETABLE_DIRECTIVE:TABLE:DCTranslation
 #define REPLICATION_GIVING_UP_VERSION      (REPLICATION_COMMANDS_BASE + 3)
 #define REPLICATION_SOLICIT_VERSION        (REPLICATION_COMMANDS_BASE + 4)
 #define REPLICATION_SOLICIT_VERSION_REPLY  (REPLICATION_COMMANDS_BASE + 5)
+#define REPLICATION_TRANSFER_FILE_NEW      (REPLICATION_COMMANDS_BASE + 6)
 
 /*
   The ClassAd-only protocol.  CA_CMD is the base command that's sent
@@ -220,11 +230,16 @@ NAMETABLE_DIRECTIVE:TABLE:DCTranslation
 #define CA_SUSPEND_CLAIM        (CA_AUTH_CMD_BASE+5)
 #define CA_RESUME_CLAIM         (CA_AUTH_CMD_BASE+6)
 #define CA_RENEW_LEASE_FOR_CLAIM (CA_AUTH_CMD_BASE+7)
-// other commands that use the ClassAd-only protocol 
-// CA_LOCATE_STARTER used to be (CA_AUTH_CMD_BASE+7), but no more 
-// CA_RECONNECT_JOB used to be  (CA_AUTH_CMD_BASE+8), but no more 
+// other commands that use the ClassAd-only protocol
+// CA_LOCATE_STARTER used to be (CA_AUTH_CMD_BASE+7), but no more
+// CA_RECONNECT_JOB used to be  (CA_AUTH_CMD_BASE+8), but no more
 
-#define CA_CMD                  (CA_CMD_BASE+0) 
+// Use the ClassAd-based protocol for updating the machine ClassAd.
+#define CA_UPDATE_MACHINE_AD	(CA_AUTH_CMD_BASE+9)
+// Use the ClassAd-based protocol for communicating with the annex daemon.
+#define CA_BULK_REQUEST			(CA_AUTH_CMD_BASE+10)
+
+#define CA_CMD                  (CA_CMD_BASE+0)
 #define CA_LOCATE_STARTER       (CA_CMD_BASE+1)
 #define CA_RECONNECT_JOB        (CA_CMD_BASE+2)
 
@@ -289,10 +304,6 @@ const int UPDATE_NEGOTIATOR_AD 	= 49;
 const int QUERY_NEGOTIATOR_ADS	= 50;
 const int INVALIDATE_NEGOTIATOR_ADS = 51;
 
-const int UPDATE_QUILL_AD	= 52;
-const int QUERY_QUILL_ADS	= 53;
-const int INVALIDATE_QUILL_ADS  = 54;
-
 const int UPDATE_HAD_AD = 55;
 const int QUERY_HAD_ADS = 56;
 const int INVALIDATE_HAD_ADS = 57;
@@ -302,13 +313,13 @@ const int INVALIDATE_ADS_GENERIC = 59;
 
 const int UPDATE_STARTD_AD_WITH_ACK = 60;
 
-const int UPDATE_XFER_SERVICE_AD		= 61;
-const int QUERY_XFER_SERVICE_ADS		= 62;
-const int INVALIDATE_XFER_SERVICE_ADS	= 63;
+//const int UPDATE_XFER_SERVICE_AD		= 61;	/* Not used */
+//const int QUERY_XFER_SERVICE_ADS		= 62;	/* Not used */
+//const int INVALIDATE_XFER_SERVICE_ADS	= 63;	/* Not used */
 
-const int UPDATE_LEASE_MANAGER_AD		= 64;
-const int QUERY_LEASE_MANAGER_ADS		= 65;
-const int INVALIDATE_LEASE_MANAGER_ADS  = 66;
+//const int UPDATE_LEASE_MANAGER_AD		= 64;	/* Not used */
+//const int QUERY_LEASE_MANAGER_ADS		= 65;	/* Not used */
+//const int INVALIDATE_LEASE_MANAGER_ADS  = 66;	/* Not used */
 
 const int CCB_REGISTER = 67;
 const int CCB_REQUEST = 68;
@@ -323,6 +334,15 @@ const int QUERY_GENERIC_ADS = 74;
 
 const int SHARED_PORT_CONNECT = 75;
 const int SHARED_PORT_PASS_SOCK = 76;
+
+const int UPDATE_ACCOUNTING_AD = 77;
+const int QUERY_ACCOUNTING_ADS = 78;
+const int INVALIDATE_ACCOUNTING_ADS = 79;
+
+const int UPDATE_OWN_SUBMITTOR_AD = 80;
+
+// Request a collector to retrieve an identity token from a schedd.
+const int IMPERSONATION_TOKEN_REQUEST = 81;
 
 /* these comments are used to control command_table_generator.pl
 NAMETABLE_DIRECTIVE:END_SECTION:collector
@@ -392,7 +412,16 @@ NAMETABLE_DIRECTIVE:END_SECTION:collector
 #define DC_SEC_QUERY        (DC_BASE+40)
 #define DC_SET_FORCE_SHUTDOWN (DC_BASE+41)
 #define DC_OFF_FORCE       (DC_BASE+42)
-
+#define DC_SET_READY       (DC_BASE+43)  // sent to parent to indicate a demon is ready for use
+#define DC_QUERY_READY     (DC_BASE+44)  // daemon command handler should reply only once it and children are ready
+#define DC_QUERY_INSTANCE  (DC_BASE+45)  // ask if a daemon is alive - returns a random 64 bit int that will not change as long as this instance is alive.
+#define DC_GET_SESSION_TOKEN (DC_BASE+46) // Retrieve an authentication token for TOKEN that is at most equivalent to the current session.
+#define DC_START_TOKEN_REQUEST (DC_BASE+47) // Request a token from this daemon.
+#define DC_FINISH_TOKEN_REQUEST (DC_BASE+48) // Poll remote daemon for available token.
+#define DC_LIST_TOKEN_REQUEST (DC_BASE+49) // Poll for the existing token requests.
+#define DC_APPROVE_TOKEN_REQUEST (DC_BASE+50) // Approve a token request.
+#define DC_AUTO_APPROVE_TOKEN_REQUEST (DC_BASE+51) // Auto-approve token requests.
+#define DC_EXCHANGE_SCITOKEN (DC_BASE+52) // Exchange a SciToken for a Condor token.
 
 /*
 *** Log type supported by DC_FETCH_LOG
@@ -473,14 +502,6 @@ NAMETABLE_DIRECTIVE:END_SECTION:collector
 /* files are being read from the transferd's storage */
 #define TRANSFERD_READ_FILES	(TRANSFERD_BASE+3)
 
-/*
-*** Commands used by the new lease manager daemon
-*/
-#define LEASE_MANAGER_BASE			75000
-#define LEASE_MANAGER_GET_LEASES	(LEASE_MANAGER_BASE+0)
-#define LEASE_MANAGER_RENEW_LEASE	(LEASE_MANAGER_BASE+1)
-#define LEASE_MANAGER_RELEASE_LEASE	(LEASE_MANAGER_BASE+2)
-
 
 /*
 *** Commands used by the credd daemon
@@ -490,6 +511,8 @@ NAMETABLE_DIRECTIVE:END_SECTION:collector
 #define CREDD_GET_CRED (CREDD_BASE+1)
 #define CREDD_REMOVE_CRED (CREDD_BASE+2)
 #define CREDD_QUERY_CRED (CREDD_BASE+3)
+#define CREDD_REFRESH_ALL (CREDD_BASE+20)
+#define CREDD_CHECK_CREDS (CREDD_BASE+30)	// check to see if the desired oauth tokens are stored
 #define CREDD_GET_PASSWD (CREDD_BASE+99)	// used by the Win32 credd only
 #define CREDD_NOP (CREDD_BASE+100)			// used by the Win32 credd only
 

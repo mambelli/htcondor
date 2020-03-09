@@ -23,7 +23,6 @@
 #include "condor_common.h"
 #include "condor_config.h"
 #include "condor_attributes.h"
-#include "get_daemon_name.h"
 #include "sig_install.h"
 #include "daemon.h"
 #include "dc_schedd.h"
@@ -57,7 +56,7 @@ void
 usage()
 {
 	fprintf( stderr, "Usage: %s [{+|-}priority ] [-p priority] ", MyName );
-	fprintf( stderr, "[ -a ] [-n schedd_name] [ -pool pool_name ] [user | cluster | cluster.proc] ...\n");
+	fprintf( stderr, "[ -a ] [-n schedd_name] [ -pool pool_name ] [user | cluster | cluster.proc | -a] ...\n");
 	exit( 1 );
 }
 
@@ -77,6 +76,7 @@ main( int argc, char *argv[] )
 	MyName = argv[0];
 	myDistro->Init( argc, argv );
 
+	set_priv_initialize(); // allow uid switching if root
 	config();
 
 	if( argc < 2 ) {
@@ -211,8 +211,6 @@ compute_adj( char *arg )
 		return( val );
 	}
 }
-
-extern "C" int SetSyscalls( int foo ) { return foo; }
 
 void UpdateJobAd(int cluster, int proc)
 {

@@ -21,7 +21,6 @@
 #include <limits.h>
 #include <string.h>
 #include "condor_debug.h"
-#include "condor_string.h"
 #include "condor_daemon_core.h"
 #include "condor_cron_job_mgr.h"
 #include "condor_cron_job_params.h"
@@ -405,7 +404,8 @@ CronJob::Reaper( int exitPid, int exitStatus )
 	case CRON_TERM_SENT:
 	case CRON_KILL_SENT:
 		m_in_shutdown = false;
-		
+		// Fall through...	
+		//@fallthrough@
 	default:
 		SetState( CRON_IDLE );			// Note that it's dead
 
@@ -447,6 +447,8 @@ CronJob::ProcessOutputQueue( void )
 	if ( linecount != 0 ) {
 		dprintf( D_FULLDEBUG, "%s: %d lines in Queue\n",
 				 GetName(), linecount );
+
+		status = ProcessOutputSep( m_stdOutBuf->GetQueueSep() );
 
 		// Read all of the data from the queue
 		char	*linebuf;
@@ -524,6 +526,7 @@ CronJob::StartJobProcess( void )
 		final_args,			// argv
 		priv,				// Priviledge level
 		m_reaperId,			// ID Of reaper
+		FALSE,				// Command port?  No
 		FALSE,				// Command port?  No
 		&Params().GetEnv(), // Env to give to child
 		Params().GetCwd(),	// Starting CWD
@@ -883,8 +886,8 @@ CronJob::SetTimer( unsigned first, unsigned period_arg )
 				 "CronJob: Creating timer for job '%s'\n", GetName() );
 		TimerHandlercpp handler =
 			(  ( IsWaitForExit() ) ? 
-			   (TimerHandlercpp)& CronJob::StartJob :
-			   (TimerHandlercpp)& CronJob::RunJob );
+			   (TimerHandlercpp)& CronJob::StartJobFromTimer :
+			   (TimerHandlercpp)& CronJob::RunJobFromTimer );
 		m_run_timer = daemonCore->Register_Timer(
 			first,
 			period_arg,

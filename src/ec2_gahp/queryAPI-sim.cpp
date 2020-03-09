@@ -15,9 +15,8 @@
 #include <string>
 #include <map>
 #include <sstream>
-
-#include <ext/hash_map>
-namespace ext = __gnu_cxx;
+#include <vector>
+#include <algorithm>
 
 typedef std::map< std::string, std::string > AttributeValueMap;
 typedef bool (*ActionHandler)( AttributeValueMap & avm, std::string & reply, unsigned requestNumber );
@@ -35,22 +34,6 @@ typedef std::map< std::string, ActionHandler > ActionToHandlerMap;
  *      CreateTags
  */
 
-/*
- * Inexplicably, this isn't one of the standard specializations.
- * Even less explicably, you can't use namespace aliases to open a namespace.
- *
- * However, by supplying this specialization, all of the ext::hash_maps using
- * std::string as a key work without further ado.
- */
-
-namespace __gnu_cxx {
-    template<> struct hash< std::string > {
-        size_t operator()( const std::string & s ) const {
-            return __stl_hash_string( s.c_str() );
-        }
-    };
-}
-
 std::string xmlTag( const char * tagName, const std::string & tagValue ) {
     std::ostringstream os;
     os << "<" << tagName << ">" << tagValue << "</" << tagName << ">";
@@ -63,7 +46,7 @@ typedef struct Group_t {
     Group_t() { }
     Group_t( const std::string & gID ) : groupID( gID ) { }
 } Group;
-typedef ext::hash_map< std::string, Group > NameToGroupMap;
+typedef std::map< std::string, Group > NameToGroupMap;
 
 typedef struct Keypair_t {
     std::string keyName;
@@ -76,7 +59,7 @@ typedef struct Keypair_t {
                const std::string & pk ) : keyName( kn ),
                fingerprint( fp ), privateKey( pk ) { }
 } Keypair;
-typedef ext::hash_map< std::string, Keypair > NameToKeypairMap;
+typedef std::map< std::string, Keypair > NameToKeypairMap;
 
 std::ostream & operator << ( std::ostream & os, const Keypair & kp ) {
     os << "<item>" << std::endl;
@@ -192,7 +175,7 @@ typedef struct Instance_t {
                 instanceType( iT ), keyName( kN ), instanceState( iS ),
                 groupNames( gN ) { }
 } Instance;
-typedef ext::hash_map< std::string, Instance > InstanceIDToInstanceMap;
+typedef std::map< std::string, Instance > InstanceIDToInstanceMap;
 
 std::ostream & operator << ( std::ostream & os, const Instance & i ) {
     os << "<item>" << std::endl;
@@ -214,7 +197,7 @@ typedef struct {
     NameToGroupMap groups;
     InstanceIDToInstanceMap instances;
 } User;
-typedef ext::hash_map< std::string, User > AccessKeyIDToUserMap;
+typedef std::map< std::string, User > AccessKeyIDToUserMap;
 
 // Global.  Eww.
 AccessKeyIDToUserMap users;
@@ -237,7 +220,7 @@ void registerTestUsers() {
 // speculated that this might be because templated functions are in their
 // own namespace, but getObject<>() doesn't infer the return type, either.
 template< class V, class T, class K > V getObject( const T & map, const K & key, bool & found ) {
-    class T::const_iterator ci = map.find( key );
+    typename T::const_iterator ci = map.find( key );
     if( map.end() == ci ) {
         found = false;
         return V();
@@ -249,7 +232,7 @@ template< class V, class T, class K > V getObject( const T & map, const K & key,
 template< class V, class T, class K > V & getReference( T & map, const K & key, bool & found ) {
     static V dummyValue = V();
 
-    class T::iterator ci = map.find( key );
+    typename T::iterator ci = map.find( key );
     if( map.end() == ci ) {
         found = false;
         return dummyValue;
@@ -263,7 +246,7 @@ User & validateAndAcquireUser( AttributeValueMap & avm, std::string & userID, st
 
     userID = getObject< std::string >( avm, "AWSAccessKeyId", found );
     if( (! found) || userID.empty() ) {
-        fprintf( stderr, "Failed to find userID in query.\n" );
+        fprintf( stderr, "Failed to find user ID in query.\n" );
         reply = "Required parameter 'AWSAccessKeyId' missing or empty.\n";
         found = false;
         return dummyUser;
@@ -673,6 +656,38 @@ void registerAllHandlers() {
     simulatorActions[ "CreateTags" ] = & handleCreateTags;
 }
 
+// m/^Authorization: <algorithm> Credential=<accessKeyID>/....
+bool extractAccessKeyID( const std::string & header, std::string & accessKeyID ) {
+	std::string::size_type i = header.find( "\r\nAuthorization: " );
+	if( std::string::npos == i ) {
+		fprintf( stderr, "Malformed header '%s': contains no Authorization header; failing.\n", header.c_str() );
+		return false;
+	}
+
+	std::string::size_type j = header.find( "\r\n", i + 2 );
+	if( std::string::npos == j ) {
+        fprintf( stderr, "Malformed request '%s': Authorization field not CR/LF terminated; failing.\n", header.c_str() );
+		return false;
+	}
+
+	std::string credential = "Credential=";
+	std::string::size_type k = header.find( credential, i );
+	if( std::string::npos == j || k >= j ) {
+		fprintf( stderr, "Malformed header '%s': Authorization field does not contain Credential.\n", header.c_str() );
+		return false;
+	}
+
+	std::string::size_type l = header.find( "/", k + credential.length() );
+	if( std::string::npos == j || l >= j ) {
+		fprintf( stderr, "Malformed header '%s': Credential does not contain '/'.\n", header.c_str() );
+		return false;
+	}
+
+	accessKeyID = header.substr( k + credential.length(), l - (k + credential.length()) );
+	// fprintf( stderr, "Found accessKeyID '%s'\n", accessKeyID.c_str() );
+	return true;
+}
+
 // m/^Host: <host>\r\n/
 bool extractHost( const std::string & request, std::string & host ) {
     std::string::size_type i = request.find( "\r\nHost: " );
@@ -822,6 +837,19 @@ std::string handleRequest( const std::string & header, std::string & request ) {
 
         i = ampersandIdx;
     }
+
+
+	//
+	// Quick hack to handle signature V4.
+	//
+	std::string accessKeyID = queryParameters[ "AWSAccessKeyId" ];
+	if( accessKeyID.empty() ) {
+    	if( ! extractAccessKeyID( header, accessKeyID ) ) {
+	        return constructReply( "HTTP/1.1 400 Bad Request", "Unable to extract accessKeyID" );
+    	}
+		queryParameters[ "AWSAccessKeyId" ] = accessKeyID;
+	}
+
 
     std::string method = "POST";
     if( ! validateSignature( method, host, URL, queryParameters ) ) {

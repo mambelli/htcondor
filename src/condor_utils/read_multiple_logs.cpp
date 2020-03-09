@@ -36,10 +36,6 @@
 #define realpath(path,resolved_path) _fullpath((resolved_path),(path),_MAX_PATH)
 #endif
 
-#define LOG_HASH_SIZE 37 // prime
-
-#define LOG_INFO_HASH_SIZE 37 // prime
-
 #define DEBUG_LOG_FILES 0 //TEMP
 #if DEBUG_LOG_FILES
 #  define D_LOG_FILES D_ALWAYS
@@ -47,11 +43,13 @@
 #  define D_LOG_FILES D_FULLDEBUG
 #endif
 
+using namespace std;
+
 ///////////////////////////////////////////////////////////////////////////////
 
 ReadMultipleUserLogs::ReadMultipleUserLogs() :
-	allLogFiles(LOG_INFO_HASH_SIZE, MyStringHash, rejectDuplicateKeys),
-	activeLogFiles(LOG_INFO_HASH_SIZE, MyStringHash, rejectDuplicateKeys)
+	allLogFiles(hashFunction),
+	activeLogFiles(hashFunction)
 {
 }
 
@@ -133,8 +131,8 @@ ReadMultipleUserLogs::readEvent (ULogEvent * & event)
 
 		if ( outcome != ULOG_NO_EVENT ) {
 			if ( oldestEventMon == NULL ||
-						(oldestEventMon->lastLogEvent->eventTime >
-						monitor->lastLogEvent->eventTime) ) {
+						(oldestEventMon->lastLogEvent->GetEventclock() >
+						monitor->lastLogEvent->GetEventclock()) ) {
 				oldestEventMon = monitor;
 			}
 		}
@@ -152,26 +150,36 @@ ReadMultipleUserLogs::readEvent (ULogEvent * & event)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool
-ReadMultipleUserLogs::detectLogGrowth()
+ReadUserLog::FileStatus
+ReadMultipleUserLogs::GetLogStatus()
 {
-    dprintf( D_FULLDEBUG, "ReadMultipleUserLogs::detectLogGrowth()\n" );
+	dprintf( D_FULLDEBUG, "ReadMultipleUserLogs::GetLogStatus()\n" );
 
-	bool grew = false;
-
-	    // Note: we must go through the whole loop even after we find a
-		// log that grew, so we have the right log lengths for next time.
-		// wenger 2003-04-11.
-		// Note that reading an event does not update the known log size.
-	activeLogFiles.startIterations();
 	LogFileMonitor *monitor;
+	ReadUserLog::FileStatus status = ReadUserLog::LOG_STATUS_NOCHANGE;
+
+	// Iterate over all the log files and check their statuses.
+	activeLogFiles.startIterations();
 	while ( activeLogFiles.iterate( monitor ) ) {
-	    if ( LogGrew( monitor ) ) {
-		    grew = true;
+		ReadUserLog::FileStatus fs = monitor->readUserLog->CheckFileStatus();
+		// If a log files has grown, we want to return ReadUserLog::LOG_STATUS_GROWN
+		// Do not exit the loop early, since checking the file status also
+		// updates the internal member variable tracking the size of the file
+		if ( fs == ReadUserLog::LOG_STATUS_GROWN ) {
+			status = fs;
+		}
+		// If a log file has shrunk or is in error, we want to return the
+		// correct status code.
+		// We can exit early here, because we're just going to abort.
+		else if ( fs == ReadUserLog::LOG_STATUS_ERROR || fs == ReadUserLog::LOG_STATUS_SHRUNK ) {
+			status = fs;
+			dprintf( D_ALWAYS, "MultiLogFiles: detected error, cleaning up all log monitors\n" );
+			cleanup();
+			break;
 		}
 	}
 
-    return grew;
+    return status;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -238,30 +246,6 @@ ReadMultipleUserLogs::cleanup()
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool
-ReadMultipleUserLogs::LogGrew( LogFileMonitor *monitor )
-{
-    dprintf( D_FULLDEBUG, "ReadMultipleUserLogs::LogGrew(%s)\n",
-				monitor->logFile.Value() );
-
-	ReadUserLog::FileStatus fs = monitor->readUserLog->CheckFileStatus();
-
-	if ( ReadUserLog::LOG_STATUS_ERROR == fs ) {
-		dprintf( D_FULLDEBUG,
-				 "ReadMultipleUserLogs error: can't stat "
-				 "condor log (%s): %s\n",
-				 monitor->logFile.Value(), strerror( errno ) );
-		return false;
-	}
-	bool grew = ( fs != ReadUserLog::LOG_STATUS_NOCHANGE );
-    dprintf( D_FULLDEBUG, "ReadMultipleUserLogs: %s\n",
-			 grew ? "log GREW!" : "no log growth..." );
-
-	return grew;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
 ULogEventOutcome
 ReadMultipleUserLogs::readEventFromLog( LogFileMonitor *monitor )
 {
@@ -304,7 +288,8 @@ MultiLogFiles::FileReader::Open( const MyString &filename )
 bool
 MultiLogFiles::FileReader::NextLogicalLine( MyString &line )
 {
-	char *tmpLine = getline( _fp );
+	int lines_read = 0;
+	char *tmpLine = getline_trim( _fp, lines_read );
 	if ( tmpLine != NULL ) {
 		line = tmpLine;
 		return true;
@@ -388,7 +373,14 @@ MultiLogFiles::readFileToString(const MyString &strFilename)
 	MyString strToReturn;
 	strToReturn.reserve_at_least(iLength);
 
-	fseek(pFile, 0, SEEK_SET);
+	if (fseek(pFile, 0, SEEK_SET) < 0) {
+		dprintf( D_ALWAYS, "MultiLogFiles::readFileToString: "
+				"fseek(%s) failed with errno %d (%s)\n", strFilename.Value(),
+				errno, strerror(errno) );
+		fclose(pFile);
+		return "";
+	}
+
 	char *psBuf = new char[iLength+1];
 		/*  We now clear the buffer to ensure there will be a NULL at the
 			end of our buffer after the fread().  Why no just do
@@ -414,108 +406,6 @@ MultiLogFiles::readFileToString(const MyString &strFilename)
 	delete [] psBuf;
 
 	return strToReturn;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Note: this method should get speeded up (see Gnats PR 846).
-MyString
-MultiLogFiles::loadLogFileNameFromSubFile(const MyString &strSubFilename,
-		const MyString &directory, bool &isXml, bool usingDefaultNode)
-{
-	dprintf( D_FULLDEBUG, "MultiLogFiles::loadLogFileNameFromSubFile(%s, %s)\n",
-				strSubFilename.Value(), directory.Value() );
-
-	TmpDir		td;
-	if ( directory != "" ) {
-		MyString	errMsg;
-		if ( !td.Cd2TmpDir(directory.Value(), errMsg) ) {
-			dprintf(D_ALWAYS, "Error from Cd2TmpDir: %s\n", errMsg.Value());
-			return "";
-		}
-	}
-
-	StringList	logicalLines;
-	if ( fileNameToLogicalLines( strSubFilename, logicalLines ) != "" ) {
-		return "";
-	}
-
-	MyString	logFileName("");
-	MyString	initialDir("");
-	MyString	isXmlLogStr("");
-
-		// Now look through the submit file logical lines to find the
-		// log file and initial directory (if specified) and combine
-		// them into a path to the log file that's either absolute or
-		// relative to the DAG submit directory.  Also look for log_xml.
-	const char *logicalLine;
-	while( (logicalLine = logicalLines.next()) != NULL ) {
-		MyString	submitLine(logicalLine);
-		MyString	tmpLogName = getParamFromSubmitLine(submitLine, "log");
-		if ( tmpLogName != "" ) {
-			logFileName = tmpLogName;
-		}
-
-			// If we are using the default node log, we don't care
-			// about these
-		if( !usingDefaultNode ) {
-			MyString	tmpInitialDir = getParamFromSubmitLine(submitLine,
-					"initialdir");
-			if ( tmpInitialDir != "" ) {
-				initialDir = tmpInitialDir;
-			}
-
-			MyString tmpLogXml = getParamFromSubmitLine(submitLine, "log_xml");
-			if ( tmpLogXml != "" ) {
-				isXmlLogStr = tmpLogXml;
-			}
-		}
-	}
-
-	if ( !usingDefaultNode ) {
-			//
-			// Check for macros in the log file name -- we currently don't
-			// handle those.
-			//
-			// If we are using the default node, we don't need to check this
-		if ( logFileName != "" ) {
-			if ( strstr(logFileName.Value(), "$(") ) {
-				dprintf(D_ALWAYS, "MultiLogFiles: macros ('$(...') not allowed "
-						"in log file name (%s) in DAG node submit files\n",
-						logFileName.Value());
-				logFileName = "";
-			}
-		}
-
-			// Do not need to prepend initialdir if we are using the 
-			// default node log
-		if ( logFileName != "" ) {
-				// Prepend initialdir to log file name if log file name is not
-				// an absolute path.
-			if ( initialDir != "" && !fullpath(logFileName.Value()) ) {
-				logFileName = initialDir + DIR_DELIM_STRING + logFileName;
-			}
-
-				// We do this in case the same log file is specified with a
-				// relative and an absolute path.  
-				// Note: we now do further checking that doesn't rely on
-				// comparing paths to the log files.  wenger 2004-05-27.
-			CondorError errstack;
-			if ( !makePathAbsolute( logFileName, errstack ) ) {
-				dprintf(D_ALWAYS, "%s\n", errstack.getFullText().c_str());
-				return "";
-			}
-		}
-		isXmlLogStr.lower_case();
-		isXml = (isXmlLogStr == "true");
-		if ( directory != "" ) {
-			MyString	errMsg;
-			if ( !td.Cd2MainDir(errMsg) ) {
-				dprintf(D_ALWAYS, "Error from Cd2MainDir: %s\n", errMsg.Value());
-				return "";
-			}
-		}
-	}
-	return logFileName;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -602,357 +492,22 @@ MultiLogFiles::makePathAbsolute(MyString &filename, CondorError &errstack)
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Skip whitespace in a std::string buffer.
-void
-MultiLogFiles::skip_whitespace(std::string const &s,int &offset) {
-	while((int)s.size() > offset && isspace(s[offset])) offset++;
-};
-
-// Read a file into a std::string.  Return false on error.
 MyString
-MultiLogFiles::readFile(char const *filename,std::string& buf)
-{
-    char chunk[4000];
-	MyString rtnVal;
-
-	int fd = safe_open_wrapper_follow(filename, O_RDONLY);
-	if (fd < 0) {
-		rtnVal.formatstr("error opening submit file %s: %s",
-				filename, strerror(errno) );
-		dprintf(D_ALWAYS, "%s\n", rtnVal.Value() );
-		return rtnVal;
-	}
-
-    while(1) {
-        size_t n = read(fd,chunk,sizeof(chunk)-1);
-        if(n>0) {
-            chunk[n] = '\0';
-            buf += chunk;
-        }
-        else if(n==0) {
-            break;
-        }
-        else {
-            rtnVal.formatstr("failed to read submit file %s: %s",
-					filename, strerror(errno) );
-			dprintf(D_ALWAYS, "%s\n", rtnVal.Value() );
-			close(fd);
-			return rtnVal;
-        }
-    }
-
-	close(fd);
-    return rtnVal;
-}
-
-// Gets the log files from a Stork submit file.
-MyString
-MultiLogFiles::loadLogFileNamesFromStorkSubFile(
-		const MyString &strSubFilename,
-		const MyString &directory,
-		StringList &listLogFilenames)
-{
-	MyString rtnVal;
-	MyString path;
-	std::string adBuf;
-	classad::ClassAdParser parser;
-	classad::PrettyPrint unparser;
-	std::string unparsed;
-
-	dprintf( D_FULLDEBUG,
-			"MultiLogFiles::loadLogFileNamesFromStorkSubFile(%s, %s)\n",
-				strSubFilename.Value(), directory.Value() );
-
-	// Construct fully qualified path from directory and log file.
-	if ( directory.Length() > 0 ) {
-		path = directory + DIR_DELIM_STRING;
-	}
-	path += strSubFilename;
-
-	// Read submit file into std::string buffer, the native input buffer for
-	// the [new] ClassAds parser.
-	rtnVal = MultiLogFiles::readFile( path.Value(), adBuf);
-	if (rtnVal.Length() > 0 ) {
-		return rtnVal;
-	}
-
-	// read all classads out of the input file
-    int offset = 0;
-    classad::ClassAd ad;
-
-	// Loop through the Stork submit file, parsing out one submit job [ClassAd]
-	// at a time.
-	skip_whitespace(adBuf,offset);  // until the parser can do this itself
-    while (parser.ParseClassAd(adBuf, ad, offset) ) {
-		std::string logfile;
-
-		// ad now contains the next Stork job ClassAd.  Extract log file, if
-		// found.
-		if ( ! ad.EvaluateAttrString("log", logfile) ) {
-			// no log file specified
-			continue;
-		}
-
-		// reject empty log file names
-		if ( logfile.empty() ) {
-			unparser.Unparse( unparsed, &ad);
-			rtnVal.formatstr("Stork job specifies null log file:%s",
-					unparsed.c_str() );
-			return rtnVal;
-		}
-
-		// reject log file names with embedded macros
-		if ( logfile.find('$') != std::string::npos) {
-			unparser.Unparse( unparsed, &ad);
-			rtnVal.formatstr("macros not allowed in Stork log file names:%s",
-					unparsed.c_str() );
-			return rtnVal;
-		}
-
-		// All logfile must be fully qualified paths.  Prepend the current
-		// working directory if logfile not a fully qualified path.
-		if ( ! fullpath(logfile.c_str() ) ) {
-			MyString	currentDir;
-			if ( ! condor_getcwd(currentDir) ) {
-				rtnVal.formatstr("condor_getcwd() failed with errno %d (%s)",
-						errno, strerror(errno));
-				dprintf(D_ALWAYS, "ERROR: %s at %s:%d\n", rtnVal.Value(),
-						__FILE__, __LINE__);
-				return rtnVal;
-			}
-			std::string tmp  = currentDir.Value();
-			tmp += DIR_DELIM_STRING;
-			tmp += logfile;
-			logfile = tmp;
-		}
-
-		// Add the log file we just found to the log file list
-		// (if it's not already in the list -- we don't want
-		// duplicates).
-		listLogFilenames.rewind();
-		char *psLogFilename;
-		bool bAlreadyInList = false;
-		while ( (psLogFilename = listLogFilenames.next()) ) {
-			if (logfile == psLogFilename) {
-				bAlreadyInList = true;
-			}
-		}
-
-		if (!bAlreadyInList) {
-				// Note: append copies the string here.
-			listLogFilenames.append(logfile.c_str() );
-		}
-
-        skip_whitespace(adBuf,offset);	// until the parser can do this itself
-    }
-
-	return rtnVal;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-int
-MultiLogFiles::getQueueCountFromSubmitFile(const MyString &strSubFilename,
-			const MyString &directory, MyString &errorMsg)
-{
-	dprintf( D_FULLDEBUG,
-				"MultiLogFiles::getQueueCountFromSubmitFile(%s, %s)\n",
-				strSubFilename.Value(), directory.Value() );
-
-	int queueCount = 0;
-	errorMsg = "";
-
-	MyString	fullpath("");
-	if ( directory != "" ) {
-		fullpath = directory + DIR_DELIM_STRING + strSubFilename;
-	} else {
-		fullpath = strSubFilename;
-	}
-
-	StringList	logicalLines;
-	if ( (errorMsg = fileNameToLogicalLines( strSubFilename,
-				logicalLines)) != "" ) {
-		return -1;
-	}
-
-		// Now look through the submit file logical lines to find any
-		// queue commands, and count up the total number of job procs
-		// to be queued.
-	const char *	paramName = "queue";
-	const char *logicalLine;
-	while( (logicalLine = logicalLines.next()) != NULL ) {
-		MyString	submitLine(logicalLine);
-		submitLine.Tokenize();
-		const char *DELIM = " ";
-		const char *rawToken = submitLine.GetNextToken( DELIM, true );
-		if ( rawToken ) {
-			MyString	token(rawToken);
-			token.trim();
-			if ( !strcasecmp(token.Value(), paramName) ) {
-				rawToken = submitLine.GetNextToken( DELIM, true );
-				if ( rawToken ) {
-					queueCount += atoi( rawToken );
-				} else {
-					queueCount++;
-				}
-			}
-		}
-	}
-
-	return queueCount;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-MyString
-MultiLogFiles::getValuesFromFile(const MyString &fileName, 
-			const MyString &keyword, StringList &values, int skipTokens)
-{
-
-	MyString	errorMsg;
-	StringList	logicalLines;
-	if ( (errorMsg = fileNameToLogicalLines( fileName,
-				logicalLines )) != "" ) {
-		return errorMsg;
-	}
-
-	const char *	logicalLine;
-	while ( (logicalLine = logicalLines.next()) ) {
-
-		if ( strcmp(logicalLine, "") ) {
-
-				// Note: StringList constructor removes leading
-				// whitespace from lines.
-			StringList	tokens(logicalLine, " \t");
-			tokens.rewind();
-
-			if ( !strcasecmp(tokens.next(), keyword.Value()) ) {
-					// Skip over unwanted tokens.
-				for ( int skipped = 0; skipped < skipTokens; skipped++ ) {
-					if ( !tokens.next() ) {
-						MyString result = MyString( "Improperly-formatted DAG "
-									"file: value missing after keyword <" ) +
-									keyword + ">";
-			    		return result;
-					}
-				}
-
-					// Get the value.
-				const char *newValue = tokens.next();
-				if ( !newValue || !strcmp( newValue, "") ) {
-					MyString result = MyString( "Improperly-formatted DAG "
-								"file: value missing after keyword <" ) +
-								keyword + ">";
-			    	return result;
-				}
-
-					// Add the value we just found to the values list
-					// (if it's not already in the list -- we don't want
-					// duplicates).
-				values.rewind();
-				char *existingValue;
-				bool alreadyInList = false;
-				while ( (existingValue = values.next()) ) {
-					if (!strcmp( existingValue, newValue ) ) {
-						alreadyInList = true;
-					}
-				}
-
-				if (!alreadyInList) {
-						// Note: append copies the string here.
-					values.append(newValue);
-				}
-			}
-		}
-	}	
-
-	return "";
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-MyString
-MultiLogFiles::getValuesFromFileNew(const MyString &fileName, 
-			const MyString &keyword, StringList &values, int skipTokens)
-{
-	MyString	errorMsg;
-
-	FileReader reader;
-	errorMsg = reader.Open( fileName );
-	if ( errorMsg != "" ) {
-		return errorMsg;
-	}
-
-	MyString logicalLine;
-	while ( reader.NextLogicalLine( logicalLine ) ) {
-		if ( logicalLine != "" ) {
-				// Note: StringList constructor removes leading
-				// whitespace from lines.
-			StringList tokens( logicalLine.Value(), " \t" );
-			tokens.rewind();
-
-			if ( !strcasecmp(tokens.next(), keyword.Value()) ) {
-					// Skip over unwanted tokens.
-				for ( int skipped = 0; skipped < skipTokens; skipped++ ) {
-					if ( !tokens.next() ) {
-						MyString result = MyString( "Improperly-formatted "
-									"file: value missing after keyword <" ) +
-									keyword + ">";
-			    		return result;
-					}
-				}
-
-					// Get the value.
-				const char *newValue = tokens.next();
-				if ( !newValue || !strcmp( newValue, "" ) ) {
-					MyString result = MyString( "Improperly-formatted "
-								"file: value missing after keyword <" ) +
-								keyword + ">";
-			    	return result;
-				}
-
-					// Add the value we just found to the values list
-					// (if it's not already in the list -- we don't want
-					// duplicates).
-				values.rewind();
-				char *existingValue;
-				bool alreadyInList = false;
-				while ( (existingValue = values.next()) ) {
-					if (!strcmp( existingValue, newValue ) ) {
-						alreadyInList = true;
-					}
-				}
-
-				if ( !alreadyInList ) {
-						// Note: append copies the string here.
-					values.append(newValue);
-				}
-			}
-		}
-	}
-
-	reader.Close();
-
-	return "";
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-MyString
-MultiLogFiles::getParamFromSubmitLine(MyString &submitLine,
+MultiLogFiles::getParamFromSubmitLine(MyString &submitLineIn,
 		const char *paramName)
 {
 	MyString	paramValue("");
 
 	const char *DELIM = "=";
 
-	submitLine.Tokenize();
-	const char *	rawToken = submitLine.GetNextToken(DELIM, true);
+	MyStringTokener submittok;
+	submittok.Tokenize(submitLineIn.Value());
+	const char *	rawToken = submittok.GetNextToken(DELIM, true);
 	if ( rawToken ) {
 		MyString	token(rawToken);
 		token.trim();
 		if ( !strcasecmp(token.Value(), paramName) ) {
-			rawToken = submitLine.GetNextToken(DELIM, true);
+			rawToken = submittok.GetNextToken(DELIM, true);
 			if ( rawToken ) {
 				paramValue = rawToken;
 				paramValue.trim();
@@ -985,7 +540,7 @@ MultiLogFiles::CombineLines(StringList &listIn, char continuation,
 		while ( logicalLine[logicalLine.Length()-1] == continuation ) {
 
 				// Remove the continuation character.
-			logicalLine.setChar(logicalLine.Length()-1, '\0');
+			logicalLine.truncate(logicalLine.Length()-1);
 
 				// Append the next physical line.
 			physicalLine = listIn.next();
@@ -1008,16 +563,16 @@ MultiLogFiles::CombineLines(StringList &listIn, char continuation,
 
 ///////////////////////////////////////////////////////////////////////////////
 
-unsigned int
+size_t
 ReadMultipleUserLogs::hashFuncJobID(const CondorID &key)
 {
-	int		result = (key._cluster * 29) ^ (key._proc * 7) ^ key._subproc;
+	long result = (key._cluster * 29) ^ (key._proc * 7) ^ key._subproc;
 
 		// Make sure we produce a non-negative result (modulus on negative
 		// value may produce a negative result (implementation-dependent).
 	if ( result < 0 ) result = -result;
 
-	return (unsigned int)result;
+	return (size_t)result;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1037,10 +592,6 @@ MultiLogFiles::logFileNFSError(const char *logFilename, bool nfsIsError)
 		if ( nfsIsError ) {
 			dprintf(D_ALWAYS, "ERROR: log file %s is on NFS.\n", logFilename);
 			return true;
-		} else {
-			dprintf(D_FULLDEBUG, "WARNING: log file %s is on NFS.  This "
-				"could cause log file corruption and is _not_ recommended.\n",
-				logFilename);
 		}
 	}
 

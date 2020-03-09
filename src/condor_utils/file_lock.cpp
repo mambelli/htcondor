@@ -425,11 +425,6 @@ FileLock::lockViaMutex(LOCK_TYPE type)
 	int result = -1;
 
 #ifdef WIN32	// only implemented on Win32 so far...
-	//char * filename = NULL;
-	int filename_len;
-	char *ptr = NULL;
-	char mutex_name[MAX_PATH];
-
 
 		// If we made it here, we want to use a kernel mutex.
 		//
@@ -441,6 +436,35 @@ FileLock::lockViaMutex(LOCK_TYPE type)
 
 		// first, open a handle to the mutex if we haven't already
 	if ( m_debug_win32_mutex == NULL && m_path ) {
+#if 1
+		char mutex_name[MAX_PATH];
+
+		// start the mutex name with Global\ so that it works properly on systems running Terminal Services
+		strcpy(mutex_name, "Global\\");
+		size_t ix = strlen(mutex_name);
+
+		// Create the mutex name based upon the lock file
+		// specified in the config file.
+		const char * ptr = m_path;
+
+		// Note: Win32 will not allow backslashes in the name,
+		// so get convert them to / as we copy. Also
+		// The mutex name is case-sensitive, but the NTFS filesystem
+		// is not.  So to avoid user confusion, we lowercase it
+		while (*ptr) {
+			char ch = *ptr++;
+			if (ch == '\\') ch = '/';
+			else if (isupper(ch)) ch = _tolower(ch);
+			mutex_name[ix++] = ch;
+			if (ix+1 >= COUNTOF(mutex_name))
+				break;
+		}
+		mutex_name[ix] = 0;
+#else
+		int filename_len;
+		char *ptr = NULL;
+		char mutex_name[MAX_PATH];
+
 			// Create the mutex name based upon the lock file
 			// specified in the config file.  				
 		char * filename = strdup(m_path);
@@ -460,6 +484,7 @@ FileLock::lockViaMutex(LOCK_TYPE type)
 		snprintf(mutex_name,MAX_PATH,"Global\\%s",filename);
 		free(filename);
 		filename = NULL;
+#endif
 			// Call CreateMutex - this will create the mutex if it does
 			// not exist, or just open it if it already does.  Note that
 			// the handle to the mutex is automatically closed by the
@@ -498,6 +523,10 @@ FileLock::lockViaMutex(LOCK_TYPE type)
 	return result;
 }
 
+
+// fstat can't really fail, but to quell static analysis,
+// we stuff the result of fstat here.
+static int dummyGlobal;
 
 bool
 FileLock::obtain( LOCK_TYPE t )
@@ -549,15 +578,15 @@ FileLock::obtain( LOCK_TYPE t )
 		
 		if (m_fp)
 		{
-			// restore their FILE*-position
-			fseek(m_fp, lPosBeforeLock, SEEK_SET); 	
+			// restore their FILE*-position, if ftell didn't return an error
+			if (lPosBeforeLock >= 0) fseek(m_fp, lPosBeforeLock, SEEK_SET); 	
 		}
 
 #ifndef WIN32		
 			// if we deal with our own fd and are not unlocking
 		if (m_delete == 1 && t != UN_LOCK){
 			struct stat si; 
-			fstat(m_fd, &si);
+			dummyGlobal = fstat(m_fd, &si);
 				// no more hard links ... it was deleted while we were waiting
 				// in that case we need to reopen and restart
 			if ( si.st_nlink < 1 ){
@@ -599,10 +628,10 @@ FileLock::obtain( LOCK_TYPE t )
 	                t, saved_errno, strerror(saved_errno) );
 	}
 	else {
-		UtcTime	now( true );
+		double now = condor_gettimestamp_double();
 		dprintf( D_FULLDEBUG,
 				 "FileLock::obtain(%d) - @%.6f lock on %s now %s\n",
-				 t, now.combined(), m_path, getStateString(t) );
+				 t, now, m_path, getStateString(t) );
 	}
 	return status == 0;
 }
@@ -664,19 +693,18 @@ FileLock::updateLockTimestamp(void)
 }
 
 
-// create a temporary lock path
-// return value must be freed via delete[] by caller.
-char * 
-FileLock::GetTempPath() 
+// create a temporary lock path name into supplied buffer.
+const char *
+FileLock::getTempPath(MyString & pathbuf)
 {
 	const char *suffix = "";
-	char *result = NULL;
+	const char *result = NULL;
 	char *path = param("LOCAL_DISK_LOCK_DIR");
 	if (!path) {
 		path = temp_dir_path();
 		suffix = "condorLocks";
 	}
-	result = dirscat(path, suffix);
+	result = dirscat(path, suffix, pathbuf);
 	free(path);
 
 	return result;
@@ -685,7 +713,8 @@ FileLock::GetTempPath()
 char *
 FileLock::CreateHashName(const char *orig, bool useDefault)
 {
-	char *path = GetTempPath();
+	MyString pathbuf;
+	const char *path = getTempPath(pathbuf);
 	unsigned long hash = 0;
 	char *temp_filename;
 	int c;
@@ -722,7 +751,6 @@ FileLock::CreateHashName(const char *orig, bool useDefault)
 #endif
 		sprintf(dest, "%s", path  );
 	delete []temp_filename; 
-	delete []path;
 	for (int i = 0 ; i < 4; i+=2 ) {
 		snprintf(dest+strlen(dest), 3, "%s", hashVal+i);
 		snprintf(dest+strlen(dest), 2, "%c", DIR_DELIM_CHAR);

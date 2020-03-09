@@ -171,19 +171,21 @@ void KeyCacheEntry::delete_storage() {
 }
 
 
-KeyCache::KeyCache(int nbuckets) {
-	key_table = new HashTable<MyString, KeyCacheEntry*>(nbuckets, MyStringHash, rejectDuplicateKeys);
-	m_index = new KeyCacheIndex(MyStringHash);
-	dprintf ( D_SECURITY, "KEYCACHE: created: %p\n", key_table );
+KeyCache::KeyCache() {
+	key_table = new HashTable<MyString, KeyCacheEntry*>(hashFunction);
+	m_index = new KeyCacheIndex(hashFunction);
+	dprintf ( D_SECURITY|D_FULLDEBUG, "KEYCACHE: created: %p\n", key_table );
 }
 
 KeyCache::KeyCache(const KeyCache& k) {
-	m_index = new KeyCacheIndex(MyStringHash);
+	key_table = new HashTable<MyString, KeyCacheEntry*>(hashFunction);
+	m_index = new KeyCacheIndex(hashFunction);
 	copy_storage(k);
 }
 
 KeyCache::~KeyCache() {
 	delete_storage();
+	delete key_table;
 	delete m_index;
 }
 	    
@@ -197,20 +199,14 @@ const KeyCache& KeyCache::operator=(const KeyCache& k) {
 
 
 void KeyCache::copy_storage(const KeyCache &copy) {
-	if (copy.key_table) {
-		m_index = new KeyCacheIndex(MyStringHash);
-		key_table = new HashTable<MyString, KeyCacheEntry*>(copy.key_table->getTableSize(), MyStringHash, rejectDuplicateKeys);
-		dprintf ( D_SECURITY, "KEYCACHE: created: %p\n", key_table );
+	dprintf ( D_SECURITY|D_FULLDEBUG, "KEYCACHE: created: %p\n", key_table );
 
-		// manually iterate all entries from the hash.  they are
-		// pointers, and we need to copy that object.
-		KeyCacheEntry* key_entry;
-		copy.key_table->startIterations();
-		while (copy.key_table->iterate(key_entry)) {
-			insert(*key_entry);
-		}
-	} else {
-		key_table = NULL;
+	// manually iterate all entries from the hash.  they are
+	// pointers, and we need to copy that object.
+	KeyCacheEntry* key_entry;
+	copy.key_table->startIterations();
+	while (copy.key_table->iterate(key_entry)) {
+		insert(*key_entry);
 	}
 }
 
@@ -218,23 +214,16 @@ void KeyCache::copy_storage(const KeyCache &copy) {
 void KeyCache::delete_storage()
 {
 	if( key_table ) {
-			// Delete all entries from the hash, and the table itself
+			// Delete all entries from the hash
 		KeyCacheEntry* key_entry;
 		key_table->startIterations();
 		while( key_table->iterate(key_entry) ) {
 			if( key_entry ) {
-				if( IsDebugVerbose(D_SECURITY) ) {
-					dprintf( D_SECURITY, "KEYCACHEENTRY: deleted: %p\n", 
-							 key_entry );
-				}
 				delete key_entry;
 			}
 		}
-		if( IsDebugVerbose(D_SECURITY) ) {
-			dprintf( D_SECURITY, "KEYCACHE: deleted: %p\n", key_table );
-		}
-		delete key_table;
-		key_table = NULL;
+		key_table->clear();
+		dprintf( D_SECURITY|D_FULLDEBUG, "KEYCACHE: deleted: %p\n", key_table );
 	}
 	if( m_index ) {
 		MyString index;
@@ -248,6 +237,11 @@ void KeyCache::delete_storage()
 	}
 }
 
+
+void KeyCache::clear()
+{
+	delete_storage();
+}
 
 bool KeyCache::insert(KeyCacheEntry &e) {
 
@@ -310,9 +304,10 @@ KeyCache::addToIndex(KeyCacheEntry *key)
 {
 		// update our index
 	ClassAd *policy = key->policy();
-	MyString parent_id, server_unique_id;
+	std::string parent_id;
+	MyString server_unique_id;
 	int server_pid=0;
-	MyString server_addr, peer_addr;
+	std::string server_addr, peer_addr;
 
 	policy->LookupString(ATTR_SEC_SERVER_COMMAND_SOCK, server_addr);
 	policy->LookupString(ATTR_SEC_PARENT_UNIQUE_ID, parent_id);
@@ -331,9 +326,10 @@ void
 KeyCache::removeFromIndex(KeyCacheEntry *key)
 {
 		//remove references to this key from the index
-	MyString parent_id, server_unique_id;
+	std::string parent_id;
+	MyString server_unique_id;
 	int server_pid=0;
-	MyString server_addr, peer_addr;
+	std::string server_addr, peer_addr;
 	ClassAd *policy = key->policy();
 	ASSERT( policy );
 
@@ -412,11 +408,11 @@ void KeyCache::expire(KeyCacheEntry *e) {
 	time_t key_exp = e->expiration();
 	char const *expiration_type = e->expirationType();
 
-	dprintf (D_SECURITY, "KEYCACHE: Session %s %s expired at %s", e->id(), expiration_type, ctime(&key_exp) );
+	dprintf (D_SECURITY|D_FULLDEBUG, "KEYCACHE: Session %s %s expired at %s", e->id(), expiration_type, ctime(&key_exp) );
 
 	// remove its reference from the hash table
 	remove(key_id);       // This should do it
-	dprintf (D_SECURITY, "KEYCACHE: Removed %s from key cache.\n", key_id);
+	dprintf (D_SECURITY|D_FULLDEBUG, "KEYCACHE: Removed %s from key cache.\n", key_id);
 
 	free( key_id );
 }
@@ -458,7 +454,7 @@ KeyCache::getKeysForPeerAddress(char const *addr)
 
 	keylist->Rewind();
 	while( keylist->Next(key) ) {
-		MyString server_addr,peer_addr;
+		std::string server_addr,peer_addr;
 		ClassAd *policy = key->policy();
 
 		policy->LookupString(ATTR_SEC_SERVER_COMMAND_SOCK, server_addr);
@@ -491,7 +487,8 @@ KeyCache::getKeysForProcess(char const *parent_unique_id,int pid)
 
 	keylist->Rewind();
 	while( keylist->Next(key) ) {
-		MyString this_parent_id,this_server_unique_id;
+		std::string this_parent_id;
+		MyString this_server_unique_id;
 		int this_server_pid=0;
 		ClassAd *policy = key->policy();
 

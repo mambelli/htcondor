@@ -19,8 +19,10 @@
 
 #include "condor_common.h"
 #include "condor_config.h"
-#include "../condor_daemon_core.V6/condor_daemon_core.h"
+#include "condor_daemon_core.h"
 #include "shared_port_server.h"
+
+#include "daemon_command.h"
 
 SharedPortServer::SharedPortServer():
 	m_registered_handlers(false),
@@ -55,6 +57,18 @@ SharedPortServer::InitAndReconfig() {
 			this,
 			ALLOW );
 		ASSERT( rc >= 0 );
+
+		rc = daemonCore->Register_UnregisteredCommandHandler(
+			(CommandHandlercpp)&SharedPortServer::HandleDefaultRequest,
+			"SharedPortServer::HandleDefaultRequest",
+			this,
+			true);
+		ASSERT( rc >= 0 );
+	}
+
+	param(m_default_id, "SHARED_PORT_DEFAULT_ID");
+	if (param_boolean("USE_SHARED_PORT", false) && param_boolean("COLLECTOR_USES_SHARED_PORT", true) && !m_default_id.size()) {
+		m_default_id = "collector";
 	}
 
 	PublishAddress();
@@ -91,10 +105,18 @@ SharedPortServer::RemoveDeadAddressFile()
 		// ungraceful shutdown.
 	MyString shared_port_server_ad_file;
 	if( !param(shared_port_server_ad_file,"SHARED_PORT_DAEMON_AD_FILE") ) {
-		EXCEPT("SHARED_PORT_DAEMON_AD_FILE must be defined");
+		dprintf( D_FULLDEBUG, "SHARED_PORT_DAEMON_AD_FILE not defined, not removing shared port daemon ad file.\n" );
+		return;
 	}
-	if( unlink(shared_port_server_ad_file.Value()) == 0 ) {
-		dprintf(D_ALWAYS,"Removed %s (assuming it is left over from previous run)\n",shared_port_server_ad_file.Value());
+
+	int fd = open( shared_port_server_ad_file.Value(), O_RDONLY );
+	if( fd != -1 ) {
+		close( fd );
+		if( unlink(shared_port_server_ad_file.Value()) == 0 ) {
+			dprintf(D_ALWAYS,"Removed %s (assuming it is left over from previous run)\n",shared_port_server_ad_file.Value());
+		} else {
+			EXCEPT( "Failed to remove dead shared port address file '%s'!", shared_port_server_ad_file.Value() );
+		}
 	}
 }
 
@@ -107,6 +129,21 @@ SharedPortServer::PublishAddress()
 
 	ClassAd ad;
 	ad.Assign(ATTR_MY_ADDRESS,daemonCore->publicNetworkIpAddr());
+
+	std::set<std::string> commandAddresses;
+	const std::vector<Sinful> &mySinfuls = daemonCore->InfoCommandSinfulStringsMyself();
+	for (std::vector<Sinful>::const_iterator it=mySinfuls.begin(); it!=mySinfuls.end(); it++)
+	{
+		commandAddresses.insert(it->getSinful());
+	}
+	StringList commandAddressesSL;
+	for (std::set<std::string>::const_iterator it=commandAddresses.begin(); it!=commandAddresses.end(); it++)
+	{
+		commandAddressesSL.insert(it->c_str());
+	}
+	char *adAddresses = commandAddressesSL.print_to_string();
+	if (adAddresses) {ad.InsertAttr(ATTR_SHARED_PORT_COMMAND_SINFULS, adAddresses);}
+	free( adAddresses );
 
 	// Place some operational metrics into the daemon ad
 	ad.Assign("RequestsPendingCurrent",m_shared_port_client.get_currentPendingPassSocketCalls());
@@ -131,8 +168,6 @@ SharedPortServer::PublishAddress()
 int
 SharedPortServer::HandleConnectRequest(int,Stream *sock)
 {
-	int result = TRUE;
-
 	sock->decode();
 
 		// to avoid possible D-O-S attacks, we read into fixed-length buffers
@@ -201,6 +236,46 @@ SharedPortServer::HandleConnectRequest(int,Stream *sock)
 			m_shared_port_client.get_currentPendingPassSocketCalls(),
 			m_shared_port_client.get_maxPendingPassSocketCalls() );
 
+	if( strcmp( shared_port_id, "self" ) == 0 ) {
+		// The last 'true' flags this protocol as being "loopback," so
+		// we won't ever end up back here and pass off the request.
+		classy_counted_ptr< DaemonCommandProtocol > r = new DaemonCommandProtocol( sock, true, true );
+		return r->doProtocol();
+	}
+
+	// Technically optional, but since HTCondor code always sets it to
+	// its own Sinful string, check to see if it's a daemon trying to
+	// connect to itself and refuse.
+	if( client_name[0] ) {
+		//dprintf( D_FULLDEBUG, "Found client name '%s'.\n", client_name );
+		char * client_sinful = strstr( client_name, "<" );
+		Sinful s( client_sinful );
+		if( s.valid() ) {
+			//dprintf( D_FULLDEBUG, "Client name '%s' contains a valid Sinful.\n", client_name );
+			char const * sourceSharedPortID = s.getSharedPortID();
+			if( sourceSharedPortID && strcmp( sourceSharedPortID, shared_port_id ) == 0 ) {
+				dprintf( D_FULLDEBUG, "Client name '%s' has same shared port ID as its target (%s).\n", client_name, shared_port_id );
+				s.setSharedPortID( NULL );
+				Sinful t( global_dc_sinful() );
+				if( t.valid() ) {
+					//dprintf( D_FULLDEBUG, "Daemon core Sinful (%s) is valid.\n", global_dc_sinful() );
+					t.setSharedPortID( NULL );
+					if( t.addressPointsToMe( s ) ) {
+						dprintf( D_ALWAYS, "Rejected request from %s to connect to itself.\n", sock->peer_description() );
+						return FALSE;
+					}
+				}
+			}
+		}
+	}
+
+	return PassRequest(static_cast<Sock*>(sock), shared_port_id);
+}
+
+int
+SharedPortServer::PassRequest(Sock *sock, const char *shared_port_id)
+{
+	int result = TRUE;
 #if HAVE_SCM_RIGHTS_PASSFD
 		// Note: the HAVE_SCM_RIGHTS_PASSFD implementation of PassSocket()
 		// is nonblocking.  See gt #4094.
@@ -232,4 +307,17 @@ SharedPortServer::HandleConnectRequest(int,Stream *sock)
 #endif
 
 	return result;
+}
+
+int
+SharedPortServer::HandleDefaultRequest(int cmd,Stream *sock)
+{
+	if (!m_default_id.size()) {
+		dprintf(D_FULLDEBUG, "SharedPortServer: Got request for command %d from %s, but no default client specified.\n",
+			cmd, sock->peer_description());
+		return 0;
+	}
+	dprintf(D_FULLDEBUG, "SharedPortServer: Passing a request from %s for command %d to ID %s.\n",
+		sock->peer_description(), cmd, m_default_id.c_str()); 
+	return PassRequest(static_cast<Sock*>(sock), m_default_id.c_str());
 }

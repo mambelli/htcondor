@@ -84,7 +84,7 @@
     platforms are supported.
 
     This GAHP is available as part of the HTCondor software distribution,
-    version FIXME.FIXME or later.
+    version 8.1.4 or later.
 
 2.0   GAHP SERVER IMPLEMENTATION
 
@@ -536,6 +536,8 @@
     * cred-file     = the full path to a file containing a valid set of
                       Google OAuth credentials in the JSON format used
                       by Google's gcutil command-line client program
+    * account       = if the credentials file has data for multiple
+                      accounts, which account should be used
     * project       = the GCE project to be used
     * zone          = the GCE zone to be used
 
@@ -582,7 +584,8 @@
     + Request Line:
 
         GCE_PING <SP> <request-ID> <SP> <service-URL>
-            <SP> <cred-file> <SP> <project> <SP> <zone> <CRLF>
+            <SP> <cred-file> <SP> <account> <SP> <project>
+            <SP> <zone> <CRLF>
 
     -----------------------------------------------
 
@@ -593,9 +596,10 @@
     + Request Line:
 
         GCE_INSTANCE_INSERT <SP> <request-ID> <SP> <service-URL>
-            <SP> <cred-file> <SP> <project> <SP> <zone>
+            <SP> <cred-file> <SP> <account> <SP> <project> <SP> <zone>
             <SP> <instance-name> <SP> <machine-type>
-            <SP> <image> <SP> <metadata> <SP> <metadata-file> <CRLF>
+            <SP> <image> <SP> <metadata> <SP> <metadata-file>
+            <SP> <preemptible> <SP> <json-file> <CRLF>
 
         The following attributes are required.
 
@@ -607,9 +611,13 @@
         * image = a value for the 'image' property
         * metadata = a set of metadata name/value pairs of the form
             <name>=<value>,<name>=<value>...
-        * metadate-file = the full path to a file containing metadata
+        * metadata-file = the full path to a file containing metadata
             name/value pairs of the form
             <name>=<value>\n<name>=<value>\n...
+        * preemptible = 'true' or 'false', which will determine
+            whether the instance submitted can be preempted
+        * json-file = the full path to a file containing additional
+            JSON that will be added to the GCE instance insert request
 
     + Result Line:
 
@@ -631,7 +639,7 @@
     + Request Line:
 
         GCE_INSTANCE_DELETE <SP> <request-ID> <SP> <service-URL>
-            <SP> <cred-file> <SP> <project> <SP> <zone>
+            <SP> <cred-file> <SP> <account> <SP> <project> <SP> <zone>
             <SP> <instance-ID> <CRLF>
 
         The following attribute is required.
@@ -649,7 +657,8 @@
     + Request Line:
 
         GCE_INSTANCE_LIST <SP> <request-ID> <SP> <service-URL>
-            <SP> <cred-file> <SP> <project> <SP> <zone> <CRLF>
+            <SP> <cred-file> <SP> <account> <SP> <project>
+            <SP> <zone> <CRLF>
 
     + Result Line:
 

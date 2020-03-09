@@ -124,8 +124,8 @@ class VMProc : public OsProc
 
 		int m_vm_id;
 		int m_vm_pid;
-		MyString m_vm_mac;
-		MyString m_vm_ip;
+		std::string m_vm_mac;
+		std::string m_vm_ip;
 
 		struct procInfo m_vm_exited_pinfo;
 		struct procInfo m_vm_alive_pinfo;
@@ -141,7 +141,7 @@ class VMProc : public OsProc
 		// Number of checkpointing executed during current running
 		int m_vm_ckpt_count;
 		// Time at which the job last performed a successful checkpoint.
-		UtcTime m_vm_last_ckpt_time;
+		time_t m_vm_last_ckpt_time;
 
 
 		/* 
@@ -183,6 +183,11 @@ class VMProc : public OsProc
 		// Only used for Xen.
 		float m_vm_cputime;
 		float m_vm_utilization; 
+		
+		// How much memory, in kbytes, the domain is using.
+		unsigned long m_vm_memory;
+		// How much memory, in kbytes, the domain could use.
+		unsigned long m_vm_max_memory;
 };
 
 #endif

@@ -1,6 +1,6 @@
---- condor_config.generic	Wed May  7 16:28:43 2014
-+++ condor_config.patched	Wed May  7 17:44:57 2014
-@@ -19,16 +19,14 @@
+--- condor_config.generic	2019-08-04 17:15:38.663989094 -0500
++++ condor_config.patched	2019-08-04 18:44:20.953175955 -0500
+@@ -19,25 +19,23 @@
  ######################################################################
  
  ##  Where have you installed the bin, sbin and lib condor directories?   
@@ -20,7 +20,9 @@
  ##  If your configuration is on a shared file system, then this might be a better default
  #LOCAL_CONFIG_FILE = $(RELEASE_DIR)/etc/$(HOSTNAME).local
  ##  If the local config file is not present, is it an error? (WARNING: This is a potential security issue.)
-@@ -37,7 +35,7 @@
+-#REQUIRE_LOCAL_CONFIG_FILE = true
++REQUIRE_LOCAL_CONFIG_FILE = false
+ 
  ##  The normal way to do configuration with RPMs is to read all of the
  ##  files in a given directory that don't match a regex as configuration files.
  ##  Config files are read in lexicographic order.
@@ -29,7 +31,7 @@
  #LOCAL_CONFIG_DIR_EXCLUDE_REGEXP = ^((\..*)|(.*~)|(#.*)|(.*\.rpmsave)|(.*\.rpmnew))$
  
  ##  Use a host-based security policy. By default CONDOR_HOST and the local machine will be allowed
-@@ -50,5 +48,24 @@
+@@ -50,5 +48,36 @@
  #FLOCK_TO = condor.cs.wisc.edu, cm.example.edu
  
  ##--------------------------------------------------------------------
@@ -45,13 +47,25 @@
 +RUN     = $(LOCAL_DIR)/run/condor
 +LOG     = $(LOCAL_DIR)/log/condor
 +LOCK    = $(LOCAL_DIR)/lock/condor
-+SPOOL   = $(LOCAL_DIR)/lib/condor/spool
++SPOOL   = $(LOCAL_DIR)/spool/condor
 +EXECUTE = $(LOCAL_DIR)/lib/condor/execute
++CRED_STORE_DIR = $(LOCAL_DIR)/lib/condor/cred_dir
++ETC     = /etc/condor
 +BIN     = $(RELEASE_DIR)/bin
 +LIB     = $(RELEASE_DIR)/lib/condor
 +INCLUDE = $(RELEASE_DIR)/include/condor
 +SBIN    = $(RELEASE_DIR)/sbin
 +LIBEXEC = $(RELEASE_DIR)/lib/condor/libexec
 +SHARE   = $(RELEASE_DIR)/share/condor
++MAIL    = /usr/bin/mail
++GANGLIA_LIB64_PATH = /lib,/usr/lib,/usr/local/lib
 +
 +PROCD_ADDRESS = $(RUN)/procd_pipe
++
++# Account for different pki locations for Debian
++AUTH_SSL_SERVER_CAFILE   = /etc/ssl/certs/ca-bundle.crt
++AUTH_SSL_CLIENT_CAFILE   = /etc/ssl/certs/ca-bundle.crt
++AUTH_SSL_SERVER_CERTFILE = /etc/ssl/certs/localhost.crt
++AUTH_SSL_SERVER_KEYFILE  = /etc/ssl/private/localhost.key
++
++##  Install the minihtcondor package to run HTCondor on a single node

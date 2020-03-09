@@ -95,6 +95,12 @@ registerAllGceCommands(void)
 	registerGceGahpCommand(GCE_COMMAND_INSTANCE_LIST,
 			GceInstanceList::ioCheck, GceInstanceList::workerFunction);
 
+	registerGceGahpCommand(GCE_COMMAND_GROUP_INSERT,
+			GceGroupInsert::ioCheck, GceGroupInsert::workerFunction);
+
+	registerGceGahpCommand(GCE_COMMAND_GROUP_DELETE,
+			GceGroupDelete::ioCheck, GceGroupDelete::workerFunction);
+
 	return true;
 }
 
@@ -209,8 +215,22 @@ main( int argc, char ** const argv )
 		 */
 	gce_gahp_grab_big_mutex();
 
+	// check to see if we're going to quit after a certain time
+	time_t die_time = 0;
+	int lifetime = param_integer("GCE_GAHP_LIFETIME", 86400);
+	if (lifetime) {
+		die_time = time(0) + lifetime;
+	}
+
 	for(;;) {
+		// main driver
 		ioprocess.stdinPipeHandler();
+
+		// if lifetime is set, see if we need to quit.  die_time pre-computed above.
+		if(die_time && (time(0) > die_time)) {
+			dprintf(D_ALWAYS, "GCEGAHP: I've been around %i seconds.  Exiting.\n", lifetime);
+			_exit(0);
+		}
 	}
 
 	return 0;
@@ -316,7 +336,7 @@ Request::Request (const char *cmd)
 
 // Functions for IOProcess class
 IOProcess::IOProcess()
-	: m_workers_list(20, &hashFuncInt)
+	: m_workers_list(&hashFuncInt)
 {
 	m_async_mode = false;
 	m_new_results_signaled = false;
@@ -475,7 +495,7 @@ IOProcess::createNewWorker(void)
 	pthread_detach(thread);
 
 	// Insert a new worker to HashTable
-	m_workers_list.insert(new_worker->m_id, new_worker);
+	ASSERT( m_workers_list.insert(new_worker->m_id, new_worker) == 0 );
 	m_avail_workers_num++;
 
 	dprintf(D_FULLDEBUG, "New Worker[id=%d] is created!\n", new_worker->m_id);

@@ -46,15 +46,15 @@
 
 
 void computeRealAction( void );
-bool resolveNames( DaemonList* daemon_list, StringList* name_list );
+bool resolveNames( DaemonList* daemon_list, StringList* name_list, StringList* unresolved_names_list );
 void doCommand( Daemon* d );
-int doCommands(int argc,char *argv[],char *MyName);
+int doCommands(int argc,char *argv[],char *MyName, StringList & unresolved_names);
 void version();
 void handleAll();
-void doSquawk( char *addr );
+void doSquawk( const char *addr );
 int handleSquawk( char *line, char *addr );
 int doSquawkReconnect( char *addr );
-void squawkHelp( char *token );
+void squawkHelp( const char *token );
 int  printAdToFile(ClassAd *ad, char* filename);
 int strncmp_auto(const char *s1, const char *s2);
 void PREFAST_NORETURN usage( const char *str, int iExitCode=1 );
@@ -70,17 +70,18 @@ bool peaceful_shutdown = false;
 bool force_shutdown = false;
 bool full = false;
 bool all = false;
-char* constraint = NULL;
+const char* constraint = NULL;
+std::string annexString;
 const char* subsys = NULL;
 const char* exec_program = NULL;
 int takes_subsys = 0;
 int cmd_set = 0;
-char *subsys_arg = NULL;
+const char *subsys_arg = NULL;
 bool IgnoreMissingDaemon = false;
 
 bool all_good = true;
 
-HashTable<MyString, bool> addresses_sent( 100, MyStringHash );
+HashTable<MyString, bool> addresses_sent( hashFunction );
 
 // The pure-tools (PureCoverage, Purify, etc) spit out a bunch of
 // stuff to stderr, which is where we normally put our error
@@ -130,6 +131,10 @@ usage( const char *str, int iExitCode )
 	fprintf( stderr, "where [targets] can be zero or more of:\n" );
 	fprintf( stderr, 
 			 "    -all\t\tall hosts in your pool (overrides other targets)\n" );
+	fprintf( stderr,
+			 "    -annex-name <name>\tall annex hosts in the named annex\n" );
+	fprintf( stderr,
+			 "    -annex-slots\tall annex hosts in your pool\n" );
 	fprintf( stderr, "    hostname\t\tgiven host\n" );
 	fprintf( stderr, "    <ip.address:port>\tgiven \"sinful string\"\n" );
 	fprintf( stderr,
@@ -155,9 +160,6 @@ usage( const char *str, int iExitCode )
 		fprintf( stderr, "    -collector\n" );
 		fprintf( stderr, "    -negotiator\n" );
 		fprintf( stderr, "    -kbdd\n" );
-#ifdef HAVE_EXT_POSTGRESQL
-		fprintf( stderr, "    -quill\n" );
-#endif
 	}
 	fprintf( stderr, "\n" );
 
@@ -322,6 +324,7 @@ subsys_check( char* MyName )
 	subsys = (char*)1;
 }
 
+bool skipAfterAnnex = false;
 
 int
 main( int argc, char *argv[] )
@@ -330,6 +333,8 @@ main( int argc, char *argv[] )
 	char *cmd_str, **tmp;
 	int size;
 	int rc;
+	int got_name_or_addr = 0;
+	StringList unresolved_names;
 
 #ifndef WIN32
 	// Ignore SIGPIPE so if we cannot connect to a daemon we do not
@@ -338,6 +343,7 @@ main( int argc, char *argv[] )
 #endif
 
 	myDistro->Init( argc, argv );
+	set_priv_initialize(); // allow uid switching if root
 	config();
 
 	MyName = strrchr( argv[0], DIR_DELIM_CHAR );
@@ -411,24 +417,20 @@ main( int argc, char *argv[] )
 		fprintf( stderr, "ERROR: unknown command %s\n", MyName );
 		usage( "condor" );
 	}
-	
+
+
 		// First, deal with options (begin with '-')
 	tmp = argv;
 	for( tmp++; *tmp; tmp++ ) {
 		if( (*tmp)[0] != '-' ) {
 				// If it doesn't start with '-', skip it
+			++got_name_or_addr;
 			continue;
 		}
 		switch( (*tmp)[1] ) {
 		case 'v':
 			version();
 			break;
-#ifdef HAVE_EXT_POSTGRESQL
-		case 'q':
-			subsys_check( MyName );
-			dt = DT_QUILL;
-			break;
-#endif
 		case 'h':
 			usage( MyName, 0 );
 			break;
@@ -460,6 +462,11 @@ main( int argc, char *argv[] )
 					fprintf( stderr, "ERROR: -pool requires another argument\n" );
 					usage( NULL );
 				}
+			}
+			else if (is_dash_arg_prefix(*tmp, "preen", -1)) {
+				subsys_check(MyName);
+				dt = DT_GENERIC;
+				subsys_arg = "preen";
 			}
 			else {
 				fprintf( stderr, "ERROR: \"%s\" "
@@ -575,8 +582,15 @@ main( int argc, char *argv[] )
 			printf( "Set exec to %s\n", exec_program );
 			break;
 		case 'g':
-			fast = false;
-			peaceful_shutdown = false;
+			if ( is_dash_arg_prefix( *tmp, "graceful", 1 ) ) {
+				fast = false;
+				peaceful_shutdown = false;
+			} else {
+				fprintf( stderr,
+						 "ERROR: unknown parameter: \"%s\"\n",
+						 *tmp );
+				usage( NULL );
+			}
 			break;
 		case 'a':
 			if( (*tmp)[2] ) {
@@ -590,11 +604,51 @@ main( int argc, char *argv[] )
 								 "ERROR: -addr requires another argument\n" ); 
 						usage( NULL );
 					}
+					++got_name_or_addr;
 					break;
 				case 'l':
 						// We got a "-all", remember that
 					all = true;
 					break;
+				case 'n': {
+					// We got -annex*, all of which default to the master.
+					if( cmd == DAEMONS_OFF ) {
+						subsys_check( MyName );
+						dt = DT_MASTER;
+					}
+
+					char * option = * tmp;
+					++tmp;
+					char * argument = NULL;
+					if( tmp ) { argument = * tmp; }
+					--tmp;
+
+					if( strcmp( option, "-annex-name" ) == 0 ) {
+						if( argument ) {
+							formatstr( annexString, ATTR_ANNEX_NAME " =?= \"%s\"", argument );
+							skipAfterAnnex = true;
+							++tmp;
+						} else {
+							fprintf( stderr, "ERROR: -annex-name requires an annex name\n" );
+							usage( NULL );
+						}
+					} else if( strcmp( option, "-annex-slots" ) == 0 ) {
+						annexString = "IsAnnex";
+					} else {
+						if( argument && argument[0] != '-' ) {
+							formatstr( annexString, ATTR_ANNEX_NAME " =?= \"%s\"", argument );
+							skipAfterAnnex = true;
+							++tmp;
+						} else {
+							annexString = "IsAnnex";
+						}
+					}
+
+					if( constraint && (! annexString.empty()) ) {
+						formatstr( annexString, "(%s) && (%s)", constraint, annexString.c_str() );
+					}
+					constraint = annexString.c_str();
+					} break;
 				default:
 					fprintf( stderr, 
 							 "ERROR: unknown parameter: \"%s\"\n",
@@ -672,40 +726,44 @@ main( int argc, char *argv[] )
 					}
 					break;
 				case 'o':
-				  if( (*tmp)[3] ) {
-				    switch( (*tmp)[3] ) {
-				    case 'n': 
-				      // We got a "-constraint", make sure we've got 
-				      // something else after it
-				      tmp++;
-				      if( tmp && *tmp ) {
-					constraint = *tmp;
-				      } else {
-					fprintf( stderr, "ERROR: -constraint requires another argument\n" );
-					usage( NULL );
-				      }
+					if( (*tmp)[3] ) {
+						switch( (*tmp)[3] ) {
+						case 'n':
+							// We got a "-constraint", make sure we've got
+							// something else after it
+							tmp++;
+							if (constraint) {
+								fprintf(stderr, "ERROR: only one -constraint argument is allowed\n");
+								exit (1);
+							}
+							if( tmp && *tmp ) {
+								constraint = *tmp;
+							} else {
+								fprintf( stderr, "ERROR: -constraint requires another argument\n" );
+								usage( NULL );
+							}
+							break;
 
-				      break;
-				    case 'l':
-					subsys_check( MyName );
-					dt = DT_COLLECTOR;
+						case 'l':
+							subsys_check( MyName );
+							dt = DT_COLLECTOR;
+							break;
+						default:
+							fprintf( stderr,
+								"ERROR: unknown parameter: \"%s\"\n",
+								*tmp );
+							usage( NULL );
+							break;
+						}
+					} else {
+						fprintf( stderr,
+							"ERROR: ambigous parameter: \"%s\"\n",
+							*tmp );
+						fprintf( stderr,
+							"Please specify \"-collector\" or \"-constraint\"\n" );
+						usage( NULL );
+					}
 					break;
-				    default:
-				      fprintf( stderr, 
-					       "ERROR: unknown parameter: \"%s\"\n",
-					       *tmp );  
-				      usage( NULL );
-				      break;
-				    }
-				  } else {
-				    fprintf( stderr, 
-					     "ERROR: ambigous parameter: \"%s\"\n",
-					     *tmp );  
-				    fprintf( stderr, 
-					     "Please specify \"-collector\" or \"-constraint\"\n" );
-				    usage( NULL );
-				  }
-				  break;
 				default:
 					fprintf( stderr, 
 							 "ERROR: unknown parameter: \"%s\"\n",
@@ -747,7 +805,7 @@ main( int argc, char *argv[] )
 						}
 					} else {
 						fprintf( stderr, 
-							 "ERROR: -daemon requires another argument\n" ); 
+							 "ERROR: -subsystem requires another argument\n" );
 						usage( NULL );
 						exit( 1 );
 					}
@@ -764,7 +822,7 @@ main( int argc, char *argv[] )
 						 "ERROR: ambiguous argument \"%s\"\n",
 						 *tmp );
 				fprintf( stderr, 
-				"Please specify \"-daemon\", \"-startd\" or \"-schedd\"\n" );
+				"Please specify \"-subsystem\", \"-startd\" or \"-schedd\"\n" );
 				usage( NULL );
 			}
 			break;
@@ -773,6 +831,15 @@ main( int argc, char *argv[] )
 					 *tmp );
 			usage( MyName );
 		}
+	}
+
+	if (constraint && got_name_or_addr) {
+		fprintf (stderr,
+			"ERROR: use of -constraint or -annex conflicts with other arguments containing names or addresses.\n"
+			"You can change the constraint to select daemons by name by adding\n"
+			"  (NAME == \"daemon-name\" || MACHINE == \"daemon-name\")\n"
+			"to your constraint.\n");
+		usage(NULL);
 	}
 
 		// it's not always obvious what daemon we want to talk to and
@@ -803,6 +870,20 @@ main( int argc, char *argv[] )
 		usage( NULL );
 	}
 
+
+	if (takes_subsys) {
+		// for these commands, double check that the current configuration files
+		// can be parsed by daemons running as 'condor' before running the command
+		// note that check_config_file_access does nothing if can_switch_ids() is false.
+		StringList errFiles;
+		if ( ! check_config_file_access("condor", errFiles)) {
+			fprintf(stderr, "ERROR: the following configuration files cannot be read by user 'condor'. Aborting command\n");
+			for (const char * file = errFiles.first(); file != NULL; file = errFiles.next()) {
+				fprintf(stderr, "\t%s\n", file);
+			}
+			exit(1);
+		}
+	}
 
 	// If we are sending peaceful daemon shutdown/restart commands to
 	// the master (i.e. we want no timeouts resulting in killing),
@@ -838,12 +919,12 @@ main( int argc, char *argv[] )
 
 			if( !subsys || !strcmp(subsys,"startd") ) {
 				real_dt = DT_STARTD;
-				rc = doCommands(argc,argv,MyName);
+				rc = doCommands(argc,argv,MyName,unresolved_names);
 				if(rc) return rc;
 			}
 			if( !subsys || !strcmp(subsys,"schedd") ) {
 				real_dt = DT_SCHEDD;
-				rc = doCommands(argc,argv,MyName);
+				rc = doCommands(argc,argv,MyName,unresolved_names);
 				if(rc) return rc;
 			}
 
@@ -855,11 +936,21 @@ main( int argc, char *argv[] )
 		}
 	}
 
-	return doCommands(argc,argv,MyName);
+	rc = doCommands(argc,argv,MyName,unresolved_names);
+
+	if ( ! unresolved_names.isEmpty()) {
+		for (const char * name = unresolved_names.first(); name; name = unresolved_names.next()) {
+			fprintf( stderr, "Can't find address for %s\n", name);
+		}
+		fprintf( stderr, "Perhaps you need to query another pool.\n" );
+		if ( ! rc) rc = 1;
+	}
+
+	return rc;
 }
 
 int
-doCommands(int /*argc*/,char * argv[],char *MyName)
+doCommands(int /*argc*/,char * argv[],char *MyName,StringList & unresolved_names)
 {
 	StringList names;
 	StringList addrs;
@@ -899,6 +990,12 @@ doCommands(int /*argc*/,char * argv[],char *MyName)
 				//  -cmd XXX     (but not "-collector")
 				//  -subsys XXX  (but not "-schedd" or "-startd")
 			switch( (*argv)[1] ) {
+			case 'a':
+				if( (*argv)[2] == 'n' && skipAfterAnnex ) {
+					// this is -annex, skip the next one.
+					++argv;
+				}
+				break;
 			case 'p':
 				if( (*argv)[2] == '\0' || (*argv)[2] == 'o' ) {
 						// this is -pool, skip the next one.
@@ -970,7 +1067,7 @@ doCommands(int /*argc*/,char * argv[],char *MyName)
 			} else {
 				names.append( *argv );
 			}
-			delete [] daemonname;
+			free( daemonname );
 			daemonname = NULL;
 			break;
 		}
@@ -1007,7 +1104,7 @@ doCommands(int /*argc*/,char * argv[],char *MyName)
 		// If we got here, there were some targets specified on the
 		// command line.  that we know all the targets, resolve any
 		// names, with a single query to the collector...
-	if( ! resolveNames(&daemons, &names) ) {
+	if( ! resolveNames(&daemons, &names, &unresolved_names) ) {
 		fprintf( stderr, "ERROR: Failed to resolve daemon names, aborting\n" );
 		exit( 1 );
 	}
@@ -1127,7 +1224,7 @@ computeRealAction( void )
 
 
 bool
-resolveNames( DaemonList* daemon_list, StringList* name_list )
+resolveNames( DaemonList* daemon_list, StringList* name_list, StringList* unresolved_names )
 {
 	Daemon* d = NULL;
 	char* name = NULL;
@@ -1168,12 +1265,6 @@ resolveNames( DaemonList* daemon_list, StringList* name_list )
 	case DT_CREDD:
 		adtype = CREDD_AD;
 		break;
-	case DT_QUILL:
-		adtype = QUILL_AD;
-		break;
-	case DT_LEASE_MANAGER:
-		adtype = LEASE_MANAGER_AD;
-		break;
 	case DT_GENERIC:
 		adtype = GENERIC_AD;
 		break;
@@ -1186,7 +1277,7 @@ resolveNames( DaemonList* daemon_list, StringList* name_list )
 		usage( NULL );
 	}
 
-	char* pool_addr = pool ? pool->addr() : NULL;
+	const char* pool_addr = pool ? pool->addr() : NULL;
 	CondorQuery query(adtype);
 	ClassAd* ad;
 	ClassAdList ads;
@@ -1265,6 +1356,8 @@ resolveNames( DaemonList* daemon_list, StringList* name_list )
 		// sure we find them all.
 	name_list->rewind();
 	while( (name = name_list->next()) ) {
+		if (unresolved_names && unresolved_names->contains(name))
+			continue;
 		ads.Rewind();
 		while( !d && (ad = ads.Next()) ) {
 				// we only want to use the special ATTR_MACHINE hack
@@ -1346,7 +1439,11 @@ resolveNames( DaemonList* daemon_list, StringList* name_list )
 		} else {
 			fprintf( stderr, "Can't find address for %s %s\n",
 					 daemonString(real_dt), name );
-			had_error = true;
+			if (unresolved_names) {
+				unresolved_names->append(name);
+			} else {
+				had_error = true;
+			}
 		}
 	} // while( each name we were given ) 
 
@@ -1366,7 +1463,7 @@ doCommand( Daemon* d )
 	int	my_cmd = real_cmd;
 	CondorError errstack;
 	bool error = true;
-	char* name;
+	const char* name;
 	bool is_local;
 	daemon_t d_type;
 
@@ -1427,7 +1524,6 @@ doCommand( Daemon* d )
 			continue;
 		}
 
-		char	*psubsys = const_cast<char *>(subsys);
 		switch(real_cmd) {
 		case VACATE_CLAIM:
 			if( is_per_claim_startd_cmd ) {
@@ -1439,7 +1535,7 @@ doCommand( Daemon* d )
 				if (!d->startCommand(my_cmd, &sock, 0, &errstack)) {
 					fprintf(stderr, "ERROR\n%s\n", errstack.getFullText(true).c_str());
 				}
-				if( !sock.code(name) || !sock.end_of_message() ) {
+				if( !sock.put(name) || !sock.end_of_message() ) {
 					fprintf( stderr, "Can't send %s command to %s\n", 
 								 cmdToStr(my_cmd), d->idStr() );
 					all_good = false;
@@ -1463,7 +1559,7 @@ doCommand( Daemon* d )
 				if( !d->startCommand(my_cmd, &sock, 0, &errstack) ) {
 					fprintf( stderr, "ERROR\n%s\n", errstack.getFullText(true).c_str());
 				}
-				if( !sock.code(name) || !sock.end_of_message() ) {
+				if( !sock.put(name) || !sock.end_of_message() ) {
 					fprintf( stderr, "Can't send %s command to %s\n",
 								 cmdToStr(my_cmd), d->idStr() );
 					all_good = false;
@@ -1486,7 +1582,7 @@ doCommand( Daemon* d )
 			if( !d->startCommand( my_cmd, &sock, 0, &errstack) ) {
 				fprintf( stderr, "ERROR\n%s\n", errstack.getFullText(true).c_str() );
 			}
-			if( !sock.code( psubsys ) || !sock.end_of_message() ) {
+			if( !sock.put( subsys ) || !sock.end_of_message() ) {
 				fprintf( stderr, "Can't send %s command to %s\n",
 							cmdToStr(my_cmd), d->idStr() );
 				all_good = false;
@@ -1500,7 +1596,7 @@ doCommand( Daemon* d )
 			if( !d->startCommand(my_cmd, &sock, 0, &errstack) ) {
 				fprintf( stderr, "ERROR\n%s\n", errstack.getFullText(true).c_str() );
 			}
-			if( !sock.code( psubsys ) || !sock.end_of_message() ) {
+			if( !sock.put( subsys ) || !sock.end_of_message() ) {
 				fprintf( stderr, "Can't send %s command to %s\n",
 						 cmdToStr(my_cmd), d->idStr() );
 				all_good = false;
@@ -1554,11 +1650,10 @@ doCommand( Daemon* d )
 			break;
 		case SET_SHUTDOWN_PROGRAM:
 		{
-			char	*pexec = const_cast<char *>(exec_program); 
 			if( !d->startCommand(my_cmd, &sock, 0, &errstack) ) {
 				fprintf( stderr, "ERROR\n%s\n", errstack.getFullText(true).c_str() );
 			}
-			if( !sock.code( pexec ) || !sock.end_of_message() ) {
+			if( !sock.put( exec_program ) || !sock.end_of_message() ) {
 				fprintf( stderr, "Can't send %s command to %s\n",
 						 cmdToStr(my_cmd), d->idStr() );
 				all_good = false;
@@ -1638,7 +1733,7 @@ handleAll()
 {
 	DaemonList daemons;
 
-	if( ! resolveNames(&daemons, NULL) ) {
+	if( ! resolveNames(&daemons, NULL, NULL) ) {
 	  if ( constraint!=NULL ) {
 	    fprintf( stderr, "ERROR: Failed to find daemons matching the constraint\n" );
 	  } else {
@@ -1660,7 +1755,7 @@ handleAll()
 
 
 void
-doSquawk( char *address ) {
+doSquawk( const char *address ) {
 
 		/* making own addr here; memory management in tool confusing. */
 	char line[256], addr[256];
@@ -1804,6 +1899,7 @@ handleSquawk( char *line, char *addr ) {
 			return TRUE;
 		}
 			/* Generic help falls thru to here: */
+			//@fallthrough@
 	default:
 		printf( "Valid commands are \"help\", \"signal\", \"command\"," );
 		printf( "\"reconnect\",\n\"dump\" (state into a ClassAd) and" );
@@ -1887,18 +1983,18 @@ doSquawkReconnect( char *addr ) {
 	if( real_dt == DT_GENERIC ) {
 		d.setSubsystem( subsys );
 	}
-	if( ! d.locate() ) {
+	if( ! d.locate(Daemon::LOCATE_FOR_LOOKUP) ) {
 		printf ( "Failed to contact daemon.\n" );
-		delete [] hostname;
+		free( hostname );
 		return FALSE;
 	}
 	strcpy ( addr, d.addr() );
-	delete [] hostname;
+	free( hostname );
 	
 	return TRUE;	
 }
 
-void squawkHelp( char *token ) {
+void squawkHelp( const char *token ) {
 	switch( token[0] ) {
 	case 's': 
 		printf ( "Send a daemoncore signal.\n" ); 
@@ -1955,5 +2051,3 @@ int strncmp_auto(const char *s1, const char *s2)
 {
     return strncasecmp(s1, s2, strlen(s2));
 }
-
-extern "C" int SetSyscalls() {return 0;}

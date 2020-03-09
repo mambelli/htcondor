@@ -255,7 +255,7 @@ ALLOW_READ_STARTD     = $(ALLOW_READ), $(FLOCK_FROM)
 ##  obvious security implications, so only grant this kind of
 ##  permission for custom attributes that you define for your own use
 ##  at your pool (custom attributes about your machines that are
-##  published with the STARTD_EXPRS setting, for example).
+##  published with the STARTD_ATTRS setting, for example).
 #SETTABLE_ATTRS_OWNER = your_custom_attribute, another_custom_attr
 
 ##  You can also define daemon-specific versions of each of these
@@ -274,24 +274,6 @@ ALLOW_READ_STARTD     = $(ALLOW_READ), $(FLOCK_FROM)
 ##  Do you want to use AFS for file access instead of remote system
 ##  calls?
 #USE_AFS		= False
-
-##--------------------------------------------------------------------
-##  Checkpoint server:
-##--------------------------------------------------------------------
-##  Do you want to use a checkpoint server if one is available?  If a
-##  checkpoint server isn't available or USE_CKPT_SERVER is set to
-##  False, checkpoints will be written to the local SPOOL directory on
-##  the submission machine.
-#USE_CKPT_SERVER	= True
-
-##  What's the hostname of this machine's nearest checkpoint server?
-#CKPT_SERVER_HOST	= checkpoint-server-hostname.your.domain
-
-##  Do you want the starter on the execute machine to choose the
-##  checkpoint server?  If False, the CKPT_SERVER_HOST set on
-##  the submit machine is used.  Otherwise, the CKPT_SERVER_HOST set
-##  on the execute machine is used.  The default is true.
-#STARTER_CHOOSES_CKPT_SERVER = True
 
 ##--------------------------------------------------------------------
 ##  Miscellaneous:
@@ -824,9 +806,8 @@ NEGOTIATOR_INTERVAL = 15
 ##  condor_startd
 ##--------------------------------------------------------------------
 ##  Where are the various condor_starter binaries installed?
-STARTER_LIST = STARTER, STARTER_STANDARD
+STARTER_LIST = STARTER
 STARTER			= $(SBIN)/condor_starter
-STARTER_STANDARD	= $(SBIN)/condor_starter.std
 
 ##  When the startd starts up, it can place it's address (IP and port)
 ##  into a file.  This way, tools running on the local machine don't
@@ -876,7 +857,7 @@ STARTD_ADDRESS_FILE	= $(LOG)/.startd_address
 ##  "/dev/" portion of the pathname.
 CONSOLE_DEVICES	= mouse, console
 
-##  The STARTD_EXPRS entry allows you to have the startd advertise
+##  The STARTD_ATTRS entry allows you to have the startd advertise
 ##  arbitrary expressions from the config file in its ClassAd.  Give
 ##  the comma-separated list of entries from the config file you want
 ##  in the startd ClassAd.
@@ -889,14 +870,12 @@ CONSOLE_DEVICES	= mouse, console
 ##  benchmarks, and how often it sends updates to the central manager,
 ##  you'd have to define the following helper macro:
 #MY_CONSOLE_DEVICES = "$(CONSOLE_DEVICES)"
-##  Note: this must come before you define STARTD_EXPRS because macros
+##  Note: this must come before you define STARTD_ATTRS because macros
 ##  must be defined before you use them in other macros or
 ##  expressions.
-##  Then, you'd set the STARTD_EXPRS setting to this:
-#STARTD_EXPRS = MY_CONSOLE_DEVICES, RunBenchmarks, UPDATE_INTERVAL
+##  Then, you'd set the STARTD_ATTRS setting to this:
+#STARTD_ATTRS = MY_CONSOLE_DEVICES, RunBenchmarks, UPDATE_INTERVAL
 
-COLLECTOR_HOST_STRING = "$(COLLECTOR_HOST)"
-STARTD_EXPRS = COLLECTOR_HOST_STRING
 
 ##  When the startd is claimed by a remote user, it can also advertise
 ##  arbitrary attributes from the ClassAd of the job its working on.
@@ -904,7 +883,7 @@ STARTD_EXPRS = COLLECTOR_HOST_STRING
 ##  Note: since this is already a ClassAd, you don't have to do
 ##  anything funny with strings, etc.  This feature can be turned off
 ##  by commenting out this setting (there is no default).
-STARTD_JOB_EXPRS = ImageSize, ExecutableSize, JobUniverse, NiceUser
+#STARTD_JOB_ATTRS
 
 ##  If you want to "lie" to Condor about how many CPUs your machine
 ##  has, you can use this setting to override Condor's automatic
@@ -1010,46 +989,12 @@ NUM_VIRTUAL_MACHINES = 1
 ##  nodes, just increase this parameter.
 #DISCONNECTED_KEYBOARD_IDLE_BOOST = 1200
 
-######
-##  Settings for computing optional resource availability statistics:
-######
-##  If STARTD_COMPUTE_AVAIL_STATS = True, the startd will compute
-##  statistics about resource availability to be included in the
-##  classad(s) sent to the collector describing the resource(s) the
-##  startd manages.  The following attributes will always be included
-##  in the resource classad(s) if STARTD_COMPUTE_AVAIL_STATS = True:
-##    AvailTime = What proportion of the time (between 0.0 and 1.0)
-##      has this resource been in a state other than "Owner"?
-##    LastAvailInterval = What was the duration (in seconds) of the
-##      last period between "Owner" states?
-##  The following attributes will also be included if the resource is
-##  not in the "Owner" state:
-##    AvailSince = At what time did the resource last leave the
-##      "Owner" state?  Measured in the number of seconds since the
-##      epoch (00:00:00 UTC, Jan 1, 1970).
-##    AvailTimeEstimate = Based on past history, this is an estimate
-##      of how long the current period between "Owner" states will
-##      last.
-#STARTD_COMPUTE_AVAIL_STATS = False
-
-##  If STARTD_COMPUTE_AVAIL_STATS = True, STARTD_AVAIL_CONFIDENCE sets
-##  the confidence level of the AvailTimeEstimate.  By default, the
-##  estimate is based on the 80th percentile of past values.
-#STARTD_AVAIL_CONFIDENCE = 0.8
-
-##  STARTD_MAX_AVAIL_PERIOD_SAMPLES limits the number of samples of
-##  past available intervals stored by the startd to limit memory and
-##  disk consumption.  Each sample requires 4 bytes of memory and
-##  approximately 10 bytes of disk space.
-#STARTD_MAX_AVAIL_PERIOD_SAMPLES = 100
-
 ##--------------------------------------------------------------------
 ##  condor_schedd
 ##--------------------------------------------------------------------
 ##  Where are the various shadow binaries installed?
-SHADOW_LIST = SHADOW, SHADOW_STANDARD
+SHADOW_LIST = SHADOW
 SHADOW			= $(SBIN)/condor_shadow
-SHADOW_STANDARD		= $(SBIN)/condor_shadow.std
 
 ##  When the schedd starts up, it can place it's address (IP and port)
 ##  into a file.  This way, tools running on the local machine don't
@@ -1126,32 +1071,6 @@ QUEUE_SUPER_USERS	= root, condor
 
 
 ##--------------------------------------------------------------------
-##  condor_shadow
-##--------------------------------------------------------------------
-##  If the shadow is unable to read a checkpoint file from the
-##  checkpoint server, it keeps trying only if the job has accumulated
-##  more than MAX_DISCARDED_RUN_TIME seconds of CPU usage.  Otherwise,
-##  the job is started from scratch.  Defaults to 1 hour.  This
-##  setting is only used if USE_CKPT_SERVER (from above) is True.
-#MAX_DISCARDED_RUN_TIME = 3600 
-
-##  Should periodic checkpoints be compressed?
-#COMPRESS_PERIODIC_CKPT = False
-
-##  Should vacate checkpoints be compressed?
-#COMPRESS_VACATE_CKPT = False
-
-##  Should we commit the application's dirty memory pages to swap
-##  space during a periodic checkpoint?
-#PERIODIC_MEMORY_SYNC = False
-
-##  Should we write vacate checkpoints slowly?  If nonzero, this
-##  parameter specifies the speed at which vacate checkpoints should
-##  be written, in kilobytes per second.
-#SLOW_CKPT_SPEED = 0
-
-
-##--------------------------------------------------------------------
 ##  condor_starter
 ##--------------------------------------------------------------------
 ##  The condor_starter can renice the processes from remote Condor
@@ -1160,11 +1079,6 @@ QUEUE_SUPER_USERS	= root, condor
 ##  jobs. (1-19)  The larger the number, the lower priority the
 ##  process gets on your machines.
 #JOB_RENICE_INCREMENT	= 10
-
-##  Should the starter do local logging to its own log file, or send
-##  debug information back to the condor_shadow where it will end up
-##  in the ShadowLog? 
-#STARTER_LOCAL_LOGGING	= TRUE
 
 ##  If the UID_DOMAIN settings match on both the execute and submit
 ##  machines, but the UID of the user who submitted the job isn't in

@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -95,13 +96,9 @@ $success = sub
 	CondorTest::debug("Verifying output\n",1);
 	$diditpass = 1;
 	
-	my $global_logfile = `condor_config_val -expand EVENT_LOG`;
-	open GLOBALLOG, "<$global_logfile" || die "Could not get global event log\n";
-	open USERLOG, "<$userlog" || die "Could not get user log\n";
-	@globallog = <GLOBALLOG>;
-	@userlog = <USERLOG>;
-	close GLOBALLOG;
-	close USERLOG;
+	my $global_logfile = `condor_config_val EVENT_LOG`;
+	@globallog = split "\n", `condor_wait -echo:ISO_DATE $global_logfile`;
+	@userlog = split "\n", `condor_wait -echo:ISO_DATE $userlog`;
 	for($i=0;$i<=$#globallog;++$i){
 		last if($globallog[$i] eq $userlog[0]);
 	}

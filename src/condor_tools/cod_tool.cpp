@@ -41,6 +41,7 @@
 #include "sig_install.h"
 #include "basename.h"
 #include "globus_utils.h"
+#include "condor_claimid_parser.h"
 
 // Global variables
 int cmd = 0;
@@ -66,10 +67,10 @@ VacateType vacate_type = VACATE_GRACEFUL;
 
 // protoypes of interest
 PREFAST_NORETURN void usage( const char*, int iExitCode=1 );
-void version( void );
-void invalid( const char* opt );
-void ambiguous( const char* opt );
-void another( const char* opt );
+PREFAST_NORETURN void version( void );
+PREFAST_NORETURN void invalid( const char* opt );
+PREFAST_NORETURN void ambiguous( const char* opt );
+PREFAST_NORETURN void another( const char* opt );
 void parseCOpt( char* opt, char* arg );
 void parsePOpt( char* opt, char* arg );
 void parseArgv( int argc, char* argv[] );
@@ -95,6 +96,7 @@ main( int argc, char *argv[] )
 
 	myDistro->Init( argc, argv );
 
+	set_priv_initialize(); // allow uid switching if root
 	config();
 
 	cmd = getCommandFromArgv( argc, argv );
@@ -238,9 +240,8 @@ fillRequirements( ClassAd* req )
 	}
 	jic_req += "==TRUE";
 
-	MyString require;
-	require = ATTR_REQUIREMENTS;
-	require += "=(";
+	std::string require;
+	require = "(";
 
 	if (requirements) {
 		require += requirements;
@@ -256,39 +257,18 @@ fillRequirements( ClassAd* req )
 		require += "TARGET.";
 		require += ATTR_SLOT_ID;
 		require += "==";
-		require += slot_id;
+		require += IntToStr( slot_id );
 		require += ")&&(";
-	}
-	else if (param_boolean("ALLOW_VM_CRUFT", false)) {
-		int vm_id = 0;
-		if (name) {
-			if (sscanf(name, "vm%d@", &vm_id) != 1) { 
-				vm_id = 0;
-			}
-		}
-		if (vm_id > 0) {
-			require += "TARGET.";
-			require += ATTR_VIRTUAL_MACHINE_ID;
-			require += "==";
-			require += vm_id;
-			require += ")&&(";
-		}
 	}
 
 	require += jic_req;
 	require += ')';
 
-	if( ! req->Insert(require.Value()) ) {
+	if( ! req->AssignExpr(ATTR_REQUIREMENTS, require.c_str()) ) {
 		fprintf( stderr, "ERROR: can't parse requirements '%s'\n",
 				 requirements );
 		exit( 1 );
 	}
-
-#if defined(ADD_TARGET_SCOPING)
-		// The user may have entered some references to machine attributes
-		// without explicitly specifying the TARGET scope.
-	req->AddTargetRefs( TargetMachineAttrs );
-#endif
 
 }
 
@@ -309,31 +289,17 @@ fillActivateAd( ClassAd* req )
 {
 	fillRequirements( req );
 
-	MyString line;
 	if( cluster_id >= 0 ) {
-		line = ATTR_CLUSTER_ID;
-		line += '=';
-		line += cluster_id;
-		req->Insert( line.Value() );
+		req->Assign( ATTR_CLUSTER_ID, cluster_id );
 	}
 	if( proc_id >= 0 ) {
-		line = ATTR_PROC_ID;
-		line += '=';
-		line += proc_id;
-		req->Insert( line.Value() );
+		req->Assign( ATTR_PROC_ID, proc_id );
 	}
 	if( job_keyword ) {
-		line = ATTR_JOB_KEYWORD;
-		line += "=\"";
-		line += job_keyword;
-		line += '"';
-		req->Insert( line.Value() );
+		req->Assign( ATTR_JOB_KEYWORD, job_keyword );
 	}
 	if( jobad_path ) {
-		line = ATTR_HAS_JOB_AD;
-		line += '=';
-		line += "TRUE";
-		req->Insert( line.Value() );
+		req->Assign( ATTR_HAS_JOB_AD, true );
 		dumpAdIntoRequest( req );
 	}
 }
@@ -367,12 +333,6 @@ dumpAdIntoRequest( ClassAd* req )
 		}
     }
 	fclose( JOBAD_PATH );
-
-#if defined(ADD_TARGET_SCOPING)
-		// The user may have entered some references to machine attributes
-		// without explicitly specifying the TARGET scope.
-	req->AddTargetRefs( TargetMachineAttrs );
-#endif
 
 	return read_something;
 }
@@ -671,6 +631,9 @@ parseArgv( int  /*argc*/, char* argv[] )
 						 my_name, *tmp );
 				exit( 1 );
 			}
+			if (addr) {
+				free(addr);
+			}
 			addr = strdup( *tmp ); 
 			break;
 
@@ -684,6 +647,9 @@ parseArgv( int  /*argc*/, char* argv[] )
 			tmp++;
 			if( ! (tmp && *tmp) ) {
 				another( "-name" );
+			}
+			if (name) {
+				free(name);
 			}
 			name = get_daemon_name( *tmp );
 			if( ! name ) {
@@ -722,6 +688,9 @@ parseArgv( int  /*argc*/, char* argv[] )
 			if( ! (tmp && *tmp) ) {
 				another( "-requirements" );
 			}
+			if (requirements) {
+				free(requirements);
+			}
 			requirements = strdup( *tmp );
 			break;
 
@@ -735,6 +704,9 @@ parseArgv( int  /*argc*/, char* argv[] )
 			tmp++;
 			if( ! (tmp && *tmp) ) {
 				another( "-id" );
+			}
+			if (claim_id) {
+				free(claim_id);
 			}
 			claim_id = strdup( *tmp );
 			break;
@@ -750,6 +722,9 @@ parseArgv( int  /*argc*/, char* argv[] )
 			if( ! (tmp && *tmp) ) {
 				another( "-jobad" );
 			}
+			if (jobad_path) {
+				free(jobad_path);
+			}
 			jobad_path = strdup( *tmp );
 			break;
 
@@ -763,6 +738,9 @@ parseArgv( int  /*argc*/, char* argv[] )
 			tmp++;
 			if( ! (tmp && *tmp) ) {
 				another( "-keyword" );
+			}
+			if (job_keyword) {
+				free(job_keyword);
 			}
 			job_keyword = strdup( *tmp );
 			break;
@@ -850,7 +828,8 @@ parseArgv( int  /*argc*/, char* argv[] )
 			// This is the last resort, because claim ids are
 			// no longer considered to be the correct place to
 			// get the startd's address.
-		target = getAddrFromClaimId( claim_id );
+		ClaimIdParser id_parser(claim_id);
+		target = strdup(id_parser.startdSinfulAddr());
 	} else { 
 			// local startd
 		target = NULL;

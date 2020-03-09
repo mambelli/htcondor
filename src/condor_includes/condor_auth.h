@@ -39,6 +39,9 @@ const int CAUTH_KERBEROS                = 64;
 const int CAUTH_ANONYMOUS               = 128;
 const int CAUTH_SSL                     = 256;
 const int CAUTH_PASSWORD                = 512;
+const int CAUTH_MUNGE                   = 1024;
+const int CAUTH_TOKEN                   = 2048;
+const int CAUTH_SCITOKENS               = 4096;
 
 const char STR_DEFAULT_CONDOR_USER[]    = "condor";    // Default condor user
 const char STR_DEFAULT_CONDOR_SPOOL[]   = "SPOOL";
@@ -68,7 +71,8 @@ class Condor_Auth_Base {
     // RETURNS: None
     //------------------------------------------
 
-    virtual int authenticate(const char * remoteHost, CondorError* errstack) = 0;
+    virtual int authenticate(const char * remoteHost, CondorError* errstack, bool non_blocking) = 0;
+    virtual int authenticate_continue(CondorError* /*errstack*/, bool /*non_blocking*/) {return -1;};
     //------------------------------------------
     // PURPOSE: authenticate with the other side 
     // REQUIRE: 1. Remote host
@@ -92,7 +96,7 @@ class Condor_Auth_Base {
     //          by derived class such as Kerberos
     //------------------------------------------
 
-    virtual int wrap(char*  input, 
+    virtual int wrap(const char*  input,
                      int    input_len, 
                      char*& output,
                      int&   output_len);
@@ -105,7 +109,7 @@ class Condor_Auth_Base {
     //          May need more code later on
     //------------------------------------------
     
-    virtual int unwrap(char*  input, 
+    virtual int unwrap(const char*  input,
                        int    input_len, 
                        char*& output, 
                        int&   output_len);

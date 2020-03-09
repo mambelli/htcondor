@@ -23,13 +23,11 @@
 
 #include "condor_common.h"
 #include "condor_classad.h"
-#include "classad_hashtable.h"
 
 #include "basejob.h"
 #include "ec2resource.h"
 #include "proxymanager.h"
 #include "gahp-client.h"
-#include "vm_univ_utils.h"
 
 void EC2JobInit();
 void EC2JobReconfig();
@@ -64,7 +62,6 @@ public:
 	static int gahpCallTimeout;
 	static int maxConnectFailures;
 	static int funcRetryInterval;
-	static int pendingWaitTime;
 	static int maxRetryTimes;
 	
 	static void setSubmitInterval( int new_interval )	{ submitInterval = new_interval; }
@@ -77,17 +74,42 @@ public:
 	time_t lastSubmitAttempt;
 	int numSubmitAttempts;
 
+
+	//
+	// Hold reason codes were assigned as follows.  Hold reason sub codes
+	// were assigned sequentially by order of their appearance in the code,
+	// and as such are unique between hold codes.
+	//
+	//  37: (apparent) user error.  Example: an unspecified access key ID.
+	//  38: internal error.  Example: the grid resource type was not "ec2";
+	//      the GAHP should never have seen this job ad.
+	//  39: administrator error.  Example: EC2_GAHP being unset.
+	//  40: connection problem.  Example: E_CURL_IO.
+	//  41: server error.  Example: an unrecognized or unexpected job state.
+	//  42: INSTANCE MAY HAVE BEEN LOST.  Example: we tried and failed to
+	//      cancel a spot instance request.
+	//
+	// Of these, only code 40 has a decent chance of working if tried again.
+	// Code 41 may work, but probably won't (for example, the instance would
+	// have to change to a recognized state).  Codes 37, 38, and 39 would need
+	// to debugged; CODE 42 REQUIRES THE EC2 ACCOUNT OWNER TO INVESTIGATE.
+	//
+	int holdReasonCode;
+	int holdReasonSubCode;
+
+
 	std::string errorString;
 	std::string m_remoteJobId;
 	std::string remoteJobState;
 
 	EC2Resource *myResource;
-	GahpClient *gahp;
+	EC2GahpClient *gahp;
 
     void StatusUpdate( const char * instanceID,
                        const char * status,
                        const char * stateReasonCode,
-                       const char * publicDNSName );
+                       const char * publicDNSName,
+                       const char * launchGroup );
 
 	friend class EC2Resource;
 
@@ -99,7 +121,9 @@ private:
 	StringList* build_groupnames();
 
 	std::string m_serviceUrl;
-	
+
+	std::string m_iam_profile_arn;
+	std::string m_iam_profile_name;
 	std::string m_public_key_file;
 	std::string m_private_key_file;
 	std::string m_user_data;
@@ -120,7 +144,10 @@ private:
 	
 	std::string m_ami_id;
 	std::string m_client_token;
+	std::string m_block_device_mapping;
 	StringList* m_group_names;
+	StringList* m_group_ids;
+	StringList* m_parameters_and_values;
 	
 	std::string m_spot_price;
 	std::string m_spot_request_id;
@@ -144,6 +171,9 @@ private:
 	bool probeNow;
 
 	int resourceLeaseTID;
+
+	bool purgedTwice;
+	bool updatedOnce;
 };
 
 #endif

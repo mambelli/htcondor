@@ -24,7 +24,6 @@
 #include "condor_classad.h"
 #include "list.h"
 #include "simplelist.h"
-#include "condor_collector.h"
 #include "condor_attributes.h"
 #include "query_result_type.h"
 #include "generic_query.h"
@@ -154,8 +153,14 @@ class CondorQuery
 	QueryResult addORConstraint (const char *);			 // custom constraints
 	QueryResult addANDConstraint (const char *);		 // custom constraints
 
+	// This query should perform only a location lookup.
+	bool setLocationLookup(const std::string &location, bool want_one_result=true);
+
 	// fetch from collector
 	QueryResult fetchAds (ClassAdList &adList, const char * pool, CondorError* errstack = NULL);
+	// fetch ads from the collector, handing each to 'callback'
+	// callback will return 'false' if it took ownership of the ad.
+	QueryResult processAds (bool (*callback)(void*, ClassAd *), void* pv, const char * pool, CondorError* errstack = NULL);
 
 
 	// filter list of ads; arg1 is 'in', arg2 is 'out'
@@ -163,19 +168,27 @@ class CondorQuery
 
 	// get the query filter ad --- useful for debugging
 	QueryResult getQueryAd (ClassAd &);
+	QueryResult getRequirements (MyString & req) { return (QueryResult) query.makeQuery (req); }
 	
 	// set the type for the next generic query
 	void setGenericQueryType(const char*);
 
 	// Add a non-requirements attribute to send along with the
 	// query.  The server will decide what, if anything to do with it
-	int addExtraAttribute(const char*);
+	int addExtraAttribute(const char *name, const char *value);
 
 		// Set the list of desired attributes
 		// to be returned in the queried ads.
 		// If not set, all attributes are returned.
 	void setDesiredAttrs(char const * const *attrs);
+	void setDesiredAttrs(const std::vector<std::string> &attrs);
+	void setDesiredAttrs(const classad::References & attrs);
+		// set list of desired attributes as a space-separated string
+	void setDesiredAttrs(const std::string &attrs) { extraAttrs.Assign(ATTR_PROJECTION, attrs); }
 	void setDesiredAttrsExpr(const char *expr);
+
+	void setResultLimit(int limit) { resultLimit = limit; }
+	int  getResultLimit() { return resultLimit; }
 
   private:
 		// These are unimplemented, so make them private so that they
@@ -187,6 +200,7 @@ class CondorQuery
 	AdTypes     queryType;
 	GenericQuery query;
 	char*		genericQueryType;
+	int         resultLimit; // limit on number of desired results. collectors prior to 8.7.1 will ignore this.
 
  // Stores extra attributes other than reqs to send to server
 	ClassAd		extraAttrs;

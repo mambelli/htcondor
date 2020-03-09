@@ -33,6 +33,17 @@ enum StopStateT { PEACEFUL, GRACEFUL, FAST, KILL, NONE };
 const char * StopStateToString(StopStateT state);
 StopStateT StringToStopState(const char * psz);
 
+// used to keep track of a query command for which we want to deferr the reply
+class DeferredQuery
+{
+public:
+	Stream * stream;
+	ExprTree * requirements;
+	time_t   expire_time;
+	DeferredQuery(int cmd, Stream * stm, ExprTree * req, time_t expires);
+	~DeferredQuery();
+};
+
 // Max # of controllee's a controller can support
 const int MAX_CONTROLLEES = 5;
 
@@ -49,6 +60,7 @@ public:
 	char*	process_name;
 	char*	watch_name;
 	char*	log_name;
+	char*	ready_state;
 	int		runs_here;
 	int		pid;
 	int 	restarts;
@@ -64,12 +76,14 @@ public:
 	char*	config_info_file;				// for config server
 #endif
 
+	time_t		GetNextRestart();
 	int		NextStart();
 	int		Start( bool never_forward = false );
 	int		RealStart();
 	int		Restart();
 	void    Hold( bool on_hold, bool never_forward = false );
-	bool	OnHold( void ) { return on_hold; };
+	int		OnHold( void ) { return on_hold; };
+	bool	WaitingforStartup(bool & for_file) { for_file = ! m_after_startup_wait_for_file.empty(); return m_waiting_for_startup; }
 	void	Stop( bool never_forward = false );
 	void	StopFast( bool never_forward = false );
 	void	StopFastTimer();
@@ -83,6 +97,7 @@ public:
 	void	KillFamily( void );
 	void	Reconfig();
 	void	InitParams();
+	void	SetReadyState(const char * state);
 
 	int		SetupController( void );
 	int		DetachController( void );
@@ -140,6 +155,8 @@ private:
 	bool m_never_use_shared_port;
 	bool m_waiting_for_startup;
 	bool m_only_stop_when_master_stops;
+
+	std::string localName;
 };
 
 
@@ -205,6 +222,7 @@ public:
 	void	CancelNewExecTimer();
 
 	int		SetupControllers( );
+	int		QueryReady(ClassAd & cmdAd, Stream* stm);
 
 	int		immediate_restart;
 	int		immediate_restart_master;
@@ -217,6 +235,7 @@ public:
 
 	class daemon*	FindDaemon( daemon_t dt );
 	class daemon*	FindDaemon( const char * );
+	class daemon*	FindDaemonByPID( int pid );
 
 private:
 	std::map<std::string, class daemon*> daemon_ptr;
@@ -229,15 +248,25 @@ private:
 	ReaperT reaper;
 	int prevLHF;
 	int m_retry_start_all_daemons_tid;
+	int m_deferred_query_ready_tid;
+	std::list<DeferredQuery*> deferred_queries;
+	DCTokenRequester m_token_requester;
 
 	void ScheduleRetryStartAllDaemons();
 	void CancelRetryStartAllDaemons();
 	void RetryStartAllDaemons();
+	void DeferredQueryReadyReply();
+	bool InitDaemonReadyAd(ClassAd & readyAd);
+	//bool GetDaemonReadyStates(std::string & ready);
 	int  SendSetPeacefulShutdown(class daemon*, int timeout);
 	void DoPeacefulShutdown(int timeout, void (Daemons::*pfn)(void), const char * lbl);
 
 		// returns true if there are no remaining daemons
 	bool StopDaemonsBeforeMasterStops();
+
+	static void ProcdStopped(void*, int pid, int status);
+
+	static void token_request_callback(bool success, void *miscdata);
 };
 
 #endif /* _CONDOR_MASTER_H */

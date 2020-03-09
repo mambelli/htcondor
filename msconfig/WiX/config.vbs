@@ -2,17 +2,35 @@ Function ReplaceConfig(configName, newValue, srcTxt)
   Set re = new RegExp
   re.Global = true
   re.Multiline = true
+  re.IgnoreCase = true
   re.Pattern = "^" & configName & "[ \t]*=.+$"
   Set matches = re.Execute(srcTxt)
   if matches.Count = 0 then
     re.Pattern = "^#" & configName & "[ \t]*=.+$"
     Set matches = re.Execute(srcText)
+    if matches.Count = 0 then
+      ' can't just append new attrib because of possible $$, so append dummy, then search and replace it with real stuff.
+      srcTxt = srcTxt & configName & " = _" & VbCrLf
+      re.Pattern = "^" & configName & "[ \t]*=.+$"
+      re.Execute(srcText)
+    end if
   end if
+  ReplaceConfig = re.Replace(srcTxt, configName & " = " & newValue)
+End Function
+
+Function ReplaceMetaConfig(metaCat, oldVals, newValue, srcTxt)
+  Set re = new RegExp
+  re.Global = true
+  re.Multiline = true
+  re.IgnoreCase = true
+  re.Pattern = "^[ \t]*use[ \t]*" & metaCat & "[ \t]*:[ \t]*" & oldVals & "$"
+  Set matches = re.Execute(srcTxt)
   if matches.Count = 0 then
-    ReplaceConfig = srcTxt & configName & " = " & newValue & VbCrLf
-  else
-    ReplaceConfig = re.Replace(srcTxt, configName & " = " & newValue)
+    ' can't just append new attrib because of possible $$, so append dummy, then search and replace it with real stuff.
+    srcTxt = srcTxt & "use " & metaCat & " : " & newValue & VbCrLf
+    re.Execute(srcText)
   end if
+  ReplaceMetaConfig = re.Replace(srcTxt, "use " & metaCat & " : " & newValue)
 End Function
 
 Function CreateConfig2()
@@ -20,10 +38,14 @@ Function CreateConfig2()
   path = Session.Property("INSTALLDIR")
   Set installpath = fso.GetFolder(path)
   strippedPath = installpath.ShortPath
-  if Not fso.FileExists(path & "condor_config.local") Then
-   fso.CreateTextFile(path & "condor_config.local")
+
+  cclpath = fso.BuildPath(path,"condor_config.local")
+  if Not fso.FileExists(cclpath) Then
+   fso.CreateTextFile(cclpath)
   End if
-  if fso.FileExists(path & "condor_config") then
+
+  ccpath = fso.BuildPath(path,"condor_config")
+  if fso.FileExists(ccpath) then
    Exit Function
   end if
 
@@ -32,7 +54,8 @@ Function CreateConfig2()
    daemonList = daemonList & " SCHEDD"
   End If
 
-  Set Configfile = fso.OpenTextFile(path & "etc\condor_config.generic", 1, True)
+  ccgpath = fso.BuildPath(path, "etc\condor_config.generic")
+  Set Configfile = fso.OpenTextFile(ccgpath, 1, True)
   configTxt = Configfile.ReadAll
   configTxt = configTxt & VbCrLf
   Configfile.Close
@@ -50,7 +73,7 @@ Function CreateConfig2()
 
   Select Case Session.Property("NEWPOOL")
   Case "Y"
-   configTxt = ReplaceConfig("CONDOR_HOST", "$$(FULL_HOSTNAME)",configTxt)
+   configTxt = ReplaceConfig("CONDOR_HOST", "$(FULL_HOSTNAME)",configTxt)
    configTxt = ReplaceConfig("COLLECTOR_NAME",Session.Property("POOLNAME"),configTxt)
    daemonList = daemonList & " COLLECTOR NEGOTIATOR"
   Case "N"
@@ -72,22 +95,25 @@ Function CreateConfig2()
 
   Select Case Session.Property("RUNJOBS")
   Case "A"
-   configTxt = ReplaceConfig("START","TRUE",configTxt)
-   configTxt = ReplaceConfig("SUSPEND","FALSE",configTxt)
-   configTxt = ReplaceConfig("WANT_SUSPEND","FALSE",configTxt)
-   configTxt = ReplaceConfig("WANT_VACATE","FALSE",configTxt)
-   configTxt = ReplaceConfig("PREEMPT","FALSE",configTxt)
+   configTxt = ReplaceMetaConfig("POLICY", "(DESKTOP|UWCS_DESKTOP|ALWAYS_RUN_JOBS)", "ALWAYS_RUN_JOBS", configTxt)
+   'configTxt = ReplaceConfig("START","TRUE",configTxt)
+   'configTxt = ReplaceConfig("SUSPEND","FALSE",configTxt)
+   'configTxt = ReplaceConfig("WANT_SUSPEND","FALSE",configTxt)
+   'configTxt = ReplaceConfig("WANT_VACATE","FALSE",configTxt)
+   'configTxt = ReplaceConfig("PREEMPT","FALSE",configTxt)
    daemonList = daemonList & " STARTD"
   Case "N"
    configTxt = ReplaceConfig("START","FALSE",configTxt)
   Case "I"
+   configTxt = ReplaceMetaConfig("POLICY", "(DESKTOP|UWCS_DESKTOP|ALWAYS_RUN_JOBS)", "DESKTOP", configTxt)
    configTxt = ReplaceConfig("START","KeyboardIdle > $$(StartIdleTime)",configTxt)
    configTxt = ReplaceConfig("CONTINUE","KeyboardIdle > $$(ContinueIdleTime)",configTxt)
    daemonList = daemonList & " STARTD KBDD"
   Case "C"
+   configTxt = ReplaceMetaConfig("POLICY", "(DESKTOP|UWCS_DESKTOP|ALWAYS_RUN_JOBS)", "DESKTOP", configTxt)
    daemonList = daemonList & " STARTD KBDD"
   End Select
-  
+
   If Session.Property("VACATEJOBS") = "N" Then
    configTxt = ReplaceConfig("WANT_VACATE","FALSE",configTxt)
    configTxt = ReplaceConfig("WANT_SUSPEND","TRUE",configTxt)
@@ -112,7 +138,7 @@ Function CreateConfig2()
 
   configTxt = ReplaceConfig("DAEMON_LIST",daemonList,configTxt)
 
-  Set Configfile = fso.OpenTextFile(path & "condor_config", 2, True)
+  Set Configfile = fso.OpenTextFile(ccpath, 2, True)
   Configfile.WriteLine configTxt
   Configfile.Close
 End Function

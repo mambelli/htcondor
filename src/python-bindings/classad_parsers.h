@@ -1,12 +1,19 @@
 
-#include <boost/python.hpp>
-
 #include "classad_wrapper.h"
+
+enum ParserType {
+  CLASSAD_AUTO,
+  CLASSAD_OLD,
+  CLASSAD_NEW,
+  CLASSAD_JSON
+};
 
 ClassAdWrapper *parseString(const std::string &str);
 ClassAdWrapper *parseFile(FILE *stream);
 ClassAdWrapper *parseOld(boost::python::object input);
-
+boost::shared_ptr<ClassAdWrapper> parseOne(boost::python::object input, ParserType);
+boost::python::object parseAds(boost::python::object input, ParserType type);
+boost::python::object parseNext(boost::python::object input, ParserType type);
 
 class OldClassAdIterator
 {

@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2008, Condor Team, Computer Sciences Department,
@@ -80,7 +81,7 @@ foreach my $arg ( @ARGV ) {
 }
 
 my $dir = "test-eventlog_" . $settings{name};
-my $exe = "./lib_eventlog_".$settings{name}.".exe";
+my $exe = "./lib_eventlog_".$settings{name}."_executable.exe";
 my $fulldir = getcwd() . "/$dir";
 unlink "$dir/EventLog";
 unlink "$dir/reader.state";

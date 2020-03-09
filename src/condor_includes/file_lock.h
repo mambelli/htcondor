@@ -22,6 +22,7 @@
 
 #include "condor_constants.h"
 #include <stdio.h>	// for FILE
+#include <MyString.h>
 
 typedef enum { READ_LOCK, WRITE_LOCK, UN_LOCK } LOCK_TYPE;
 
@@ -50,6 +51,8 @@ class FileLockBase
   public:
 	FileLockBase( void );
 	virtual ~FileLockBase(void);
+
+	FileLockBase(const FileLockBase &) = delete;
 
 		// Read only access functions
 	bool isBlocking(void) const			// whether or not operations will block
@@ -155,7 +158,7 @@ class FileLock : public FileLockBase
 	virtual void display(void) const;
 
 	void updateLockTimestamp(void);
-	char*		GetTempPath();	// get a temporary path from the local file system
+	static const char *getTempPath(MyString & pathbuf);	// get a temporary path from the local file system
 
   private:
 

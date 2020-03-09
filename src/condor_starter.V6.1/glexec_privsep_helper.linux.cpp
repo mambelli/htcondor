@@ -362,6 +362,7 @@ GLExecPrivSepHelper::create_process(const char* path,
 		                                     PRIV_USER_FINAL,
 		                                     reaper_id,
 		                                     FALSE,
+		                                     FALSE,
 		                                     NULL,
 		                                     iwd,
 		                                     fi_ptr,
@@ -417,12 +418,12 @@ GLExecPrivSepHelper::create_process(const char* path,
 		if( !retry ) {
 				// return the most recent glexec error output
 			if( error_msg ) {
-				error_msg->formatstr_cat(glexec_error_msg.Value());
+				error_msg->formatstr_cat("%s",glexec_error_msg.Value());
 			}
 			return 0;
 		}
 			// truncated exponential backoff
-		int delay_rand = 1 + (get_random_int() % glexec_errors) % 100;
+		int delay_rand = 1 + (get_random_int_insecure() % glexec_errors) % 100;
 		int delay = m_glexec_retry_delay * delay_rand;
 		dprintf(D_ALWAYS,"Glexec exited with status %d; retrying in %d seconds.\n",
 				glexec_rc, delay );

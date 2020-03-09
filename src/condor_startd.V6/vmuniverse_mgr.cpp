@@ -31,7 +31,6 @@
 #include "daemon_types.h"
 #include "directory.h"
 #include "condor_environ.h"
-#include "../condor_privsep/condor_privsep.h"
 #include "vmuniverse_mgr.h"
 #include "condor_vm_universe_types.h"
 #include "vm_univ_utils.h"
@@ -108,7 +107,6 @@ VMStarterInfo::getUsageOfVM(ProcFamilyUsage &usage)
 		usage.total_resident_set_size = m_vm_alive_pinfo.rssize;
 #if HAVE_PSS
 		usage.total_proportional_set_size = m_vm_alive_pinfo.pssize;
-		usage.total_proportional_set_size = m_vm_alive_pinfo.pssize_available;
 #endif
 	}else {
 		usage.total_image_size = 0;
@@ -176,7 +174,7 @@ VMStarterInfo::addMACForVM(const char* mac)
 const char *
 VMStarterInfo::getMACForVM(void)
 {
-	return m_vm_mac.Value();
+	return m_vm_mac.c_str();
 }
 
 void
@@ -188,7 +186,7 @@ VMStarterInfo::addIPForVM(const char* ip)
 const char *
 VMStarterInfo::getIPForVM(void)
 {
-	return m_vm_ip.Value();
+	return m_vm_ip.c_str();
 }
 
 void 
@@ -197,10 +195,10 @@ VMStarterInfo::publishVMInfo(ClassAd* ad, amask_t  /*mask*/ )
 	if( !ad ) {
 		return;
 	}
-	if( m_vm_mac.IsEmpty() == false ) {
+	if (m_vm_mac.length() == 0) {
 		ad->Assign(ATTR_VM_GUEST_MAC, m_vm_mac);
 	}
-	if( m_vm_ip.IsEmpty() == false ) {
+	if( m_vm_ip.length() == 0 ) {
 		ad->Assign(ATTR_VM_GUEST_IP, m_vm_ip);
 	}
 	if( m_memory > 0 ) {
@@ -232,8 +230,8 @@ VMUniverseMgr::~VMUniverseMgr()
 bool
 VMUniverseMgr::init( void )
 {
-	MyString vmtype;
-	MyString vmgahppath;
+	std::string vmtype;
+	std::string vmgahppath;
 
 	m_vm_type = "";
 
@@ -275,9 +273,9 @@ VMUniverseMgr::init( void )
 	// try to test it with given vmtype 
 	// and grab the output (whose format should be a classad type), 
 	// and set the appropriate values for vm universe
-	if( testVMGahp(vmgahppath.Value(), vmtype.Value()) == false ) {
+	if( testVMGahp(vmgahppath.c_str(), vmtype.c_str()) == false ) {
 		dprintf( D_ALWAYS, "Test of vmgahp for VM_TYPE('%s') failed. "
-				"So we disabled VM Universe\n", vmtype.Value());
+				"So we disabled VM Universe\n", vmtype.c_str());
 		m_vm_type = "";
 		return false;
 	}
@@ -299,7 +297,7 @@ VMUniverseMgr::publish( ClassAd* ad, amask_t  /*mask*/ )
 	if( !ad ) {
 		return;
 	}
-	if( !m_starter_has_vmcode || ( m_vm_type.Length() == 0 )) {
+	if( !m_starter_has_vmcode || ( m_vm_type.length() == 0 )) {
 		ad->Assign(ATTR_HAS_VM, false);
 		return;
 	}
@@ -316,11 +314,12 @@ VMUniverseMgr::publish( ClassAd* ad, amask_t  /*mask*/ )
 	}
 
 	// we will publish all information provided by vmgahp server
-	m_vmgahp_info.ResetExpr();
 
 	ExprTree* expr = NULL;
 	const char *attr_name = NULL;
-	while(m_vmgahp_info.NextExpr(attr_name, expr)) {
+	for( auto itr = m_vmgahp_info.begin(); itr != m_vmgahp_info.end(); itr++ ) {
+		attr_name = itr->first.c_str();
+		expr = itr->second;
 		// we need to adjust available vm memory
 		if( strcasecmp(attr_name, ATTR_VM_MEMORY) == MATCH ) {
 			int freemem = getFreeVMMemSize();
@@ -329,13 +328,13 @@ VMUniverseMgr::publish( ClassAd* ad, amask_t  /*mask*/ )
 			ad->Assign(ATTR_VM_NETWORKING, m_vm_networking); 
 		}else {
 			ExprTree * pTree =  expr->Copy();
-			ad->Insert(attr_name, pTree, false);
+			ad->Insert(attr_name, pTree);
 		}
 	}
 
 	// Now, we will publish mac and ip addresses of all guest VMs.
-	MyString all_macs;
-	MyString all_ips;
+	std::string all_macs;
+	std::string all_ips;
 	VMStarterInfo *info = NULL;
 	const char* guest_ip = NULL;
 	const char* guest_mac = NULL;
@@ -344,7 +343,7 @@ VMUniverseMgr::publish( ClassAd* ad, amask_t  /*mask*/ )
 	while( m_vm_starter_list.Next(info) ) {
 		guest_ip = info->getIPForVM();
 		if( guest_ip ) {
-			if( all_ips.IsEmpty() == false ) {
+			if( all_ips.length() == 0 ) {
 				all_ips += ",";
 			}
 			all_ips += guest_ip;
@@ -352,16 +351,16 @@ VMUniverseMgr::publish( ClassAd* ad, amask_t  /*mask*/ )
 
 		guest_mac = info->getMACForVM();
 		if( guest_mac ) {
-			if( all_macs.IsEmpty() == false ) {
+			if (all_macs.length() == 0) {
 				all_macs += ",";
 			}
 			all_macs += guest_mac;
 		}
 	}
-	if( all_ips.IsEmpty() == false ) {
+	if( all_ips.length() == 0 ) {
 		ad->Assign(ATTR_VM_ALL_GUEST_IPS, all_ips);
 	}
-	if( all_macs.IsEmpty() == false ) {
+	if( all_macs.length() == 0 ) {
 		ad->Assign(ATTR_VM_ALL_GUEST_MACS, all_macs);
 	}
 }
@@ -417,9 +416,9 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 
 #if !defined(WIN32)
 	if( can_switch_ids() ) {
-		MyString tmp_str;
-		tmp_str.formatstr("%d", (int)get_condor_uid());
-		SetEnv("VMGAHP_USER_UID", tmp_str.Value());
+		std::string tmp_str;
+		formatstr(tmp_str,"%d", (int)get_condor_uid());
+		SetEnv("VMGAHP_USER_UID", tmp_str.c_str());
 	}
 #endif
 
@@ -458,9 +457,9 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 		systemcmd.GetArgsStringForDisplay(&args_string,0);
 		dprintf( D_ALWAYS, 
 				 "Warning: '%s' did not produce any valid output.\n", 
-				 args_string.Value());
+				 args_string.c_str());
 		if( (strcasecmp(vmtype, CONDOR_VM_UNIVERSE_XEN) == 0) ) {
-			MyString err_msg;
+			std::string err_msg;
 			err_msg += "\n#######################################################\n";
 			err_msg += "##### Make sure the followings ";
 			err_msg += "to use VM universe for Xen\n";
@@ -470,9 +469,9 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 			err_msg += "### - Other writable bit for the above files is ";
 			err_msg += "not allowed.\n";
 			err_msg += "#########################################################\n";
-			dprintf( D_ALWAYS, "%s", err_msg.Value());
+			dprintf( D_ALWAYS, "%s", err_msg.c_str());
 		} else if( (strcasecmp(vmtype, CONDOR_VM_UNIVERSE_KVM) == 0)) {
-		        MyString err_msg;
+		        std::string err_msg;
 			err_msg += "\n#######################################################\n";
 			err_msg += "##### Make sure the followings ";
 			err_msg += "to use VM universe for KVM\n";
@@ -482,10 +481,10 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 			err_msg += "### - Other writable bit for the above files is ";
 			err_msg += "not allowed.\n";
 			err_msg += "#########################################################\n";
-			dprintf( D_ALWAYS, "%s", err_msg.Value());
+			dprintf( D_ALWAYS, "%s", err_msg.c_str());
 		}else if( strcasecmp(vmtype, CONDOR_VM_UNIVERSE_VMWARE ) == 0 ) {
-			MyString err_msg;
-			MyString err_msg2;
+			std::string err_msg;
+			std::string err_msg2;
 			err_msg += "\n#######################################################\n";
 			err_msg += "##### Make sure the followings ";
 			err_msg += "to use VM universe for VMware\n";
@@ -499,7 +498,7 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 			err_msg += "### - Check the path of vmware-cmd, vmrun, and mkisofs ";
 			err_msg += "in 'condor_vm_vmware\n'";
 			err_msg += "#########################################################\n";
-			dprintf( D_ALWAYS, "%s", err_msg.Value());
+			dprintf( D_ALWAYS, "%s", err_msg.c_str());
 		}
 		return false;
 	}
@@ -508,13 +507,13 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 	printVMGahpInfo(D_ALWAYS);
 
 	// Read vm_type
-	MyString tmp_vmtype;
+	std::string tmp_vmtype;
 	if( m_vmgahp_info.LookupString( ATTR_VM_TYPE, tmp_vmtype) != 1 ) {
 		dprintf( D_ALWAYS, "There is no %s in the output of vmgahp. "
 				"So VM Universe will be disabled\n", ATTR_VM_TYPE);
 		return false;
 	}
-	if( strcasecmp(tmp_vmtype.Value(), vmtype) != 0 ) {
+	if( strcasecmp(tmp_vmtype.c_str(), vmtype) != 0 ) {
 		dprintf( D_ALWAYS, "The vmgahp(%s) doesn't support this vmtype(%s)\n",
 				gahppath, vmtype);
 		return false;
@@ -536,7 +535,7 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 
 	// Read vm_networking
 	bool tmp_networking = false;
-	MyString tmp_networking_types;
+	std::string tmp_networking_types;
 
 	m_vmgahp_info.LookupBool(ATTR_VM_NETWORKING, tmp_networking);
 	if( tmp_networking ) {
@@ -561,7 +560,7 @@ VMUniverseMgr::testVMGahp(const char* gahppath, const char* vmtype)
 	}else {
 		dprintf( D_ALWAYS, "VM networking is enabled\n");
 		dprintf( D_ALWAYS, "Supported networking types are %s\n", 
-				tmp_networking_types.Value());
+				tmp_networking_types.c_str());
 	}
 			
 	// Now, we received correct information from vmgahp
@@ -580,7 +579,7 @@ VMUniverseMgr::getFreeVMMemSize()
 bool
 VMUniverseMgr::canCreateVM(ClassAd *jobAd)
 {
-	if( !m_starter_has_vmcode || ( m_vm_type.Length() == 0 )) {
+	if( !m_starter_has_vmcode || ( m_vm_type.length() == 0 )) {
 		return false;
 	}
 
@@ -597,7 +596,8 @@ VMUniverseMgr::canCreateVM(ClassAd *jobAd)
 
 	// check free memory for VM
 	int int_value = 0;
-	if( jobAd->LookupInteger(ATTR_JOB_VM_MEMORY, int_value) != 1 ) {
+	if( (jobAd->LookupInteger(ATTR_JOB_VM_MEMORY, int_value) != 1) &&
+		(jobAd->LookupInteger(ATTR_REQUEST_MEMORY, int_value) != 1) ) {
 		dprintf(D_ALWAYS, "Can't find VM memory in Job ClassAd\n");
 		return false;
 	}
@@ -609,11 +609,11 @@ VMUniverseMgr::canCreateVM(ClassAd *jobAd)
 
 	// check if the MAC address for checkpointed VM
 	// is conflict with running VMs.
-	MyString string_value;
+	std::string string_value;
 	if( jobAd->LookupString(ATTR_VM_CKPT_MAC, string_value) == 1 ) {
-		if( findVMStarterInfoWithMac(string_value.Value()) ) {
+		if( findVMStarterInfoWithMac(string_value.c_str()) ) {
 			dprintf(D_ALWAYS, "MAC address[%s] for VM is already being used "
-					"by other VM\n", string_value.Value());
+					"by other VM\n", string_value.c_str());
 			return false;
 		}
 	}
@@ -630,13 +630,15 @@ VMUniverseMgr::allocVM(pid_t s_pid, ClassAd &ad, char const *execute_dir)
 
 	// Find memory for VM
 	int vm_mem = 0;
-	if( ad.LookupInteger(ATTR_JOB_VM_MEMORY, vm_mem) != 1 ) {
+	if( (ad.LookupInteger(ATTR_JOB_VM_MEMORY, vm_mem) != 1) &&
+	    (ad.LookupInteger(ATTR_REQUEST_MEMORY, vm_mem) != 1) ) {
 		dprintf(D_ALWAYS, "Can't find VM memory in Job ClassAd\n");
 		return false;
 	}
 
 	int vcpus = 0;
-	if(ad.LookupInteger(ATTR_JOB_VM_VCPUS, vcpus) != 1)
+	if( (ad.LookupInteger(ATTR_JOB_VM_VCPUS, vcpus) != 1) &&
+	    (ad.LookupInteger(ATTR_REQUEST_CPUS, vcpus) != 1) )
 	  {
 	    dprintf(D_FULLDEBUG, "Defaulting to one CPU\n");
 	    vcpus = 1;
@@ -663,7 +665,7 @@ VMUniverseMgr::allocVM(pid_t s_pid, ClassAd &ad, char const *execute_dir)
 
 	// If there exists MAC or IP address for a checkpointed VM,
 	// we use them as initial values.
-	MyString string_value;
+	std::string string_value;
 	if( ad.LookupString(ATTR_VM_CKPT_MAC, string_value) == 1 ) {
 		newinfo->m_vm_mac = string_value;
 	}
@@ -686,11 +688,11 @@ VMUniverseMgr::freeVM(pid_t s_pid)
 		return;
 	}
 
-	MyString pid_dir;
-	Directory execute_dir(info->m_execute_dir.Value(), PRIV_ROOT);
-	pid_dir.formatstr("dir_%ld", (long)s_pid);
+	std::string pid_dir;
+	Directory execute_dir(info->m_execute_dir.c_str(), PRIV_ROOT);
+	formatstr(pid_dir,"dir_%ld", (long)s_pid);
 
-	if( execute_dir.Find_Named_Entry( pid_dir.Value() ) ) {
+	if( execute_dir.Find_Named_Entry( pid_dir.c_str() ) ) {
 		// starter didn't exit cleanly,
 		// maybe it seems to be killed by startd.
 		// So we need to make sure that VM is really destroyed. 
@@ -755,7 +757,7 @@ VMUniverseMgr::findVMStarterInfoWithMac(const char* mac)
 
 	m_vm_starter_list.Rewind();
 	while( m_vm_starter_list.Next(info) ) {
-		if( !strcasecmp(info->m_vm_mac.Value(), mac) ) {
+		if( !strcasecmp(info->m_vm_mac.c_str(), mac) ) {
 			return info;
 		}
 	}
@@ -773,17 +775,21 @@ VMUniverseMgr::findVMStarterInfoWithIP(const char* ip)
 
 	m_vm_starter_list.Rewind();
 	while( m_vm_starter_list.Next(info) ) {
-		if( !strcasecmp(info->m_vm_ip.Value(), ip) ) {
+		if( !strcasecmp(info->m_vm_ip.c_str(), ip) ) {
 			return info;
 		}
 	}
 	return NULL;
 }
 
-void 
-VMUniverseMgr::checkVMUniverse(void)
+void
+VMUniverseMgr::checkVMUniverse( bool warn )
 {
-	dprintf( D_ALWAYS, "VM-gahp server reported an internal error\n");
+	// This might be better as detect, where detect never sets m_needCheck
+	// because it should be an error for there to be running VMs on startup.
+	if( warn ) {
+		dprintf( D_ALWAYS, "VM-gahp server reported an internal error\n");
+	}
 
 	if( numOfRunningVM() == 0 ) {
 		// There is no running VM job.
@@ -791,7 +797,7 @@ VMUniverseMgr::checkVMUniverse(void)
 		docheckVMUniverse();
 		return;
 	}
-	
+
 	// There are running VM jobs.
 	// We need to wait for all jobs to be finished
 	// When all jobs are finished, we will call docheckVMUniverse function
@@ -856,7 +862,7 @@ VMUniverseMgr::killVM(const char *matchstring)
 	if ( !matchstring ) {
 		return;
 	}
-	if( !m_vm_type.Length() || !m_vmgahp_server.Length() ) {
+	if( !m_vm_type.length() || !m_vmgahp_server.length() ) {
 		return;
 	}
 
@@ -881,9 +887,9 @@ VMUniverseMgr::killVM(const char *matchstring)
 
 #if !defined(WIN32)
 	if( can_switch_ids() ) {
-		MyString tmp_str;
-		tmp_str.formatstr("%d", (int)get_condor_uid());
-		SetEnv("VMGAHP_USER_UID", tmp_str.Value());
+		std::string tmp_str;
+		formatstr(tmp_str,"%d", (int)get_condor_uid());
+		SetEnv("VMGAHP_USER_UID", tmp_str.c_str());
 	}
 #endif
 
@@ -909,7 +915,7 @@ VMUniverseMgr::killVM(VMStarterInfo *info)
 	if( !info ) {
 		return;
 	}
-	if( !m_vm_type.Length() || !m_vmgahp_server.Length() ) {
+	if( !m_vm_type.length() || !m_vmgahp_server.length() ) {
 		return;
 	}
 
@@ -919,13 +925,9 @@ VMUniverseMgr::killVM(VMStarterInfo *info)
 		daemonCore->Send_Signal(info->m_vm_pid, SIGKILL);
 	}
 
-	MyString matchstring;
-	MyString workingdir;
+	std::string matchstring;
 
-	workingdir.formatstr("%s%cdir_%ld", info->m_execute_dir.Value(),
-	                   DIR_DELIM_CHAR, (long)info->m_pid);
-
-	if( (strcasecmp(m_vm_type.Value(), CONDOR_VM_UNIVERSE_XEN ) == MATCH) || (strcasecmp(m_vm_type.Value(), CONDOR_VM_UNIVERSE_KVM) == 0)) {
+	if( (strcasecmp(m_vm_type.c_str(), CONDOR_VM_UNIVERSE_XEN ) == MATCH) || (strcasecmp(m_vm_type.c_str(), CONDOR_VM_UNIVERSE_KVM) == 0)) {
 		if( create_name_for_VM(&info->m_job_ad, matchstring) == false ) {
 			dprintf(D_ALWAYS, "VMUniverseMgr::killVM() : "
 					"cannot make the name of VM\n");
@@ -934,10 +936,11 @@ VMUniverseMgr::killVM(VMStarterInfo *info)
 	}else {
 		// Except Xen, we need the path of working directory of Starter
 		// in order to destroy VM.
-		matchstring = workingdir;
+		formatstr(matchstring, "%s%cdir_%ld", info->m_execute_dir.c_str(),
+	                   DIR_DELIM_CHAR, (long)info->m_pid);
 	}
 
-	killVM( matchstring.Value() );
+	killVM( matchstring.c_str() );
 }
 
 bool 

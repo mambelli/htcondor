@@ -21,8 +21,10 @@
 #ifndef _SCRIPTQ_H
 #define _SCRIPTQ_H
 
+#include <utility>
+
 #include "HashTable.h"
-#include "Queue.h"
+#include <queue>
 
 #include "condor_daemon_core.h"
 
@@ -46,16 +48,12 @@ class ScriptQ : public Service {
 	// or deferred).
 	int Run( Script *script );
 
-	/** Run one waiting script, if possible.
-		@return 1 if a script was spawned, 0 if not (error or deferred).
-	*/
-	int RunWaitingScript();
-
-	/** Run all waiting scripts, if possible (keep trying until a script
-		is not run).
+	/** Run waiting/deferred scripts.
+		@param justOne: if true, only run one script; if false, run as
+			many scripts as we can, limited by maxpre/maxpost and halt.
 		@return the number of scripts spawned.
 	*/
-	int RunAllWaitingScripts();
+	int RunWaitingScripts( bool justOne = false );
 
 	/** Return the number of scripts actually running (does not include
 	    scripts that are queued to run but have been deferred).
@@ -79,14 +77,15 @@ class ScriptQ : public Service {
 	HashTable<int, Script*> *_scriptPidTable;
 
 	// queue of scripts waiting to be run
-	Queue<Script*> *_waitingQueue;
+	std::queue<Script*> *_waitingQueue;
 
 	// daemonCore reaper id for PRE/POST script reaper function
 	int _scriptReaperId;
 
 	// Total count of scripts deferred because of MaxPre or MaxPost limit
 	// (note that a single script getting deferred multiple times is counted
-	// multiple times).
+	// multiple times).  Also includes scripts deferred by the new
+	// DEFER feature.
 	int _scriptDeferredCount;
 };
 

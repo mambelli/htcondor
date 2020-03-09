@@ -21,9 +21,9 @@
 #define _COLLECTOR_DAEMON_H_
 
 #include <vector>
+#include <queue>
 
 #include "condor_classad.h"
-#include "condor_commands.h"
 #include "totals.h"
 #include "forkwork.h"
 
@@ -96,11 +96,12 @@ public:
 	virtual void Exit();             // main__shutdown_fast
 	virtual void Shutdown();         // main_shutdown_graceful
 	// command handlers
-	static int receive_query_cedar(Service*, int, Stream*);
+	static int receive_query_cedar(int, Stream*);
+	static int receive_query_cedar_worker_thread(void *, Stream*);
 	static AdTypes receive_query_public( int );
-	static int receive_invalidation(Service*, int, Stream*);
-	static int receive_update(Service*, int, Stream*);
-    static int receive_update_expect_ack(Service*, int, Stream*);
+	static int receive_invalidation(int, Stream*);
+	static int receive_update(int, Stream*);
+    static int receive_update_expect_ack(int, Stream*);
 
 	static void process_query_public(AdTypes, ClassAd*, List<ClassAd>*);
 	static ClassAd * process_global_query( const char *constraint, void *arg );
@@ -115,8 +116,6 @@ public:
 	static int reportSubmittorScanFunc(ClassAd*);
 	static int reportMiniStartdScanFunc(ClassAd *cad);
 
-	static void reportToDevelopers();
-
 	static int sigint_handler(Service*, int);
 	static void unixsigint_handler();
 	
@@ -125,6 +124,10 @@ public:
 
 	static void forward_classad_to_view_collector(int cmd, const char *filterAttr, ClassAd *ad);
 	static void send_classad_to_sock(int cmd, ClassAd* theAd);	
+
+		// Take an incoming session and forward a token request to the schedd.
+	static int schedd_token_request(int, Stream *stream);
+
 
 	// A get method to support SOAP
 	static CollectorEngine & getCollector( void ) { return collector; };
@@ -138,22 +141,52 @@ public:
 
     static OfflineCollectorPlugin offline_plugin_;
 
+	static const int HandleQueryInProcNever = 0x0000;
+	static const int HandleQueryInProcSmallTable = 0x0001;
+	static const int HandleQueryInProcSmallQuery = 0x0002;
+	static const int HandleQueryInProcSmallTableAndQuery = 0x0003;
+	static const int HandleQueryInProcSmallTableOrQuery = 0x0004;
+	static const int HandleQueryInProcAlways = 0xFFFF;
+
+	typedef struct pending_query_entry {
+		ClassAd *cad;
+		Stream *sock;
+		AdTypes whichAds;
+		bool is_locate;
+		char subsys[15];
+	} pending_query_entry_t;
+
+	static std::queue<pending_query_entry_t *> query_queue_high_prio;
+	static std::queue<pending_query_entry_t *> query_queue_low_prio;
+	static int ReaperId;
+	static int QueryReaper(int pid, int exit_status);
+	static int max_query_workers;  // from config file
+	static int max_pending_query_workers;  // from config file
+	static int max_query_worktime;  // from config file
+	static int reserved_for_highprio_query_workers; // from config file
+	static int active_query_workers;
+	static int pending_query_workers;
+
+#ifdef TRACK_QUERIES_BY_SUBSYS
+	static bool want_track_queries_by_subsys;
+#endif
+
+
 protected:
 	static CollectorStats collectorStats;
 	static CollectorEngine collector;
 	static Timeslice view_sock_timeslice;
     static std::vector<vc_entry> vc_list;
 
+	static int HandleQueryInProcPolicy;	// one of above HandleQueryInProc* constants
 	static int ClientTimeout;
 	static int QueryTimeout;
 	static char* CollectorName;
 
-	static ClassAd query_any_request;
-	static ClassAd *query_any_result;
-
 	static ClassAd* __query__;
 	static List<ClassAd>* __ClassAdResultList__;
 	static int __numAds__;
+	static int __resultLimit__;
 	static int __failed__;
 	static std::string __adType__;
 	static ExprTree *__filter__;
@@ -161,24 +194,24 @@ protected:
 	static TrackTotals* normalTotals;
 	static int submittorRunningJobs;
 	static int submittorIdleJobs;
+	static int submittorNumAds;
 
 	static int machinesTotal,machinesUnclaimed,machinesClaimed,machinesOwner;
+	static int startdNumAds;
 
 	static CollectorUniverseStats ustatsAccum;
 	static CollectorUniverseStats ustatsMonthly;
 
 	static ClassAd *ad;
-	static CollectorList* updateCollectors;
-	static DCCollector* updateRemoteCollector;
+	static CollectorList* collectorsToUpdate;
 	static int UpdateTimerId;
-
-	static ForkWork forkQuery;
 
 	static int stashSocket( ReliSock* sock );
 
 	static class CCBServer *m_ccb_server;
 
 	static bool filterAbsentAds;
+	static bool forwardClaimedPrivateAds;
 
 private:
 

@@ -212,7 +212,7 @@ ReadCheckPointFile(){
 	      string name="Time";
 	      cla->EvaluateAttrString(name,buf);
 	      
-	      int i_p=buf.find(".");
+	      size_t i_p=buf.find(".");
 	      string sec=buf.substr(0,i_p);
 	      string usec=buf.substr(i_p+1,buf.size()-i_p);
 	      
@@ -247,7 +247,7 @@ OperateInRecoveryMode( ClassAd *logRec )
 	    string buf;
 	    logRec->EvaluateAttrString("Time",buf);
 	    
-	    int i_p=buf.find(".");
+	    size_t i_p=buf.find(".");
 	    string sec=buf.substr(0,i_p);
 	    string usec=buf.substr(i_p+1,buf.size()-i_p);
 	    long temp_sec=atol(sec.c_str());
@@ -272,6 +272,7 @@ OperateInRecoveryMode( ClassAd *logRec )
 		}
 	    ClassAdParser local_parser;
 		ClassAd *cla=local_parser.ParseClassAd(oneentry,true);
+		SAL_assume(cla != NULL)
 		ClassAd *content = (ClassAd*)(cla->Lookup("Ad"));
 		if( !viewTree.ClassAdInserted( this, key, content ) ) {
 		  CondorErrMsg += "; could not insert classad";
@@ -1587,6 +1588,7 @@ LogState( FILE *fp )
 			}
 			ClassAdParser local_parser;
 			ClassAd *cla=local_parser.ParseClassAd(cla_s,true);
+			if ( ! cla) { CLASSAD_EXCEPT("parser failed to allocate an ad"); }
 			if (!cla->InsertAttr("OpType", ClassAdCollOp_AddClassAd )) {
 				CondorErrMsg += "; failed to log state";
 				return( false );
@@ -1955,7 +1957,7 @@ GetStringClassAd(string key, string &ad){
 	 classad.InsertAttr( "Key", key );
 	 if( ( itr = classadTable.find( key ) ) != classadTable.end( ) ) {
 	   newad=(ClassAd *) ((itr->second).ad)->Copy();
-	   classad.Insert("Ad", newad, false);
+	   classad.Insert("Ad", newad);
 	 }else{
 	   return false;
 	 };

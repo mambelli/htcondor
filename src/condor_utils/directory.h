@@ -131,8 +131,10 @@ public:
 	/** Get the size of all the files and all the files in all subdirectories,
 		starting with the directory specified by the constructor.
 		@return the size of bytes (if we receive an error trying to determine
-		the size of any file, we consider that file to have a size of zero). */
-	filesize_t GetDirectorySize();
+		the size of any file, we consider that file to have a size of zero). 
+		we optionally return the number of files+dirs also
+		*/
+	filesize_t GetDirectorySize(size_t * number_of_entries=NULL);
 
 	/** Get full path name to the current file.  If there is no current file,
 		return NULL.
@@ -240,8 +242,12 @@ private:
 	bool rmdirAttempt( const char* path, priv_state priv );
 
 #ifdef WIN32
-	long dirp;
+	LONG_PTR dirp;
+#ifdef _M_X64
+	struct _finddatai64_t filedata;
+#else
 	struct _finddata_t filedata;
+#endif
 #else
 	condor_DIR *dirp;
 	priv_state setOwnerPriv( const char* path, si_error_t &err );
@@ -332,6 +338,7 @@ bool recursive_chown( const char *path,
 	will be set to EEXIST in that case.
  */
 bool mkdir_and_parents_if_needed( const char *path, mode_t mode, priv_state priv = PRIV_UNKNOWN );
+bool mkdir_and_parents_if_needed( const char *path, mode_t mode, mode_t parent_mode, priv_state priv = PRIV_UNKNOWN );
 
 /** Create parent directories of a path if they do not exist.
     If the parent directory already exists, it is left as is

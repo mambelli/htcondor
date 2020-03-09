@@ -58,10 +58,10 @@ static int Create_Thread_With_Data_Start(void * data, Stream *)
 	return tmp->worker(tmp->data_n1, tmp->data_n2, tmp->data_vp);
 }
 
-static HashTable<int, Create_Thread_With_Data_Data *> tid_to_data(10, hashFuncInt, rejectDuplicateKeys);
+static HashTable<int, Create_Thread_With_Data_Data *> tid_to_data(hashFuncInt);
 
 /// Support function for Create_Thread_With_Data
-static int Create_Thread_With_Data_Reaper(Service *, int tid, int exit_status)
+static int Create_Thread_With_Data_Reaper(int tid, int exit_status)
 {
 	Create_Thread_With_Data_Data * tmp = 0;
 	if( tid_to_data.lookup(tid, tmp) != 0 )

@@ -22,7 +22,6 @@
 #include <limits.h>
 #include <string.h>
 #include "condor_debug.h"
-#include "condor_string.h"
 #include "condor_daemon_core.h"
 #include "condor_cron_job.h"
 #include "condor_cron_job_io.h"
@@ -55,12 +54,16 @@ CronJobOut::Output( const char *buf, int len )
 
 	// Check for record delimitter
 	if ( '-' == buf[0] ) {
+		if (buf[1]) {
+			m_q_sep = &buf[1];
+			m_q_sep.trim();
+		}
 		return 1;
 	}
 
 	// Build up the string
 	const char	*prefix = m_job.GetPrefix( );
-	int		fulllen = len;
+	size_t fulllen = len;
 	if ( prefix ) {
 		fulllen += strlen( prefix );
 	}
@@ -68,7 +71,7 @@ CronJobOut::Output( const char *buf, int len )
 	if ( NULL == line ) {
 		dprintf( D_ALWAYS,
 				 "cronjob: Unable to duplicate %d bytes\n",
-				 fulllen );
+				 (int)fulllen );
 		return -1;
 	}
 	if ( prefix ) {
@@ -79,7 +82,7 @@ CronJobOut::Output( const char *buf, int len )
 	strcat( line, buf );
 
 	// Queue it up, get out
-	m_lineq.enqueue( line );
+	m_lineq.push( line );
 
 	// Done
 	return 0;
@@ -89,20 +92,21 @@ CronJobOut::Output( const char *buf, int len )
 int
 CronJobOut::GetQueueSize( void )
 {
-	return m_lineq.Length( );
+	return m_lineq.size( );
 }
 
 // Flush the queue
 int
 CronJobOut::FlushQueue( void )
 {
-	int		size = m_lineq.Length( );
-	char	*line;
+	int		size = m_lineq.size( );
 
 	// Flush out the queue
-	while( ! m_lineq.dequeue( line ) ) {
-		free( line );
+	while( m_lineq.size() ) {
+		free( m_lineq.front() );
+		m_lineq.pop();
 	}
+	m_q_sep.clear();
 
 	// Return the size
 	return size;
@@ -114,9 +118,12 @@ CronJobOut::GetLineFromQueue( void )
 {
 	char	*line;
 
-	if ( ! m_lineq.dequeue( line ) ) {
+	if ( m_lineq.size() ) {
+		line = m_lineq.front();
+		m_lineq.pop();
 		return line;
 	} else {
+		m_q_sep.clear();
 		return NULL;
 	}
 }

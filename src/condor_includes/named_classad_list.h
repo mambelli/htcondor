@@ -29,7 +29,7 @@ class NamedClassAdList
 {
   public:
 	NamedClassAdList( void );
-	~NamedClassAdList( void );
+	virtual ~NamedClassAdList( void );
 
 	NamedClassAd *Find( const char *name );
 	NamedClassAd *Find( NamedClassAd &ad ) {
@@ -45,6 +45,7 @@ class NamedClassAdList
 	int	Publish( ClassAd *ad );
 
   protected:
+	virtual NamedClassAd * New( const char *name, ClassAd *ad = NULL ) { return new NamedClassAd(name, ad); }
 	std::list<NamedClassAd*>		m_ads;
 
 };

@@ -21,7 +21,6 @@
 #include "condor_common.h"
 #include "condor_config.h"
 #include "condor_debug.h"
-#include "condor_string.h"
 #include "condor_attributes.h"
 #include "condor_email.h"
 #include "condor_classad.h"
@@ -410,7 +409,8 @@ JICLocalSchedd::notifyJobExit( int, int reason,
 		}
 
 			// Now that we've logged the event, we can update the job queue
-		if ( !this->job_updater->updateJob( up_type ) ) { 
+			// If we're doing a fast shutdown, don't retry on failure.
+		if ( !this->job_updater->updateJob( up_type ) && !fast_exit ) {
 			dprintf( D_ALWAYS,
 			         "Failed to update job queue - attempting to retry.\n" );
 			retryJobCleanup();
@@ -494,15 +494,13 @@ JICLocalSchedd::getUniverse( void )
 bool
 JICLocalSchedd::initLocalUserLog( void )
 {
-	bool ret = u_log->initFromJobAd( job_ad, ATTR_ULOG_FILE,
-								 ATTR_ULOG_USE_XML );
+	bool ret = u_log->initFromJobAd( job_ad, false );
 	if( ! ret ) {
 		job_ad->Assign( ATTR_HOLD_REASON, "Failed to initialize user log");
 		job_ad->Assign( ATTR_HOLD_REASON_CODE, CONDOR_HOLD_CODE_UnableToInitUserLog );
 		job_ad->Assign( ATTR_HOLD_REASON_SUBCODE, 0 );
 		job_updater->updateJob(U_HOLD);
-		Starter->FinalCleanup();
-		DC_Exit(JOB_SHOULD_HOLD);
+		Starter->StarterExit(JOB_SHOULD_HOLD);
 	}
 	return true;
 }
@@ -533,13 +531,12 @@ JICLocalSchedd::retryJobCleanup( void )
 }
 
 
-int
+void
 JICLocalSchedd::retryJobCleanupHandler( void )
 {
     m_cleanup_retry_tid = -1;
     dprintf(D_ALWAYS, "Retrying job cleanup, calling allJobsDone()\n");
     Starter->allJobsDone();
-    return TRUE;
 }
 
 bool

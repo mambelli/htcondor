@@ -81,16 +81,11 @@ my @minimal_build_configure_args =
 	(
 	 '-DPROPER:BOOL'			 => 'OFF',
 	 '-D_VERBOSE:BOOL'			  => 'ON',
-	 '-DCLIPPED:BOOL'			  => 'ON',
 	 '-DWITH_BLAHP:BOOL'		 => 'OFF',
-	 '-DWITH_COREDUMPER:BOOL'	 => 'OFF',
 	 '-DWITH_CREAM:BOOL'		 => 'OFF',
 	 '-DWITH_DRMAA:BOOL'		 => 'OFF',
 	 '-DWITH_GLOBUS:BOOL'		 => 'OFF',
-	 '-DWITH_GSOAP:BOOL'		 => 'OFF',
 	 '-DWITH_HADOOP:BOOL'		 => 'OFF',
-	 '-DWITH_KRB5:BOOL'			 => 'OFF',
-	 '-DWITH_LIBDELTACLOUD:BOOL' => 'OFF',
 	 '-DWITH_LIBVIRT:BOOL'		 => 'OFF',
 	 '-DWITH_LIBXML2:BOOL'		 => 'OFF',
 	 '-DWITH_UNICOREGAHP:BOOL'	 => 'OFF',
@@ -203,7 +198,7 @@ our %submit_info = (
 		'build' => {
 			'configure_args' => { 
 			  '-DCMAKE_SUPPRESS_REGENERATION:BOOL' => 'TRUE', # because the windows VM doesn't keep time very well.
-            },
+		},
 			'prereqs'	=> undef,
 			'xtests'	=> undef,
 		},
@@ -216,6 +211,7 @@ our %submit_info = (
 	},
 	
 	'x86_64_Windows8'   => 'x86_64_Windows7',
+	'x86_64_Windows10'  => 'x86_64_Windows7',
 	'x86_WindowsXP'		=> 'x86_64_Windows7',
 	'x86_64_winnt_6.1'	=> 'x86_64_Windows7',
 	'x86_winnt_5.1'		=> 'x86_64_Windows7',
@@ -225,9 +221,7 @@ our %submit_info = (
 	##########################################################################
 	'x86_64_Debian5'	=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [],
 			'xtests'	=> [],
 		},
@@ -246,9 +240,7 @@ our %submit_info = (
 	##########################################################################
 	'x86_64_Debian6'	=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ ],
 			'xtests'	=>	undef,
 		},
@@ -266,9 +258,26 @@ our %submit_info = (
 	##########################################################################
 	'x86_64_Debian7'	=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
+			'prereqs'	=> [ ],
+			'xtests'	=>	undef,
+		},
+
+		'test' => {
+			'configure_args' => { @default_test_configure_args },
+			'prereqs'	=> [ ],
+			'testclass' => [ @default_testclass ],
+		},
+	},
+
+	'x86_64_Debian8'	=> 'x86_64_Debian7',
+
+	##########################################################################
+	# Platform DEB 9 on x86_64
+	##########################################################################
+	'x86_64_Debian9'	=> {
+		'build' => {
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ ],
 			'xtests'	=>	undef,
 		},
@@ -285,11 +294,29 @@ our %submit_info = (
 	##########################################################################
 	'x86_64_RedHat7'	=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ ],
 			'xtests'	=>	undef,
+		},
+
+		'test' => {
+			'configure_args' => { @default_test_configure_args },
+			'prereqs'	=> [ ],
+			'testclass' => [ @default_testclass ],
+		},
+	},
+
+	'x86_64_CentOS7'	=> 'x86_64_RedHat7',
+	'x86_64_SL7'		=> 'x86_64_RedHat7',
+
+	# 32 bit CentOS 7
+	'x86_CentOS7'		=> {
+		'build' => {
+			'configure_args' => { @minimal_build_configure_args,
+                '-DWITH_PYTHON_BINDINGS:BOOL' => 'OFF',
+            },
+			'prereqs'	=> [ ],
+			'xtests'	=> undef,
 		},
 
 		'test' => {
@@ -304,9 +331,7 @@ our %submit_info = (
 	##########################################################################
 	'x86_64_RedHat6'	=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-				'-DCLIPPED:BOOL' => 'OFF',
-			 },
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ @default_prereqs ],
 			'xtests'	=> ['x86_64_SL6'],
 		},
@@ -339,9 +364,7 @@ our %submit_info = (
 	# RedHat5
 	'x86_64_RedHat5'		=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ @default_prereqs ],
 			'xtests'	=> [ ],
 		},
@@ -360,7 +383,7 @@ our %submit_info = (
 	# 32 bit RedHat 6
 	'x86_RedHat6'		=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args	},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ @default_prereqs ],
 			'xtests'	=> [ ],
 		},
@@ -383,9 +406,7 @@ our %submit_info = (
 	# 32 bit RedHat 5
 	'x86_RedHat5'		=> {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ @default_prereqs ],
 			'xtests'	=> [ ],
 		},
@@ -403,9 +424,7 @@ our %submit_info = (
 	# 32 bit SL 5
 	'x86_SL5' => {
 		'build' => {
-			'configure_args' => { @default_build_configure_args,
-								  '-DCLIPPED:BOOL' => 'OFF',
-			},
+			'configure_args' => { @default_build_configure_args },
 			'prereqs'	=> [ ],
 			'xtests'	=> undef,
 		},
@@ -445,6 +464,8 @@ our %submit_info = (
 	'x86_64_MacOSX7',	=> 'x86_64_MacOSX',
 	'x86_64_MacOSX8',	=> 'x86_64_MacOSX',
 	'x86_64_MacOSX9',	=> 'x86_64_MacOSX',
+	'x86_64_MacOSX10',	=> 'x86_64_MacOSX',
+	'x86_64_MacOSX13',	=> 'x86_64_MacOSX',
 
 	#
 	# The SWAMP platforms.
@@ -478,8 +499,7 @@ our %submit_info = (
 	##########################################################################
 	'x86_64_Fedora'	=> {
 		'build' => {
-			'configure_args' => { @minimal_build_configure_args,
-			},
+			'configure_args' => { @minimal_build_configure_args },
 			'prereqs'	=> [ @default_prereqs ],
 			'xtests'	=> undef,
 		},
@@ -498,6 +518,10 @@ our %submit_info = (
 	'x86_64_Fedora20'				=> 'x86_64_Fedora',
 	'x86_64_Fedora21'				=> 'x86_64_Fedora',
 	'x86_64_Fedora22'				=> 'x86_64_Fedora',
+	'x86_64_Fedora23'				=> 'x86_64_Fedora',
+	'x86_64_Fedora24'				=> 'x86_64_Fedora',
+	'x86_64_Fedora25'				=> 'x86_64_Fedora',
+	'x86_64_Fedora27'				=> 'x86_64_Fedora',
 	
 	'x86_64_fedora_15'				=> 'x86_64_Fedora',
 	'x86_64_fedora_16'				=> 'x86_64_Fedora',
@@ -507,6 +531,12 @@ our %submit_info = (
 	'x86_64_fedora_20'				=> 'x86_64_Fedora',
 	'x86_64_fedora_21'				=> 'x86_64_Fedora',
 	'x86_64_fedora_22'				=> 'x86_64_Fedora',
+	'x86_64_fedora_23'				=> 'x86_64_Fedora',
+	'x86_64_fedora_24'				=> 'x86_64_Fedora',
+	'x86_64_fedora_25'				=> 'x86_64_Fedora',
+	'x86_64_fedora_27'				=> 'x86_64_Fedora',
+	'x86_64_fedora_28'				=> 'x86_64_Fedora',
+
 
 	##########################################################################
 	# Platform Solaris 11 on x86_64
@@ -520,11 +550,8 @@ our %submit_info = (
 			# we can use ssh_to_job on solaris if we use the proper kerberose
 			# this is OK since we build kerberose only for batlab.
 			'configure_args' => { @default_build_configure_args,
-								  '-DWITH_KRB5:BOOL' => 'OFF',
-								  '-DWITH_GSOAP:BOOL' => 'OFF', 
 								  '-DWITH_CURL:BOOL' => 'OFF',
 								  #'-DHAVE_SSH_TO_JOB:BOOL' => 'OFF',
-								  #'-DWITHOUT_SOAP_TEST:BOOL' => 'ON',
 			},
 			'prereqs'	=> [],
 			'xtests'	=> undef,
@@ -574,7 +601,7 @@ our %submit_info = (
 		},
 	},
 	'x86_64_ubuntu_10.04.4' => 'x86_64_Ubuntu10',
-	
+
 	'x86_64_Ubuntu12' => {
 		'build' => {
 			'configure_args' => { @default_build_configure_args },
@@ -589,19 +616,56 @@ our %submit_info = (
 		},
 	},
 
-	# This should work.
-	'x86_64_Ubuntu14'						=> 'x86_64_Ubuntu12',
+	'x86_64_Ubuntu14'	=> {
+		'build' => {
+			'configure_args' => { @default_build_configure_args },
+			'prereqs'	=> [ @default_prereqs ],
+		},
+
+		'test' => {
+			'configure_args' => { @default_test_configure_args },
+			'prereqs'	=> [ @default_prereqs ],
+			'testclass'	=> [ @default_testclass ],
+		},
+	},
+
+	'x86_64_Ubuntu16'	=> {
+		'build' => {
+			'configure_args' => { @default_build_configure_args },
+			'prereqs'	=> [ @default_prereqs ],
+		},
+
+		'test' => {
+			'configure_args' => { @default_test_configure_args },
+			'prereqs'	=> [ @default_prereqs ],
+			'testclass'	=> [ @default_testclass ],
+		},
+	},
+
+	'x86_64_Ubuntu18'	=> {
+		'build' => {
+			'configure_args' => { @default_build_configure_args,
+								  '-DWITH_CREAM:BOOL' => 'OFF',
+			},
+			'prereqs'	=> [ @default_prereqs ],
+		},
+
+		'test' => {
+			'configure_args' => { @default_test_configure_args },
+			'prereqs'	=> [ @default_prereqs ],
+			'testclass'	=> [ @default_testclass ],
+		},
+	},
 
 	# Add the SWAMP's (temporary) platform name
-	'swamp:ubuntu-12.04-64'	=> 'x86_64_Ubuntu12',
-	
+	'swamp:ubuntu-12.04-64'					=> 'x86_64_Ubuntu12',
+
 	##########################################################################
 	# Platform openSUSE
 	##########################################################################
 	'x86_64_OpenSUSE11'				=> {
 		'build' => {
 			'configure_args' => { @minimal_build_configure_args,
-								  '-DWITHOUT_SOAP_TEST:BOOL' => 'ON',
 								  '-DWITH_CURL:BOOL' => 'ON',
 								  '-DWITH_LIBVIRT:BOOL' => 'ON',
 								  '-DWITH_LIBXML2:BOOL' => 'ON',
@@ -628,7 +692,6 @@ our %submit_info = (
 	'x86_FreeBSD7'		=> {
 		'build' => {
 			'configure_args' => { @minimal_build_configure_args,
-				'-DWITHOUT_SOAP_TEST:BOOL=ON' => undef,
 				'-DENABLE_JAVA_TESTS:BOOL=OFF' => undef,
 				'-DWITH_CURL:BOOL=OFF' => undef,
 				'-DWITH_LIBVIRT:BOOL=OFF' => undef,
@@ -652,7 +715,6 @@ our %submit_info = (
 	'x86_FreeBSD8'			=> {
 		'build' => {
 			'configure_args' => { @minimal_build_configure_args,
-				'-DWITHOUT_SOAP_TEST:BOOL=ON' => undef,
 				'-DENABLE_JAVA_TESTS:BOOL=OFF' => undef,
 				'-DWITH_CURL:BOOL=OFF' => undef,
 				'-DWITH_LIBVIRT:BOOL=OFF' => undef,

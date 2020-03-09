@@ -156,7 +156,8 @@ void setBaseName(const char *baseName) {
 		if (searchLogName)
 			free(searchLogName);
 		searchLogName = (char *)malloc(strlen(logBaseName)+3);
-		sprintf(searchLogName, "%s.*", (const char*)logBaseName); 		
+		ASSERT(searchLogName);
+		sprintf(searchLogName, "%s.*", (const char*)logBaseName);
 #endif
 		isInitialized = 1;
 	}
@@ -215,6 +216,8 @@ int cleanUpOldLogFiles(int maxNum) {
 			case a config change took place. */
 	if (maxNum > 0 ) {
 		oldFile = findOldest(baseDirName, &count);
+		int initial_count = count;
+		int delete_attempts = 0;
 		while (count > maxNum) {
 			(void)sprintf( empty, "%s.old", logBaseName );
 			// catch the exception that the file name pattern is disturbed by external influence
@@ -225,6 +228,14 @@ int cleanUpOldLogFiles(int maxNum) {
 			}
 			free(oldFile);
 			oldFile = findOldest(baseDirName, &count);
+
+			// in case we fail to clean up old files, keep track of the number of deletion attempts
+			// and don't try and delete more files than we initially thought there were.
+			delete_attempts += 1;
+			if (delete_attempts > MIN(initial_count, 10)) {
+				dprintf(D_ALWAYS | D_FAILURE, "Giving up on rotation cleanup of old files after %d attempts. Something is very wrong!\n", delete_attempts);
+				break;
+			}
 		}
 	}
 	if (oldFile != NULL) {
@@ -293,12 +304,16 @@ int file_select(const struct dirent *entry) {
 
 
 char *findOldest(char *dirName, int *count) {
-	struct dirent **files;
+	struct dirent **files = NULL;
 	int  len;
 	*count = scandirectory(dirName, &files, file_select, doalphasort);
 	// no matching files in the directory
-	if (*count <= 0)
+	if (*count <= 0) {
+		if (files) {
+			free(files);
+		}
 		return NULL;
+	}
 	char *oldFile = (char*)files[0]->d_name;
 	len = strlen(oldFile);
 	char *result = (char*)malloc(len+1 + strlen(dirName) + 1);
@@ -339,11 +354,11 @@ char *findOldest(char *dirName, int *count) {
 		if ( ! oldFile) {
 			oldFile = (char*)malloc(strlen(logBaseName) + 2 + MAX_ISO_TIMESTAMP);
 			ASSERT( oldFile );
-			strcpy(oldFile, ffd.cFileName);
+			sprintf(oldFile, "%s%c%s", dirName, DIR_DELIM_CHAR, ffd.cFileName);
 		} else {
 			int cch = strlen(ffd.cFileName);
 			if (cch > cchBase && strcmp(ffd.cFileName+cchBase, oldFile+cchBase) < 0) {
-				strcpy(oldFile, ffd.cFileName);
+				sprintf(oldFile, "%s%c%s", dirName, DIR_DELIM_CHAR, ffd.cFileName);
 			}
 		}
 	}

@@ -36,6 +36,9 @@ int findRmKillSig( ClassAd* ad );
 // same as findSoftKillSig(), but for ATTR_HOLD_KILL_SIG
 int findHoldKillSig( ClassAd* ad );
 
+// same as findSoftKillSig(), but for ATTR_CHECKPOINT_SIG
+int findCheckpointSig( ClassAd* ad );
+
 // Based on info in the ClassAd and the given exit reason, construct
 // the appropriate string describing the fate of the job...
 bool printExitString( ClassAd* ad, int exit_reason, MyString &str );
@@ -57,21 +60,26 @@ int cleanStringForUseAsAttr(MyString &str, char chReplace=0, bool compact=true);
 // owner, universe, and cmd are the only attributes that require an
 // explicit value. If NULL is passed for owner, the attribute is explicitly
 // set to Undefined, which tells the schedd to fill in the attribute. This
-// feature is only used by the soap interface currently.
+// feature is only used by the python bindings currently.
 // The caller is responible for calling 'delete' on the returned ClassAd.
 ClassAd *CreateJobAd( const char *owner, int universe, const char *cmd );
 
-/*
-	This function tells the caller if a UserLog object should be
-	constructed or not, and if so, says where the user wants the user
-	log file to go. The difference between this function and simply
-	doing a LookupString() on ATTR_ULOG_FILE is that A) the result is
-	combined with IWD if necessary to form an absolute path, and B) if
-	EVENT_LOG is defined in the condor_config file, then the result
-	will be /dev/null even if ATTR_ULOG_FILE is not defined (since we
-	still want a UserLog object in this case so the global event log
-	is updated). Return function is true if ATTR_ULOG_FILE is found or
-	if EVENT_LOG is defined, else false.
-*/
-bool getPathToUserLog(ClassAd *job_ad, MyString &result,
-					   const char* ulog_path_attr = ATTR_ULOG_FILE);
+// tokenize the input string, and insert tokens into the attrs set
+bool add_attrs_from_string_tokens(classad::References & attrs, const char * str, const char * delims=NULL);
+inline bool add_attrs_from_string_tokens(classad::References & attrs, const std::string & str, const char * delims=NULL) {
+	if (str.empty()) return false;
+	return add_attrs_from_string_tokens(attrs, str.c_str(), delims);
+}
+
+// copy string list items into an attribute set
+void add_attrs_from_StringList(classad::References & attrs, const StringList & list);
+
+// print attributes to a std::string, returning the result as a const char *
+const char *print_attrs(std::string &out, bool append, const classad::References & attrs, const char * delim);
+
+// copy attrs into stringlist, returns true if list was modified
+// if append is false, list is cleared first.
+// if check_exist is true, items are only added if the are not already in the list. comparison is case-insensitive.
+bool initStringListFromAttrs(StringList & list, bool append, const classad::References & attrs, bool check_exist=false);
+
+

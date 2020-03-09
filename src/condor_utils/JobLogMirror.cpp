@@ -56,7 +56,7 @@ JobLogMirror::config() {
 		spool = param("SPOOL");
 	}
 	if(!spool) {
-		EXCEPT("No SPOOL defined in config file.\n");
+		EXCEPT("No SPOOL defined in config file.");
 	}
 	else {
 		std::string job_log_fname(spool);
@@ -80,6 +80,12 @@ JobLogMirror::config() {
 		log_reader_polling_period,
 		(TimerHandlercpp)&JobLogMirror::TimerHandler_JobLogPolling, 
 		"JobLogMirror::TimerHandler_JobLogPolling", this);
+}
+
+void
+JobLogMirror::poll()
+{
+	TimerHandler_JobLogPolling();
 }
 
 void

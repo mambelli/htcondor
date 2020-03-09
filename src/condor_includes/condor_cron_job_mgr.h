@@ -90,10 +90,9 @@ class CronJobMgr : public Service
 	int					 m_schedule_timer;	// DaemonCore timerID
 
 	// Private member functions
-	int ScheduleJobsTimer( void );
+	void ScheduleJobsFromTimer();
 	int DoConfig( bool initial = false );
 	int ParseJobList( const char *JobListString );
-	int ParseOldJobList( const char *JobListString );
 	char *NextTok( char *cur, const char *tok );
 	char *GetParamName( const char	*paramName1,
 						const char	*paramName2 = NULL );

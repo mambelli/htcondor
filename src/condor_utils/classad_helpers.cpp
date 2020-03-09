@@ -30,7 +30,7 @@
 #include "enum_utils.h"
 #include "condor_adtypes.h"
 #include "condor_config.h"
-#include "filename_tools.h"
+#include "basename.h"
 #include "proc.h"
 #include "condor_version.h"
 
@@ -59,7 +59,7 @@ int cleanStringForUseAsAttr(MyString &str, char chReplace/*=0*/, bool compact/*=
       char ch = str[ii];
       if (ch == '_' || (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
          continue;
-      str.setChar(ii,chReplace);
+      str.setAt(ii,chReplace);
       }
 
    // if compact, convert runs of chReplace with a single instance,
@@ -90,13 +90,13 @@ findSignal( ClassAd* ad, const char* attr_name )
 	if( ! ad ) {
 		return -1;
 	}
-	MyString name;
+	std::string name;
 	int signal;
 
 	if ( ad->LookupInteger( attr_name, signal ) ) {
 		return signal;
 	} else if ( ad->LookupString( attr_name, name ) ) {
-		return signalNumber( name.Value() );
+		return signalNumber( name.c_str() );
 	} else {
 		return -1;
 	}
@@ -123,6 +123,11 @@ findHoldKillSig( ClassAd* ad )
 	return findSignal( ad, ATTR_HOLD_KILL_SIG );
 }
 
+int
+findCheckpointSig( ClassAd* ad )
+{
+	return findSignal( ad, ATTR_CHECKPOINT_SIG );
+}
 
 bool
 printExitString( ClassAd* ad, int exit_reason, MyString &str )
@@ -160,7 +165,7 @@ printExitString( ClassAd* ad, int exit_reason, MyString &str )
 
 	default:
 		str += "has a strange exit reason code of ";
-		str += exit_reason;
+		str += IntToStr( exit_reason );
 		return true;
 		break;
 
@@ -171,17 +176,14 @@ printExitString( ClassAd* ad, int exit_reason, MyString &str )
 		// a bunch of info out of the ClassAd to finish our task...
 
 	int int_value;
+	bool bool_value;
 	bool exited_by_signal = false;
 	int exit_value = -1;
 
 		// first grab everything from the ad we must have for this to
 		// work at all...
-	if( ad->LookupBool(ATTR_ON_EXIT_BY_SIGNAL, int_value) ) {
-		if( int_value ) {
-			exited_by_signal = true;
-		} else {
-			exited_by_signal = false;
-		}
+	if( ad->LookupBool(ATTR_ON_EXIT_BY_SIGNAL, bool_value) ) {
+		exited_by_signal = bool_value;
 	} else {
 		dprintf( D_ALWAYS, "ERROR in printExitString: %s not found in ad\n",
 				 ATTR_ON_EXIT_BY_SIGNAL );
@@ -224,12 +226,12 @@ printExitString( ClassAd* ad, int exit_reason, MyString &str )
 				str += reason_str;
 			} else {
 				str += "died on signal ";
-				str += exit_value;
+				str += IntToStr( exit_value );
 			}
 		}
 	} else {
 		str += "exited normally with status ";
-		str += exit_value;
+		str += IntToStr( exit_value );
 	}
 
 	if( ename ) {
@@ -277,6 +279,7 @@ ClassAd *CreateJobAd( const char *owner, int universe, const char *cmd )
 
 	job_ad->Assign( ATTR_NUM_CKPTS, 0 );
 	job_ad->Assign( ATTR_NUM_JOB_STARTS, 0 );
+	job_ad->Assign( ATTR_NUM_JOB_COMPLETIONS, 0 );
 	job_ad->Assign( ATTR_NUM_RESTARTS, 0 );
 	job_ad->Assign( ATTR_NUM_SYSTEM_HOLDS, 0 );
 	job_ad->Assign( ATTR_JOB_COMMITTED_TIME, 0 );
@@ -367,35 +370,65 @@ ClassAd *CreateJobAd( const char *owner, int universe, const char *cmd )
 	return job_ad;
 }
 
-bool getPathToUserLog(ClassAd *job_ad, MyString &result,
-					   const char* ulog_path_attr = ATTR_ULOG_FILE)
+// tokenize the input string, and insert tokens into the attrs set
+bool add_attrs_from_string_tokens(classad::References & attrs, const char * str, const char * delims=NULL)
 {
-	bool ret_val = true;
-	char *global_log = NULL;
-
-	if ( job_ad == NULL || 
-	     job_ad->LookupString(ulog_path_attr,result) == 0 ) 
-	{
-		// failed to find attribute, check config file
-		global_log = param("EVENT_LOG");
-		if ( global_log ) {
-			// canonicalize to UNIX_NULL_FILE even on Win32
-			result = UNIX_NULL_FILE;
-		} else {
-			ret_val = false;
-		}
+	if (str && str[0]) {
+		StringTokenIterator it(str, 40, delims ? delims : ", \t\r\n");
+		const std::string * attr;
+		while ((attr = it.next_string())) { attrs.insert(*attr); }
+		return true;
 	}
-
-	if ( global_log ) free(global_log);
-
-	if( ret_val && is_relative_to_cwd(result.Value()) ) {
-		MyString iwd;
-		if( job_ad && job_ad->LookupString(ATTR_JOB_IWD,iwd) ) {
-			iwd += "/";
-			iwd += result;
-			result = iwd;
-		}
-	}
-
-	return ret_val;
+	return false;
 }
+
+void add_attrs_from_StringList(const StringList & list, classad::References & attrs)
+{
+	StringList &constList = const_cast<StringList &>(list);
+	for (const char * p = constList.first(); p != NULL; p = constList.next()) {
+		attrs.insert(p);
+	}
+}
+
+// print attributes to a std::string, returning the result as a const char *
+const char *print_attrs(std::string &out, bool append, const classad::References & attrs, const char * delim)
+{
+	if ( ! append) { out.clear(); }
+	size_t start = out.size();
+
+	int cchAttr = 24; // assume 24ish characters per attribute.
+	if (delim) cchAttr += strlen(delim);
+	out.reserve(out.size() + (attrs.size()*cchAttr));
+
+	for (classad::References::const_iterator it = attrs.begin(); it != attrs.end(); ++it) {
+		if (delim && (out.size() > start)) out += delim;
+		out += *it;
+	}
+	return out.c_str();
+}
+
+// copy attrs into stringlist, returns true if list was modified
+// if append is false, list is cleared first.
+// if check_exist is true, items are only added if the are not already in the list. comparison is case-insensitive.
+bool initStringListFromAttrs(StringList & list, bool append, const classad::References & attrs, bool check_exist /*=false*/)
+{
+	bool modified = false;
+	if ( ! append) {
+		if ( ! list.isEmpty()) {
+			modified = true;
+			list.clearAll();
+		}
+		check_exist = false; // no need to do this if we cleared the list
+	}
+	for (classad::References::const_iterator it = attrs.begin(); it != attrs.end(); ++it) {
+		if (check_exist && list.contains_anycase(it->c_str())) {
+			continue;
+		}
+		list.append(it->c_str());
+		modified = true;
+	}
+	return modified;
+}
+
+
+

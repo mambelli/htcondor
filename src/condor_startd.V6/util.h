@@ -28,10 +28,13 @@ class Resource;
 class StringList;
 
 // Our utilities 
-void	cleanup_execute_dir(int pid, char const *exec_path);
+void	cleanup_execute_dir(int pid, char const *exec_path, bool remove_exec_subdir=false);
 void	cleanup_execute_dirs( StringList &list );
 void	check_execute_dir_perms( StringList &list );
+#if defined( DEPRECATED_SOCKET_CALLS )
 int 	create_port( ReliSock* );
+#endif /* DEPRECATED_SOCKET_CALLS */
+
 bool	reply( Stream*, int );
 bool	refuse( Stream* );
 bool	caInsert( ClassAd* target, ClassAd* source, const char* attr,
@@ -42,5 +45,69 @@ bool	configInsert( ClassAd* ad, const char* param_name,
 Resource* stream_to_rip( Stream*, ClassAd * pad=NULL );
 
 VacateType getVacateType( ClassAd* ad );
+
+// This class holds the names of things that still need to be cleaned up because we failed
+// to clean the the first time around. This happens mostly on Windows with execute directories
+// because of antivirus software holding the directory or some files within it open.
+// we will put instances of this class into a map and leave them there until we are able
+// to finally clean them up.
+//
+class CleanupReminder {
+public:
+	enum category { exec_dir=0, account };
+	std::string name; // name of resource to cleanup
+	category cat;  // category of resource, e.g execute dir, account name, etc.
+	int      opt; // options, meaning depends on category
+
+	// so that some of the reminders can be case sensitive, and some not.
+	// in the future, we may consider cat as well as OS in this function, so prepare for that now.
+	bool case_sensitive(category /*cat*/) const {
+#ifdef WIN32
+		return false;
+#else
+		return true;
+#endif
+	}
+
+	~CleanupReminder() {}
+	//CleanupReminder(const char * n=NULL, category c=exec_dir, int o=0) : name(n), cat(c), opt(o) {}
+	CleanupReminder(const std::string &n, category c, int o=0) : name(n), cat(c), opt(o) {}
+	CleanupReminder(const CleanupReminder & cr) : name(cr.name), cat(cr.cat), opt(cr.opt) {}
+	void operator =(const CleanupReminder & cr) { name = cr.name; cat = cr.cat; opt = cr.opt; }
+
+	// the identity of the resource does not depend on the options flags
+	// so we ignore options in == and < operators
+	bool operator ==(const CleanupReminder &rhs) const {
+		if (cat != rhs.cat) return false;
+		// comparison of reminders can be case sensitive or case insensitive.
+		if (case_sensitive(cat)) {
+			return YourString(name) == rhs.name;
+		} else {
+			return YourStringNoCase(name) == rhs.name;
+		}
+	};
+	bool operator <(const CleanupReminder &rhs) const {
+		if (cat != rhs.cat) {
+			return cat < rhs.cat;
+		}
+		if (case_sensitive(cat)) {
+			return YourString(name) < rhs.name;
+		} else {
+			return YourStringNoCase(name) < rhs.name;
+		}
+	}
+
+};
+
+// map the cleanup reminder to a number of iterations of the cleanup loop.
+// this is NOT the retry count since we use this number to calculate our exponential backoff and don't retry
+// on ever iteration.
+typedef std::map<CleanupReminder, int> CleanupReminderMap;
+
+void add_exec_dir_cleanup_reminder(const std::string & dir, int options);
+void add_account_cleanup_reminder(const std::string& name);
+
+bool retry_cleanup_execute_dir(const std::string & path, int options, int &err);
+bool retry_cleanup_user_account(const std::string & path, int options, int &err);
 
 #endif /* _UTIL_H */

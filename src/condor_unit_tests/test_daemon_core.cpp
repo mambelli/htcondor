@@ -21,8 +21,6 @@
 #include "condor_daemon_core.h"
 #include "subsystem_info.h"
 
-extern "C" int SetSyscalls(int val){return val;}
-
 class Foo : public Service
 {
 	public:
@@ -66,7 +64,9 @@ Foo::timerone()
 	rsock->encode();
 	rsock->snd_int(1,FALSE);
 	char *buf="Please Work!";
-	rsock->code(buf);
+	if (!rsock->code(buf)) {
+		printf("ERROR CODING STRING!\n");
+	}
 	rsock->end_of_message();
 	delete rsock;
 }
@@ -123,10 +123,10 @@ Foo::Foo()
 
 // Can't catch signal 9 on unix.
 #ifdef WIN32
-	daemonCore->Register_Signal(9,"SIG9",(SignalHandler)sig9,"sig9()");
+	daemonCore->Register_Signal(9,"SIG9",sig9,"sig9()");
 #endif
-	daemonCore->Register_Signal(10,"SIG10",(SignalHandler)sig10,"sig10()");
-	daemonCore->Register_Reaper("General Reaper",(ReaperHandler)reaper,"reaper()");
+	daemonCore->Register_Signal(10,"SIG10",sig10,"sig10()");
+	daemonCore->Register_Reaper("General Reaper",reaper,"reaper()");
 }
 
 int

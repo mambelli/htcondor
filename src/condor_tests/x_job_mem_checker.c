@@ -253,12 +253,17 @@ void push(int chunks) {
 
 	//printf("push %d chunks\n",chunks);
 	for(units = 0; units < chunks; units++) {
-		stack[stackpointer] = malloc((size_t) chunksize);
-		memset(stack[stackpointer],units,(size_t) chunksize);
+		void * p = malloc(chunksize);
+		if ( ! p) {
+			printf("malloc of %d bytes failed!\n", chunksize);
+			exit(1);
+		}
+		memset(p,units,chunksize);
+		stack[stackpointer] = p;
 		if(stackpointer != 999) {
 			stackpointer++;
 		} else {
-			printf("exceeded the size of the stack");
+			printf("exceeded the size of the stack\n");
 			exit(1);
 		}
 	}
@@ -269,13 +274,16 @@ void pop(int chunks) {
 
 	//printf("pop %d chunks\n",chunks);
 	for(units = 0; units < chunks; units++) {
+		void * p;
 		if(stackpointer != 0) {
 			stackpointer--;
 		} else {
 			printf("Tried to pop empty stack");
 			exit(1);
 		}
-		free(stack[stackpointer]);
+		p = stack[stackpointer];
+		stack[stackpointer] = NULL;
+		if (p) free(p);
 	}
 }
 
@@ -674,7 +682,7 @@ get_mem_data(unsigned int *vmpeak, unsigned int *vmsize, unsigned int *vmhwm, un
 	}
   
 	// fill in the values we got from the kernel
-	procRaw.imgsize = (u_long)ti.virtual_size;
+	procRaw.imgsize = (unsigned long)ti.virtual_size;
 	procRaw.rssize = ti.resident_size;
 	procRaw.user_time_1 = ti.user_time.seconds;
 	procRaw.user_time_2 = 0;

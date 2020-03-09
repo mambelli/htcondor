@@ -41,11 +41,8 @@
 
 int CreamResource::gahpCallTimeout = 300;	// default value
 
-#define HASH_TABLE_SIZE			500
-
-HashTable <HashKey, CreamResource *>
-    CreamResource::ResourcesByName( HASH_TABLE_SIZE,
-									hashFunction );
+HashTable <std::string, CreamResource *>
+    CreamResource::ResourcesByName( hashFunction );
 
 #define CHECK_DELEGATION_INTERVAL	300
 #define LIFETIME_EXTEND_INTERVAL	300
@@ -87,7 +84,7 @@ CreamResource *CreamResource::FindOrCreateResource( const char *resource_name,
 	const char *hash_name = HashName( canonical_name, proxy->subject->subject_name, proxy->subject->first_fqan );
 	ASSERT(hash_name);
 
-	rc = ResourcesByName.lookup( HashKey( hash_name ), resource );
+	rc = ResourcesByName.lookup( hash_name, resource );
 	if ( rc != 0 ) {
 		resource = new CreamResource( canonical_name, proxy );
 		ASSERT(resource);
@@ -95,7 +92,7 @@ CreamResource *CreamResource::FindOrCreateResource( const char *resource_name,
 			delete resource;
 			resource = NULL;
 		} else {
-			ResourcesByName.insert( HashKey( hash_name ), resource );
+			ResourcesByName.insert( hash_name, resource );
 		}
 	} else {
 		ASSERT(resource);
@@ -178,7 +175,7 @@ dprintf(D_FULLDEBUG,"    deleting %s\n",next_deleg->deleg_uri?next_deleg->deleg_
 		free( serviceUri );
 	}
 
-	ResourcesByName.remove( HashKey( HashName( resourceName, proxySubject, proxyFirstFQAN ) ) );
+	ResourcesByName.remove( HashName( resourceName, proxySubject, proxyFirstFQAN ) );
 
 	daemonCore->Cancel_Timer( delegationTimerId );
 	if ( gahp != NULL ) {
@@ -389,6 +386,8 @@ void CreamResource::PublishResourceAd( ClassAd *resource_ad )
 	resource_ad->Assign( ATTR_X509_USER_PROXY_SUBJECT, proxySubject );
 	resource_ad->Assign( ATTR_X509_USER_PROXY_FQAN, proxyFQAN );
 	resource_ad->Assign( ATTR_X509_USER_PROXY_FIRST_FQAN, proxyFirstFQAN );
+
+	gahp->PublishStats( resource_ad );
 }
 
 void CreamResource::registerDelegationURI( const char *deleg_uri,
@@ -476,10 +475,9 @@ const char *CreamResource::getDelegationError( Proxy *job_proxy )
 	return NULL;
 }
 
-int CreamResource::ProxyCallback()
+void CreamResource::ProxyCallback()
 {
 	daemonCore->Reset_Timer( delegationTimerId, 0 );
-	return 0;
 }
 
 void CreamResource::checkDelegation()
@@ -688,8 +686,7 @@ CreamResource::BatchStatusResult CreamResource::StartBatchStatus()
 
 		std::string full_job_id = CreamJob::getFullJobId(ResourceName(), status.job_id.c_str());
 		BaseJob * bjob = NULL;
-		int rc2 = BaseJob::JobsByRemoteId.lookup( 
-			HashKey( full_job_id.c_str()), bjob);
+		int rc2 = BaseJob::JobsByRemoteId.lookup(full_job_id, bjob);
 		if(rc2 != 0) {
 			// Job not found. Probably okay; we might see jobs
 			// submitted via other means, or jobs we've abandoned.

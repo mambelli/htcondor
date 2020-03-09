@@ -45,13 +45,24 @@ static FILE *email_open_implementation(char *Mailer,
 static FILE *email_open_implementation(const char * final_args[]);
 #endif
 
+static void email_write_headers(FILE *stream,
+				const char *FromAddress,
+				const char *FinalSubject,
+				const char *Addresses,
+				int NumAddresses);
+static void email_write_header_string(FILE *stream, const char *data);
+
+
 extern DLL_IMPORT_MAGIC char **environ;
 
 FILE *
-email_open( const char *email_addr, const char *subject )
+email_nonjob_open( const char *email_addr, const char *subject )
 {
-	char *Mailer;
+	char *Sendmail = NULL;
+	char *Mailer = NULL;
+#ifdef WIN32
 	char *SmtpServer = NULL;
+#endif
 	char *FromAddress = NULL;
 	char *FinalSubject;
 	char *FinalAddr;
@@ -60,12 +71,6 @@ email_open( const char *email_addr, const char *subject )
 	int num_addresses;
 	int arg_index;
 	FILE *mailerstream;
-
-	if ( (Mailer = param("MAIL")) == NULL ) {
-		dprintf(D_FULLDEBUG,
-			"Trying to email, but MAIL not specified in config file\n");
-		return NULL;
-	}
 
 	/* Take care of the subject. */
 	if ( subject ) {
@@ -92,7 +97,6 @@ email_open( const char *email_addr, const char *subject )
 	if ( (SmtpServer=param("SMTP_SERVER")) == NULL ) {
 		dprintf(D_FULLDEBUG,
 			"Trying to email, but SMTP_SERVER not specified in config file\n");
-		free(Mailer);
 		free(FinalSubject);
 		if (FromAddress) free(FromAddress);
 		return NULL;
@@ -110,10 +114,11 @@ email_open( const char *email_addr, const char *subject )
 		if ( (FinalAddr = param("CONDOR_ADMIN")) == NULL ) {
 			dprintf(D_FULLDEBUG,
 				"Trying to email, but CONDOR_ADMIN not specified in config file\n");
-			free(Mailer);
 			free(FinalSubject);
 			if (FromAddress) free(FromAddress);
+#ifdef WIN32
 			if (SmtpServer) free(SmtpServer);
+#endif
 			return NULL;
 		}
 	}
@@ -136,10 +141,26 @@ email_open( const char *email_addr, const char *subject )
 	}
 	if (num_addresses == 0) {
 		dprintf(D_FULLDEBUG, "Trying to email, but address list is empty\n");
-		free(Mailer);
 		free(FinalSubject);
 		if (FromAddress) free(FromAddress);
+#ifdef WIN32
 		if (SmtpServer) free(SmtpServer);
+#endif
+		free(FinalAddr);
+		return NULL;
+	}
+
+	Sendmail = param_with_full_path("SENDMAIL");
+	Mailer = param("MAIL");
+
+	if ( Mailer == NULL && Sendmail == NULL ) {
+		dprintf(D_FULLDEBUG,
+			"Trying to email, but MAIL and SENDMAIL not specified in config file\n");
+		free(FinalSubject);
+		free(FromAddress);
+#ifdef WIN32
+		free(SmtpServer);
+#endif
 		free(FinalAddr);
 		return NULL;
 	}
@@ -152,23 +173,42 @@ email_open( const char *email_addr, const char *subject )
 		EXCEPT("Out of memory");
 	}
 	arg_index = 0;
-	final_args[arg_index++] = Mailer;
-	final_args[arg_index++] = "-s";
-	final_args[arg_index++] = FinalSubject;
-	if (FromAddress) {
-		final_args[arg_index++] = "-f";
-		final_args[arg_index++] = FromAddress;
-	}
-	if (SmtpServer) {
-		final_args[arg_index++] = "-relay";
-		final_args[arg_index++] = SmtpServer;
-	}
-	temp = FinalAddr;
-	for (;;) {
-		while (*temp == '\0') temp++;
-		final_args[arg_index++] = temp;
-		if (--num_addresses == 0) break;
-		while (*temp != '\0') temp++;
+	if (Sendmail != NULL) {
+		final_args[arg_index++] = Sendmail;
+		// Obtain addresses from the header.
+		final_args[arg_index++] = "-t";
+		// No special treatment of dot-starting lines.
+		final_args[arg_index++] = "-i";
+	} else {
+		final_args[arg_index++] = Mailer;
+		final_args[arg_index++] = "-s";
+		final_args[arg_index++] = FinalSubject;
+
+		if (FromAddress) {
+#ifdef WIN32
+			// condor_mail.exe uses this flag
+			final_args[arg_index++] = "-f";
+#else
+			// modern mailx uses this flag
+			final_args[arg_index++] = "-r";
+#endif
+			final_args[arg_index++] = FromAddress;
+		}
+#ifdef WIN32
+		if (SmtpServer) {
+			// SmtpServer is only set on windows
+			// condor_mail.exe uses this flag
+			final_args[arg_index++] = "-relay";
+			final_args[arg_index++] = SmtpServer;
+		}
+#endif
+		temp = FinalAddr;
+		for (;;) {
+			while (*temp == '\0') temp++;
+			final_args[arg_index++] = temp;
+			if (--num_addresses == 0) break;
+			while (*temp != '\0') temp++;
+		}
 	}
 	final_args[arg_index] = NULL;
 
@@ -181,21 +221,79 @@ email_open( const char *email_addr, const char *subject )
 	mailerstream = email_open_implementation(final_args);
 #endif
 
+	if ( !mailerstream ) {
+		dprintf( D_ALWAYS, "Failed to launch mailer process: %s\n", final_args[0] );
+	}
 	if ( mailerstream ) {
+		if (Sendmail != NULL) {
+			email_write_headers(mailerstream,
+					    FromAddress,
+					    FinalSubject,
+					    FinalAddr,
+					    num_addresses);
+		}
+
 		fprintf(mailerstream,"This is an automated email from the Condor "
 			"system\non machine \"%s\".  Do not reply.\n\n",get_local_fqdn().Value());
 	}
 
 	/* free up everything we strdup-ed and param-ed, and return result */
+	free(Sendmail);
 	free(Mailer);
 	free(FinalSubject);
 	if (FromAddress) free(FromAddress);
+#ifdef WIN32
 	if (SmtpServer) free(SmtpServer);
+#endif
 	free(FinalAddr);
 	free(final_args);
 
 	return mailerstream;
 }
+
+static void
+email_write_header_string(FILE *stream, const char *data)
+{
+	for (; *data; ++data) {
+		char ch = *data;
+		if (ch < ' ') {
+			fputc(' ', stream);
+		} else {
+			fputc(ch, stream);
+		}
+	}
+}
+
+static void
+email_write_headers(FILE *stream,
+		    const char *FromAddress,
+		    const char *FinalSubject,
+		    const char *Addresses,
+		    int NumAddresses)
+{
+	if (FromAddress) {
+		fputs("From: ", stream);
+		email_write_header_string(stream, FromAddress);
+		fputc('\n', stream);
+	}
+	fputs("Subject: ", stream);
+	email_write_header_string(stream, FinalSubject);
+	fputc('\n', stream);
+
+	fputs("To: ", stream);
+	for (int i = 0; i < NumAddresses; ++i) {
+		if (i > 0) {
+			fputs(", ", stream);
+		}
+		while (*Addresses == '\0') {
+			Addresses++;
+		}
+		email_write_header_string(stream, Addresses);
+		Addresses += strlen(Addresses) + 1;
+	}
+	fputs("\n\n", stream);
+}
+
 
 #ifdef WIN32
 FILE *
@@ -207,14 +305,7 @@ email_open_implementation(char *Mailer, const char * final_args[])
 
 	/* Want the letter to come from "condor" if possible */
 	priv = set_condor_priv();
-	/* there are some oddities with how popen can open a pipe. In some
-		arches, popen will create temp files for locking and they need to
-		be of the correct perms in order to be deleted. So the umask is
-		set to something useable for the open operation. -pete 9/11/99
-	*/
-	prev_umask = umask(022);
 	mailerstream = my_popenv(final_args,EMAIL_POPEN_FLAGS,FALSE);
-	umask(prev_umask);
 
 	/* Set priv state back */
 	set_priv(priv);
@@ -232,183 +323,32 @@ email_open_implementation(char *Mailer, const char * final_args[])
 FILE *
 email_open_implementation( const char * final_args[])
 {
+	ArgList args;
+	Env env;
+	TemporaryPrivSentry guard( PRIV_CONDOR );
 
-	FILE *mailerstream;
-	pid_t pid;
-	int pipefds[2];
-
-	/* The gist of this code is to exec a mailer whose stdin is dup2'ed onto
-		the write end of a pipe. The parent gets the fdopen'ed read end
-		so it looks like a FILE*. The child goes out of its
-		way to set its real uid to condor and prop up the environment so
-		that any mail that gets sent from the condor daemons ends up as
-		comming from the condor account instead of superuser. 
-
-		On some OS'es, the child cannot write to the logs even though the
-		mailer process is ruid condor. So I turned off logging in the
-		child. I have no clue why this behaviour happens.
-
-		-pete 04/14/2000
-	*/
-
-	if (pipe(pipefds) < 0)
-	{
-		dprintf(D_ALWAYS, "Could not open email pipe!\n");
-		return NULL;
+	for ( int i = 0; final_args[i]; i++ ) {
+		args.AppendArg( final_args[i] );
 	}
+
+	env.Import();
+	// I don't think these environment variables are needed.
+	// Old commit messages suggest they were necessary at one time for
+	// the email to come from the 'condor' user instead of 'root'.
+	// Recent testing indicates this is not true on modern Linux.
+	env.SetEnv( "LOGNAME", get_condor_username() );
+	env.SetEnv( "USER", get_condor_username() );
 
 	dprintf(D_FULLDEBUG, "Forking Mailer process...\n");
-	if ((pid = fork()) < 0)
-	{
-		dprintf(D_ALWAYS, "Could not fork email process!\n");
-		return NULL;
-	}
-	else if (pid > 0) /* parent */
-	{
-		/* SIGCLD, SIGPIPE are ignored elsewhere in the code.... */
 
-		/* close read end of pipe */
-		close(pipefds[0]);
-
-		mailerstream = fdopen(pipefds[1], EMAIL_POPEN_FLAGS);
-		if (mailerstream == NULL)
-		{
-			dprintf(D_ALWAYS, "Could not open email FILE*: %s\n", 
-				strerror(errno));
-			return NULL;
-		}
-		return mailerstream;
-	}
-	else /* child mailer process */
-	{
-		/* Sorry, putenv wants it this way */
-		char *pe_logname = (char *)malloc(256);
-		char *pe_user = (char *)malloc(256);
-		const char *condor_name;
-		int i;
-
-		/* Disable any EXCEPT_Cleanup code installed by the parent process.
-		   Otherwise, for example, in the master, any call to EXCEPT in
-		   the following code will cause us to kill the master's children. */
-		_EXCEPT_Cleanup = NULL;
-
-		/* XXX This must be the FIRST thing in this block of code. For some
-			reason, at least on IRIX65, this forked process
-			will not be able to open the shadow lock file,
-			or be able to use dprintf or do any sort of
-			logging--even if the ruid hasn't changed. I do
-			not know why and this should be investigated. So
-			for now, I've turned off logging for this child
-			process. Thankfully it is a short piece of code
-			before the exec.  -pete 03-05-2000
-		*/
-		dprintf_set_tool_debug("TOOL", 0);
-
-		/* this is a simple daemon that if it needs to stat . should be
-			able to. You might not be able to if the shadow's cwd is in the
-			user dir somewhere and not readable by the Condor Account. */
-		int ret = chdir("/");
-		if (ret == -1) {
-			EXCEPT("EMAIL PROCESS: Could not cd /\n");
-		}
-		umask(0);
-
-		/* Change my userid permanently to "condor" */
-		/* WARNING  This code must happen before the close/dup operation. */
-		set_condor_priv_final();
-
-		/* close write end of pipe */
-		close(pipefds[1]);
-
-		/* connect the write end of the pipe to the stdin of the mailer */
-		if (dup2(pipefds[0], STDIN_FILENO) < 0)
-		{
-			/* I hope this EXCEPT gets recorded somewhere */
-			EXCEPT("EMAIL PROCESS: Could not connect stdin to child!\n");
-		}
-
-		/* close all other unneeded file descriptors including stdout and
-			stderr, just leave the stdin open to this process. */
-		for(i = 0; i < sysconf(_SC_OPEN_MAX); i++)
-		{
-			if (i != pipefds[0] && i != STDIN_FILENO)
-			{
-				(void)close(i);
-			}
-		}
-
-		/* prop up the environment with goodies to get the Mailer to do the
-			right thing */
-		condor_name = get_condor_username();
-
-		/* Should be snprintf() but we don't have it for all platforms */
-		sprintf(pe_logname,"LOGNAME=%s", condor_name);
-		if (putenv(pe_logname) != 0)
-		{
-			EXCEPT("EMAIL PROCESS: Unable to insert LOGNAME=%s into "
-				" environment correctly: %s\n", pe_logname, strerror(errno));
-		}
-
-		/* Should be snprintf() but we don't have it for all platforms */
-		sprintf(pe_user,"USER=%s", condor_name);
-		if( putenv(pe_user) != 0)
-		{
-			/* I hope this EXCEPT gets recorded somewhere */
-			EXCEPT("EMAIL PROCESS: Unable to insert USER=%s into "
-				" environment correctly: %s\n", pe_user, strerror(errno));
-		}
-
-		/* invoke the mailer */
-		execvp(final_args[0], const_cast<char *const*>(final_args) );
-
-		/* I hope this EXCEPT gets recorded somewhere */
-		EXCEPT("EMAIL PROCESS: Could not exec mailer using '%s' with command "
-			"'%s' because of error: %s.", "/bin/sh", 
-			(final_args[0]==NULL)?"(null)":final_args[0], strerror(errno));
-	}
-
-	/* for completeness */
-	return NULL;
+	return my_popen( args, "w", 0, &env );
 }
 #endif /* UNIX */
 
 FILE *
 email_admin_open(const char *subject)
 {
-	return email_open(NULL,subject);
-}
-
-FILE *
-email_developers_open(const char *subject)
-{
-	char *tmp;
-	FILE *mailer;
-
-	/* 
-	** According to the docs, if CONDOR_DEVELOPERS is not
-	** in the config file, it defaults to UW.  If it is "NONE", 
-	** nothing should be emailed.
-	*/
-    tmp = param ("CONDOR_DEVELOPERS");
-    if (tmp == NULL) {
-		/* we strdup here since we always call free below */
-#ifdef NO_PHONE_HOME
-		tmp = strdup("NONE");
-#else
-        tmp = strdup("condor-admin@cs.wisc.edu");
-#endif
-    }
-
-    if (strcasecmp (tmp, "NONE") == 0) {
-        free (tmp);
-        return NULL;
-    }
-
-	mailer = email_open(tmp,subject);		
-
-	/* Don't forget to free tmp! */
-	free(tmp);
-	return mailer;
+	return email_nonjob_open(NULL,subject);
 }
 
 /* 
@@ -420,7 +360,6 @@ void
 email_close(FILE *mailer)
 {
 	char *temp;
-	mode_t prev_umask;
 	priv_state priv;
 	char *customSig;
 
@@ -438,7 +377,7 @@ email_close(FILE *mailer)
 		fprintf( mailer, "\n");
 		free(customSig);
 	} else {
-		
+
 		/* Put a signature on the bottom of the email */
 		fprintf( mailer, "\n\n-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n" );
 		fprintf( mailer, "Questions about this message or HTCondor in general?\n" );
@@ -458,21 +397,15 @@ email_close(FILE *mailer)
 	}
 
 	fflush(mailer);
-	/* there are some oddities with how pclose can close a file. In some
-		arches, pclose will create temp files for locking and they need to
-		be of the correct perms in order to be deleted. So the umask is
-		set to something useable for the close operation. -pete 9/11/99
-	*/
-	prev_umask = umask(022);
-	/* 
-	** we fclose() on UNIX, pclose on win32 
+	/*
+	** we fclose() on UNIX, pclose on win32
 	*/
 #if defined(WIN32)
 	if (EMAIL_FINAL_COMMAND == NULL) {
 		my_pclose( mailer );
 	} else {
 		char *email_filename = NULL;
-		/* Should this be a pclose??? -Erik 9/21/00 */ 
+		/* Should this be a pclose??? -Erik 9/21/00 */
 		fclose( mailer );
 		dprintf(D_FULLDEBUG,"Sending email via system(%s)\n",
 			EMAIL_FINAL_COMMAND);
@@ -491,7 +424,6 @@ email_close(FILE *mailer)
 #else
 	(void)fclose( mailer );
 #endif
-	umask(prev_umask);
 
 	/* Set priv state back */
 	set_priv(priv);

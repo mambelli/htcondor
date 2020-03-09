@@ -21,15 +21,23 @@
 project(CONDOR)
 cmake_minimum_required(VERSION 2.6)
 
+# Turn off deprecations warnings for cmake 3.x
+# Need to wait to fix these after we drop older cmake versions
+if(POLICY CMP0054)
+	cmake_policy(SET CMP0054 OLD)
+endif()
+
 ##########################################################################
 #Setup package meta-data (used in packaging)
 set(PACKAGE "condor")
 
+#Setup test package meta-data (used in packaging)
+set(TEST_PACKAGE "condor_tests")
 # Condor version info
 #   Condor and other systems parse this number. Keep it simple:
 #   Number.Number.Number. Do nothing else.  If you need to add
 #   more information, PRE_RELEASE is usually the right location.
-set(VERSION "8.2.3")
+set(VERSION "8.9.6")
 
 # Set PRE_RELEASE to either a string (i.e. "PRE-RELEASE-UWCS") or OFF
 #   This shuld be "PRE-RELEASE-UWCS most of the time, and OFF when
@@ -47,8 +55,9 @@ if( FORCE_PRE_RELEASE )
   set(PRE_RELEASE ${FORCE_PRE_RELEASE})
 endif( FORCE_PRE_RELEASE )
 
-set(PACKAGE_BUGREPORT "http://condor-wiki.cs.wisc.edu/index.cgi/tktnew")
+set(PACKAGE_BUGREPORT "http://htcondor-wiki.cs.wisc.edu/index.cgi/tktnew")
 set(PACKAGE_NAME ${PACKAGE} )
+set(TEST_PACKAGE_NAME ${TEST_PACKAGE} )
 set(PACKAGE_VERSION ${VERSION} )
 set(PACKAGE_STRING ${PACKAGE} )
 string( TOUPPER "${CMAKE_SYSTEM_NAME}" OS_NAME )
@@ -64,9 +73,9 @@ list(APPEND CMAKE_MODULE_PATH ${CONDOR_SOURCE_DIR}/build/cmake/macros;${CONDOR_S
 include (dprint) # set debug module 1st to all spewing in other modules if needed
 include (AppendVar)
 include (CommandTarget)
-include (gSOAPGen)
 include (CloneInstall)
 include (FindMultiple)
+include (FindSoName)
 include (ExternalProject)
 include (CheckIncludeFiles)
 include (CheckFunctionExists)
@@ -88,14 +97,14 @@ include (CondorDaemon)
 include (CondorPrecompiledHeaders)
 include (CondorStaticLib)
 include (CondorPlugin)
+include (CheckCCompilerFlag)
 include (CheckCXXCompilerFlag)
 include (CheckCXXSourceCompiles)
 include (AddSubdirectories)
 include (CTest)
 include (CondorPLTest)
 include (CondorExeTest)
-include (CondorUnitTest)
-include (CondorStdExeTest)
+#include (CondorUnitTest)
 include (SrcTargetRef)
 include (DumpLocalFlags)
 include (CondorPreExternal)
@@ -112,35 +121,36 @@ endif ( WINDOWS )
 # src - src -> only
 # this way clean @ root cleans externals while clean @src cleans just the src.
 add_subdirectory (src)
+add_subdirectory (build/packaging)
+add_subdirectory (bindings/python)
 
 ##########################################################################
 # the following are existing doc targets
 # ideally one would transform the building of the docs to cmake or a script
 
 # logic here to support old nmi builds
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/doc/man")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/docs/_build/man")
 
-	if (NOT WANT_MAN_PAGES OR ${LATEX} STREQUAL "LATEX-NOTFOUND" OR ${LATEX2HTML} STREQUAL "LATEX2HTML-NOTFOUND")
+	if (NOT WANT_MAN_PAGES OR ${SPHINXBUILD} STREQUAL "SPHINXBUILD-NOTFOUND")
 		message(STATUS "NOTE: Skipping man-pages")
 	else()
 		
 		message(STATUS "NOTE: Will try building man-pages")
 		# NOTE: deps are not configured to detect file changes.
-		add_custom_command (OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/doc/man/man1/condor_on.1
+		add_custom_command (OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/docs/_build/man/man1/condor_on.1
 						COMMAND make
-						ARGS just-man-pages
-						WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/doc )
-						#DEPENDS )
+						ARGS SPHINXBUILD=${SPHINXBUILD} man
+						WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs )
 
-		add_custom_target ( docs ALL DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/doc/man/man1/condor_on.1 )
+		add_custom_target ( docs ALL DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/docs/_build/man/man1/condor_on.1 )
 		
-		install( DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/doc/man/ DESTINATION ${C_MAN} )
+		install( DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs/_build/man/ DESTINATION ${C_MAN} )
 	endif()
 
 else()
 	message(STATUS "NOTE: Will install prebuilt man-pages")
 	#Use trailing slash; otherwise, it will be C_MAN/man
-	install( DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/doc/man/ DESTINATION ${C_MAN} )
+	install( DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs/_build/man/ DESTINATION ${C_MAN} )
 endif()
 
 ##########################################################################

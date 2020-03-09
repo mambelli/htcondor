@@ -50,27 +50,22 @@ CODMgr::publish( ClassAd* ad, amask_t mask )
 	if( ! num_claims ) {
 		return;
 	}
-	MyString claim_names;
+	std::string claim_names;
 	Claim* tmp_claim;
 	claims.Rewind();
 	while( claims.Next(tmp_claim) ) {
 		tmp_claim->publishCOD( ad );
-		claim_names += tmp_claim->codId();
+		if ( tmp_claim->codId() ) {
+			claim_names += tmp_claim->codId();
+		}
 		if( ! claims.AtEnd() ) {
 			claim_names += ", ";
 		}
 	}
 
-	MyString line = ATTR_NUM_COD_CLAIMS;
-	line += '=';
-	line += num_claims;
-	ad->Insert( line.Value() );
+	ad->Assign( ATTR_NUM_COD_CLAIMS, num_claims );
 
-	line = ATTR_COD_CLAIMS;
-	line += " = \"";
-	line += claim_names.Value();
-	line +='"';
-	ad->Insert( line.Value() );
+	ad->Assign( ATTR_COD_CLAIMS, claim_names );
 }
 
 
@@ -299,7 +294,7 @@ CODMgr::activate( Stream* s, ClassAd* req, Claim* claim )
 		// first, we have to find a Starter that matches the request
 	Starter* tmp_starter;
 	bool no_starter = false;
-	tmp_starter = resmgr->starter_mgr.findStarter( req, mach_classad, no_starter );
+	tmp_starter = resmgr->starter_mgr.newStarter( req, mach_classad, no_starter );
 	if( ! tmp_starter ) {
 		ExprTree *tree;
 		tree = req->LookupExpr( ATTR_REQUIREMENTS );
@@ -339,11 +334,6 @@ CODMgr::activate( Stream* s, ClassAd* req, Claim* claim )
 		// pointer, and if we try to access this variable, we'll crash 
 	ClassAd* new_req_ad = new ClassAd( *req );
 
-		// Save the request ClassAd, so we can use it to spawn the
-		// starter.  This also grabs the job ID so we can use it to
-		// spawn the starter with the right args if needed...
-	claim->saveJobInfo( new_req_ad );
-
 		// now that we've gotten this far, we know we're going to
 		// start a starter.  so, we call the interactionLogic method
 		// to deal with the state changes of the opportunistic claim
@@ -351,21 +341,17 @@ CODMgr::activate( Stream* s, ClassAd* req, Claim* claim )
 
 		// finally, spawn the starter and COD job itself
 
-	claim->setStarter( tmp_starter );	
-	int rval = claim->spawnStarter();
+	int rval = claim->spawnStarter(tmp_starter, new_req_ad);
 	if( !rval ) {
 			// Failed to spawn, make sure everything goes back to
 			// normal with the opportunistic claim
 		interactionLogicCODStopped();
 	}
 
-	MyString line;
-	line.formatstr( "%s = \"%s\"", ATTR_RESULT, 
+	ClassAd reply;
+	reply.Assign( ATTR_RESULT,
 				  rval ? getCAResultString(CA_SUCCESS)
 				       : getCAResultString(CA_FAILURE) );
-
-	ClassAd reply;
-	reply.Insert( line.Value() );
 
 		// TODO any other info for the reply?
 	sendCAReply( s, "CA_ACTIVATE_CLAIM", &reply );
@@ -451,11 +437,7 @@ CODMgr::suspend( Stream* s, ClassAd* /*req*/ /*UNUSED*/, Claim* claim )
 	case CLAIM_RUNNING:
 		if( claim->suspendClaim() ) { 
 
-			line = ATTR_RESULT;
-			line += " = \"";
-			line += getCAResultString( CA_SUCCESS );
-			line += '"';
-			reply.Insert( line.Value() );
+			reply.Assign( ATTR_RESULT, getCAResultString( CA_SUCCESS ) );
 
 				// TODO any other info for the reply?
 			rval = sendCAReply( s, "CA_SUSPEND_CLAIM", &reply );
@@ -506,16 +488,11 @@ CODMgr::suspend( Stream* s, ClassAd* /*req*/ /*UNUSED*/, Claim* claim )
 int
 CODMgr::renew( Stream* s, ClassAd* /*req*/ /* UNUSED*/, Claim* claim )
 {
-	MyString line;
 	ClassAd reply;
 
 	claim->alive();
 
-	line = ATTR_RESULT;
-	line += " = \"";
-	line += getCAResultString( CA_SUCCESS );
-	line += '"';
-	reply.Insert( line.Value() );
+	reply.Assign( ATTR_RESULT, getCAResultString( CA_SUCCESS ) );
 
 	return sendCAReply( s, "CA_RENEW_LEASE_FOR_CLAIM", &reply );
 }
@@ -538,11 +515,7 @@ CODMgr::resume( Stream* s, ClassAd* /*req*/ /*UNUSED*/, Claim* claim )
 			// period of time.
 		interactionLogicCODRunning();
 		if( claim->resumeClaim() ) { 
-			line = ATTR_RESULT;
-			line += " = \"";
-			line += getCAResultString( CA_SUCCESS );
-			line += '"';
-			reply.Insert( line.Value() );
+			reply.Assign( ATTR_RESULT, getCAResultString( CA_SUCCESS ) );
 
 				// TODO any other info for the reply?
 			return sendCAReply( s, "CA_RESUME_CLAIM", &reply );

@@ -1,11 +1,10 @@
 
-#include <boost/python.hpp>
+#include "python_bindings_common.h"
 
 #include "old_boost.h"
 #include "export_headers.h"
 
 using namespace boost::python;
-
 
 BOOST_PYTHON_MODULE(htcondor)
 {
@@ -21,7 +20,21 @@ BOOST_PYTHON_MODULE(htcondor)
     export_collector();
     export_negotiator();
     export_schedd();
+    export_credd();
     export_dc_tool();
     export_secman();
+    export_event_log();
+	// TODO This is the old API for reading the event log.
+	//   We should remove it once users have had enough time to
+	//   migrate to the new API.
     export_event_reader();
+#if !defined(WIN32)
+	// omit for windows
+    export_log_reader();
+#endif
+    export_claim();
+    export_startd();
+    export_query_iterator();
+
+    def("enable_classad_extensions", enable_classad_extensions, "Register the HTCondor-specific extensions to the ClassAd library.");
 }

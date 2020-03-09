@@ -38,7 +38,6 @@
 #include "condor_config.h"
 #include "condor_classad.h"
 #include "condor_io.h"
-#include "get_full_hostname.h"
 #include "daemon.h"
 #include "condor_attributes.h"
 #include "subsystem_info.h"
@@ -62,6 +61,7 @@ main( int argc, char** argv )
 	ReliSock* coll_sock;
 	bool connect_error = true;
 
+	set_priv_initialize(); // allow uid switching if root
 	config();
 
 	MyName = argv[0];
@@ -91,9 +91,8 @@ main( int argc, char** argv )
     SetTargetTypeName( invalidate_ad, STARTD_ADTYPE );
 
         // We only want to invalidate this slot.
-    sprintf( line, "%s = %s == \"%s\"", ATTR_REQUIREMENTS, ATTR_MACHINE,  
-             host );
-    invalidate_ad.Insert( line );
+    sprintf( line, "%s == \"%s\"", ATTR_MACHINE, host );
+    invalidate_ad.AssignExpr( ATTR_REQUIREMENTS, line );
 
 
 	do {

@@ -77,6 +77,8 @@ int main(int argc, char **argv)
         case ULOG_RD_ERROR:
         case ULOG_UNK_ERROR:
 			logsMissing = true;
+			// Fall through
+			//@fallthrough@
         case ULOG_NO_EVENT:
 
 			printf( "Log outcome: %s\n", ULogEventOutcomeNames[outcome] );
@@ -86,7 +88,7 @@ int main(int argc, char **argv)
         case ULOG_OK:
 
 			printf( "Log event: %s (%d.%d.%d)",
-						ULogEventNumberNames[e->eventNumber],
+						e->eventName(),
 						e->cluster, e->proc, e->subproc );
 
 			if ( ce.CheckAnEvent(e, errorMsg) != CheckEvents::EVENT_OKAY ) {

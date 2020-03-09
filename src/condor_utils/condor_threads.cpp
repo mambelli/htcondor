@@ -22,11 +22,10 @@
 #include "condor_threads.h"
 #include "condor_config.h"
 #include "condor_debug.h"
-#include "Queue.h"
 #include "HashTable.h"
-#include "condor_string.h"	// for strnewp()
 #include "dc_service.h"		// for class Service
 #include "subsystem_info.h"
+#include <queue>
 
 /**********************************************************************/
 /**********************************************************************/
@@ -87,6 +86,7 @@ static int
 pthread_mutex_init (pthread_mutex_t *mv, 
                     const pthread_mutexattr_t *)
 {
+#pragma warning(suppress: 28125)
 	InitializeCriticalSection(mv);
 	return 0;
 }
@@ -140,6 +140,7 @@ pthread_cond_init (pthread_cond_t *cv,
   cv->waiters_count_ = 0;
 
   // Initialize critical section
+#pragma warning(suppress: 28125)
   InitializeCriticalSection(&(cv->waiters_count_lock_));
 
   // Create an auto-reset event.
@@ -265,7 +266,7 @@ WorkerThread::WorkerThread(const char* name, condor_thread_func_t routine, void*
 	status_ = THREAD_UNBORN;
 
 
-	name_ = strnewp(name);
+	name_ = name ? strdup(name) : NULL;
 	routine_ = routine;
 	arg_ = arg;
 }
@@ -275,7 +276,7 @@ WorkerThread::WorkerThread(const char* name, condor_thread_func_t routine, void*
 WorkerThread::~WorkerThread()
 {	
 	// note: do NOT delete arg_  !
-	if (name_) delete [] name_;
+	if (name_) free(name_);
 	if (user_pointer_) delete (Service *)user_pointer_;
 
 	// remove tid from our hash table
@@ -318,7 +319,7 @@ ThreadImplementation::get_main_thread_ptr()
 	static WorkerThreadPtr_t main_thread_ptr;
 
 	// create a thread object for the main thread if we have not already
-	if ( main_thread_ptr.is_null() ) {
+	if ( !main_thread_ptr ) {
 		ASSERT ( already_been_here == false );
 		WorkerThreadPtr_t main_thread_tmp(new WorkerThread("Main Thread",NULL));
 		main_thread_ptr = main_thread_tmp;
@@ -401,7 +402,7 @@ WorkerThread::set_status(thread_status_t newstatus)
 		 mytid != previous_running_tid ) 
 	{
 		WorkerThreadPtr_t context = CondorThreads::get_handle(previous_running_tid);
-		if ( !context.is_null() ) {
+		if ( context ) {
 			if ( context->status_ == THREAD_RUNNING ) {
 				context->status_ = THREAD_READY;
 				dprintf(D_THREADS,
@@ -462,32 +463,33 @@ WorkerThread::set_status(thread_status_t newstatus)
 }
 
 
-unsigned int
+size_t
 ThreadImplementation::hashFuncThreadInfo(const ThreadInfo & mythread)
 {
 	// For a nice distribution, break it up into unsigned int 
 	// sized chunks and add together.  This is because on Linux and 
 	// Win32, it is prolly the size of an unsigned int.  So on these
 	// two platforms we will get a very nice distribution -vs- byte adding.
-	unsigned int hash = 0;
+	size_t hash = 0;
 
-	unsigned int j = sizeof(pthread_t);
-	int i = 0;
-	pthread_t thread = mythread.get_pthread();
-	unsigned int *buf = (unsigned int *)&thread;
+	union {
+		pthread_t thread;
+		unsigned int  ibuf[sizeof(pthread_t)/sizeof(unsigned int)];
+		unsigned char cbuf[sizeof(pthread_t)];
+	} u;
 
+	u.thread = mythread.get_pthread();
 
 		// add up bytes in unsigned int chunks
-	while (j >= sizeof(unsigned int) ) {
-		hash += buf[i];
-		i++;
-		j -= sizeof(unsigned int);
+	size_t j = 0;
+	while (j < sizeof(pthread_t)) {
+		hash += u.ibuf[j/sizeof(unsigned int)];
+		j += sizeof(unsigned int);
 	}
-
 		// add up bytes of anything left over
-	unsigned char *n = (unsigned char *) &buf[i];
-	for (i=0;  j > 0; j--, i++ ) {
-		hash += n[i];
+	while (j < sizeof(pthread_t)) {
+		hash += u.cbuf[j];
+		++j;
 	}
 
 	return hash;
@@ -574,10 +576,10 @@ ThreadImplementation::pool_add(condor_thread_func_t routine, void* arg,
 
 	// If we are out of threads, yield here until some are available.
 	dprintf(D_THREADS,"Queing work to thread pool - w=%d tbusy=%d tmax=%d\n",
-			work_queue.Length(),num_threads_busy_,num_threads_);
+			(int)work_queue.size(),num_threads_busy_,num_threads_);
 	while ( num_threads_busy_ >= num_threads_ ) {
 		dprintf(D_ALWAYS,"WARNING: thread pool full - w=%d tbusy=%d tmax=%d\n",
-			work_queue.Length(),num_threads_busy_,num_threads_);
+			(int)work_queue.size(),num_threads_busy_,num_threads_);
 		pthread_cond_wait(&workers_avail_cond,&big_lock);
 	}
 
@@ -602,7 +604,7 @@ ThreadImplementation::pool_add(condor_thread_func_t routine, void* arg,
 	}
 
 	// Queue up the work
-	work_queue.enqueue(newthread);
+	work_queue.push(newthread);
 
 	dprintf(D_THREADS,"Thread %s tid=%d status set to %s\n",
 		newthread->get_name(), newthread->get_tid(), 
@@ -610,7 +612,7 @@ ThreadImplementation::pool_add(condor_thread_func_t routine, void* arg,
 
 
 	// If the queue length is 1, signal to let our workers work is available
-	if ( work_queue.Length() == 1 ) {
+	if ( work_queue.size() == 1 ) {
 		pthread_cond_broadcast(&work_queue_cond);
 	}	
 
@@ -647,7 +649,7 @@ ThreadImplementation::get_handle(int tid)
 		ThreadInfo ti( pthread_self() );
 		TI->hashThreadToWorker.lookup(ti,worker);
 
-		if ( worker.is_null() ) {
+		if ( !worker) {
 			// not in our table; if this is the first time we are being
 			// called, it would be from pool_init, thus we have 
 			// been called from the main thread.  if so, insert the 
@@ -722,13 +724,14 @@ ThreadImplementation::threadStart(void *)
 	mutex_biglock_lock();
 	
 	for (;;) {				
-		while ( TI->work_queue.IsEmpty() ) {
+		while ( TI->work_queue.empty() ) {
 			// we are out of work; yield this thread until something to do
 			pthread_cond_wait(&(TI->work_queue_cond),&(TI->big_lock));
 		}
 		
 		// grab next work item
-		TI->work_queue.dequeue(item);
+		item = TI->work_queue.front();
+		TI->work_queue.pop();
 
 		// stash our current tid for speedy lookup 
 		TI->setCurrentTid( item->get_tid() );
@@ -992,7 +995,7 @@ WorkerThread::set_status(thread_status_t newstatus)
 	status_ = newstatus;
 }
 
-unsigned int
+size_t
 ThreadImplementation::hashFuncThreadInfo(const ThreadInfo & /*mythread*/)
 {
 	return 1;

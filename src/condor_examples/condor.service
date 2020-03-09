@@ -1,19 +1,27 @@
 
 [Unit]
 Description=Condor Distributed High-Throughput-Computing
-After=syslog.target network.target
-Wants=network.target
+After=network-online.target nslcd.service ypbind.service time-sync.target nfs.client.target autofs.service
+Wants=network-online.target
+# Disabled until HTCondor security fixed.
+# Requires=condor.socket
 
 [Service]
 EnvironmentFile=-/etc/sysconfig/condor
 ExecStart=/usr/sbin/condor_master -f
-ExecStop=/usr/sbin/condor_off -master
+Delegate=true
+# In the future, we will use ExecStop with a synchronous condor_off
+KillMode=mixed
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=1minute
+WatchdogSec=20minutes
+TimeoutStopSec=150seconds
 StandardOutput=syslog
-LimitNOFILE=16384
-ControlGroup=/condor
+NotifyAccess=main
+KillSignal=SIGQUIT
+LimitNOFILE=32767
+TasksMax=32767
 
 [Install]
 WantedBy=multi-user.target

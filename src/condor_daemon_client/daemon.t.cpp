@@ -121,7 +121,7 @@ testSocks( Daemon* d )
 			dprintf( dflag, "State of %s is %s\n", d->idStr(), state );
 		}
 		if( state ) {
-			delete [] state;
+			free( state );
 			state = NULL;
 		}
 		delete reli_p;
@@ -140,7 +140,7 @@ testSocks( Daemon* d )
 			dprintf( dflag, "State of %s is %s\n", d->idStr(), state );
 		}
 		if( state ) {
-			delete [] state;
+			free( state );
 			state = NULL;
 		}
 		delete reli_p;
@@ -162,7 +162,7 @@ testSocks( Daemon* d )
 				dprintf( dflag, "State of %s is %s\n", d->idStr(), state );
 			}
 			if( state ) {
-				delete [] state;
+				free( state );
 				state = NULL;
 			}
 			delete reli_p;
@@ -213,7 +213,7 @@ testSocks( Daemon* d )
 			dprintf( dflag, "State of %s is %s\n", d->idStr(), state );
 		}
 		if( state ) {
-			delete [] state;
+			free( state );
 			state = NULL;
 		}
 		delete safe_p;
@@ -232,7 +232,7 @@ testSocks( Daemon* d )
 			dprintf( dflag, "State of %s is %s\n", d->idStr(), state );
 		}
 		if( state ) {
-			delete [] state;
+			free( state );
 			state = NULL;
 		}
 		delete safe_p;
@@ -254,7 +254,7 @@ testSocks( Daemon* d )
 				dprintf( dflag, "State of %s is %s\n", d->idStr(), state );
 			}
 			if( state ) {
-				delete [] state;
+				free( state );
 				state = NULL;
 			}
 			delete safe_p;
@@ -363,7 +363,7 @@ main(int argc, char* argv)
 	}
 
 	dprintf( dflag, "\nMake a local STARTD w/ explicit name\n\n" );
-	Daemon d2( DT_STARTD, my_full_hostname() );
+	Daemon d2( DT_STARTD, get_local_fqdn().Value() );
 	if( d2.locate() ) {
 		d2.display( dflag );
 	} else {

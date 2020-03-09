@@ -28,6 +28,7 @@ namespace classad {
 AttributeReference::
 AttributeReference()
 {
+	parentScope = NULL;
 	expr = NULL;
 	absolute = false;
 }
@@ -37,6 +38,7 @@ AttributeReference()
 AttributeReference::
 AttributeReference( ExprTree *tree, const string &attrname, bool absolut )
 {
+	parentScope = NULL;
 	attributeStr = attrname;
 	expr = tree;
 	absolute = absolut;
@@ -90,6 +92,7 @@ CopyFrom(const AttributeReference &ref)
 
     success = true;
 
+	parentScope = ref.parentScope;
 	attributeStr = ref.attributeStr;
 	if( ref.expr && ( expr=ref.expr->Copy( ) ) == NULL ) {
         success = false;
@@ -99,6 +102,18 @@ CopyFrom(const AttributeReference &ref)
     }
     return success;
 }
+
+bool AttributeReference::SetComponents( ExprTree *tree, const std::string &attr, bool abs )
+{
+	if (tree != expr) {
+		if (expr) delete expr;
+		expr = tree;
+	}
+	attributeStr = attr;
+	absolute = abs;
+	return true;
+}
+
 
 bool AttributeReference::
 SameAs(const ExprTree *tree) const
@@ -139,6 +154,7 @@ operator==(const AttributeReference &ref1, const AttributeReference &ref2)
 void AttributeReference::
 _SetParentScope( const ClassAd *parent ) 
 {
+	parentScope = parent;
 	if( expr ) expr->SetParentScope( parent );
 }
 
@@ -167,13 +183,11 @@ _Evaluate (EvalState &state, Value &val) const
 			return false;
 
 		case EVAL_ERROR:
-		case PROP_ERROR:
 			val.SetErrorValue();
 			state.curAd = curAd;
 			return true;
 
 		case EVAL_UNDEF:
-		case PROP_UNDEF:
 			val.SetUndefinedValue();
 			state.curAd = curAd;
 			return true;
@@ -219,12 +233,10 @@ _Evaluate (EvalState &state, Value &val, ExprTree *&sig ) const
 			break;
 
 		case EVAL_ERROR:
-		case PROP_ERROR:
 			val.SetErrorValue( );
 			break;
 
 		case EVAL_UNDEF:
-		case PROP_UNDEF:
 			val.SetUndefinedValue( );
 			break;
 
@@ -276,13 +288,11 @@ _Flatten( EvalState &state, Value &val, ExprTree*&ntree, int*) const
 			return false;
 
 		case EVAL_ERROR:
-		case PROP_ERROR:
 			val.SetErrorValue();
 			state.curAd = curAd;
 			return true;
 
 		case EVAL_UNDEF:
-		case PROP_UNDEF:
 			if( expr && state.flattenAndInline ) {
 				ExprTree *expr_ntree = NULL;
 				Value expr_val;
@@ -317,6 +327,14 @@ _Flatten( EvalState &state, Value &val, ExprTree*&ntree, int*) const
 
 		case EVAL_OK:
 		{
+			// Don't flatten or inline a classad that's referred to
+			// by an attribute.
+			if ( tree->GetKind() == CLASSAD_NODE ) {
+				ntree = Copy( );
+				val.SetUndefinedValue( );
+				return true;
+			}
+
 			if( state.depth_remaining <= 0 ) {
 				val.SetErrorValue();
 				state.curAd = curAd;
@@ -353,7 +371,6 @@ FindExpr(EvalState &state, ExprTree *&tree, ExprTree *&sig, bool wantSig) const
 {
 	const ClassAd *current=NULL;
 	const ExprList *adList = NULL;
-	Value	val;
 	bool	rval;
 
 	sig = NULL;
@@ -366,6 +383,8 @@ FindExpr(EvalState &state, ExprTree *&tree, ExprTree *&sig, bool wantSig) const
 			return EVAL_FAIL;					// NAC
 		}										// NAC
 	} else {
+		Value	val;
+
 		// "expr.attr"
 		rval=wantSig?expr->Evaluate(state,val,sig):expr->Evaluate(state,val);
 		if( !rval ) {
@@ -373,62 +392,62 @@ FindExpr(EvalState &state, ExprTree *&tree, ExprTree *&sig, bool wantSig) const
 		}
 
 		if( val.IsUndefinedValue( ) ) {
-			return( PROP_UNDEF );
+			return( EVAL_UNDEF );
 		} else if( val.IsErrorValue( ) ) {
-			return( PROP_ERROR );
+			return( EVAL_ERROR );
 		}
 		
 		if( !val.IsClassAdValue( current ) && !val.IsListValue( adList ) ) {
 			return( EVAL_ERROR );
 		}
-	}
 
-	if( val.IsListValue( ) ) {
-		vector< ExprTree *> eVector;
-		const ExprTree *currExpr;
-			// iterate through exprList and apply attribute reference
-			// to each exprTree
-		for(ExprListIterator itr(adList);!itr.IsAfterLast( );itr.NextExpr( )){
- 			currExpr = itr.CurrentExpr( );
-			if( currExpr == NULL ) {
-				return( EVAL_FAIL );
-			} else {
-				AttributeReference *attrRef = NULL;
-				attrRef = MakeAttributeReference( currExpr->Copy( ),
+		if( val.IsListValue( ) ) {
+			vector< ExprTree *> eVector;
+			const ExprTree *currExpr;
+				// iterate through exprList and apply attribute reference
+				// to each exprTree
+			for(ExprListIterator itr(adList);!itr.IsAfterLast( );itr.NextExpr( )){
+ 				currExpr = itr.CurrentExpr( );
+				if( currExpr == NULL ) {
+					return( EVAL_FAIL );
+				} else {
+					AttributeReference *attrRef = NULL;
+					attrRef = MakeAttributeReference( currExpr->Copy( ),
 												  attributeStr,
 												  false );
-				val.Clear( );
-					// Create new EvalState, within this scope, because
-					// attrRef is only temporary, so we do not want to
-					// cache the evaluated result in the outer state object.
-				EvalState tstate;
-				tstate.SetScopes(state.curAd);
-				rval = wantSig ? attrRef->Evaluate( tstate, val, sig )
-					: attrRef->Evaluate( tstate, val );
-				delete attrRef;
-				if( !rval ) {
-					return( EVAL_FAIL );
-				}
+					val.Clear( );
+						// Create new EvalState, within this scope, because
+						// attrRef is only temporary, so we do not want to
+						// cache the evaluated result in the outer state object.
+					EvalState tstate;
+					tstate.SetScopes(state.curAd);
+					rval = wantSig ? attrRef->Evaluate( tstate, val, sig )
+						: attrRef->Evaluate( tstate, val );
+					delete attrRef;
+					if( !rval ) {
+						return( EVAL_FAIL );
+					}
 				
-				ClassAd *evaledAd = NULL;
-				const ExprList *evaledList = NULL;
-				if( val.IsClassAdValue( evaledAd ) ) {
-					eVector.push_back( evaledAd );
-					continue;
-				}
-				else if( val.IsListValue( evaledList ) ) {
-					eVector.push_back( evaledList->Copy( ) );
-					continue;
-				}
-				else {
-					eVector.push_back( Literal::MakeLiteral( val ) );
+					ClassAd *evaledAd = NULL;
+					const ExprList *evaledList = NULL;
+					if( val.IsClassAdValue( evaledAd ) ) {
+						eVector.push_back( evaledAd );
+						continue;
+					}
+					else if( val.IsListValue( evaledList ) ) {
+						eVector.push_back( evaledList->Copy( ) );
+						continue;
+					}
+					else {
+						eVector.push_back( Literal::MakeLiteral( val ) );
+					}
 				}
 			}
+			tree = ExprList::MakeExprList( eVector );
+			ClassAd *newRoot = new ClassAd( );
+			((ExprList*)tree)->SetParentScope( newRoot );
+			return EVAL_OK;
 		}
-		tree = ExprList::MakeExprList( eVector );
-		ClassAd *newRoot = new ClassAd( );
-		((ExprList*)tree)->SetParentScope( newRoot );
-		return EVAL_OK;
 	}
 		// lookup with scope; this may side-affect state		
 
@@ -441,7 +460,7 @@ FindExpr(EvalState &state, ExprTree *&tree, ExprTree *&sig, bool wantSig) const
 		 */
 	if (!current) { return EVAL_UNDEF; }
 	int rc = current->LookupInScope( attributeStr, tree, state );
-	if ( !expr && rc == EVAL_UNDEF && current->alternateScope ) {
+	if ( !expr && !absolute && rc == EVAL_UNDEF && current->alternateScope ) {
 		rc = current->alternateScope->LookupInScope( attributeStr, tree, state );
 	}
 	return rc;

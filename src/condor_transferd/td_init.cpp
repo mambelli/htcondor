@@ -32,9 +32,9 @@
 static void usage(void);
 
 TransferD::TransferD() :
-	m_treqs(200, hashFuncMyString),
-	m_client_to_transferd_threads(200, hashFuncLong),
-	m_transferd_to_client_threads(200, hashFuncLong)
+	m_treqs(hashFunction),
+	m_client_to_transferd_threads(hashFuncLong),
+	m_transferd_to_client_threads(hashFuncLong)
 {
 	m_initialized = FALSE;
 	m_update_sock = NULL;
@@ -46,7 +46,7 @@ TransferD::TransferD() :
 
 TransferD::~TransferD()
 {	
-	MyString key;
+	std::string key;
 	TransferRequest *treq;
 
 	// delete everything in the table.
@@ -166,7 +166,6 @@ int
 TransferD::accept_transfer_request(FILE *fin)
 {
 	MyString encapsulation_method_line;
-	MyString encap_end_line;
 	EncapMethod em;
 	int rval = 0;
 
@@ -215,10 +214,11 @@ TransferD::accept_transfer_request_encapsulation_old_classads(FILE *fin)
 	const char *classad_delimitor = "---\n";
 	ClassAd *ad;
 	TransferRequest *treq = NULL;
-	MyString cap;
+	std::string cap;
 
 	/* read the transfer request header packet upon construction */
-	ad = new ClassAd(fin, classad_delimitor, eof, error, empty);
+	ad = new ClassAd;
+	InsertFromFile(fin, *ad, classad_delimitor, eof, error, empty);
 	if (empty == TRUE) {
 		EXCEPT("Protocol faliure, can't read initial Info Packet");
 	}
@@ -238,7 +238,8 @@ TransferD::accept_transfer_request_encapsulation_old_classads(FILE *fin)
 
 	// read all the work ads associated with this TransferRequest
 	for (i = 0; i < treq->get_num_transfers(); i++) {
-		ad = new ClassAd(fin, classad_delimitor, eof, error, empty);
+		ad = new ClassAd;
+		InsertFromFile(fin, *ad, classad_delimitor, eof, error, empty);
 		if (empty == TRUE) {
 			EXCEPT("Expected %d transfer job ads, got %d instead.", 
 				treq->get_num_transfers(), i);
@@ -322,9 +323,7 @@ int
 TransferD::accept_transfer_request_handler(Stream *sock)
 {
 	MyString encapsulation_method_line;
-	MyString encap_end_line;
 	EncapMethod em;
-	char *str = NULL;
 
 	dprintf(D_ALWAYS, 
 		"Entering TransferD::accept_transfer_request_handler()\n");
@@ -337,13 +336,10 @@ TransferD::accept_transfer_request_handler(Stream *sock)
 
 	sock->decode();
 
-	if (sock->code(str) == 0) {
+	if (sock->code(encapsulation_method_line) == 0) {
 		EXCEPT("Schedd closed connection, I'm going away.");
 	}
 	sock->end_of_message();
-
-	encapsulation_method_line = str; // makes a copy
-	free(str);
 
 	encapsulation_method_line.trim();
 
@@ -385,7 +381,7 @@ TransferD::accept_transfer_request_encapsulation_old_classads(Stream *sock)
 	int i;
 	ClassAd *ad = NULL;
 	TransferRequest *treq = NULL;
-	MyString cap;
+	std::string cap;
 	ClassAd respad;
 
 	dprintf(D_ALWAYS,
@@ -477,7 +473,7 @@ TransferD::accept_transfer_request_encapsulation_old_classads(Stream *sock)
 
 	respad.Assign(ATTR_TREQ_CAPABILITY, cap);
 
-	dprintf(D_ALWAYS, "Assigned capability to treq: %s.\n", cap.Value());
+	dprintf(D_ALWAYS, "Assigned capability to treq: %s.\n", cap.c_str());
 
 	// This respose ad will contain:
 	//

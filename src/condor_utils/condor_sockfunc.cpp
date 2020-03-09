@@ -99,6 +99,7 @@ int condor_recvfrom(int sockfd, void* buf, size_t buf_size, int flags,
 	return ret;
 }
 
+static double getnameinfo_slow_limit = 2.0;
 int condor_getnameinfo (const condor_sockaddr& addr,
 		                char * __host, socklen_t __hostlen,
 		                char * __serv, socklen_t __servlen,
@@ -108,47 +109,12 @@ int condor_getnameinfo (const condor_sockaddr& addr,
 	socklen_t len = addr.get_socklen();
 	int ret;
 
+	double begin = _condor_debug_get_time_double();
 	ret = getnameinfo( sa, len, __host, __hostlen, __serv, __servlen, __flags);
-	return ret;
-}
-
-int condor_getaddrinfo(const char *node,
-		                const char *service,
-		                const addrinfo *hints,
-		                addrinfo **res)
-{
-	int ret;
-
-	ret = getaddrinfo(node, service, hints, res);
-	return ret;
-}
-
-hostent* condor_gethostbyaddr_ipv6(const condor_sockaddr& addr)
-{
-	const sockaddr* sa = addr.to_sockaddr();
-	sockaddr_storage_ptr sock_address;
-	sock_address.raw = sa;
-	int type = sa->sa_family;
-	hostent* ret;
-	const char* p_addr = NULL;
-	int len;
-
-	if (type == AF_INET) {
-		sockaddr_in* sin4 = sock_address.in;
-		p_addr = (const char*)&sin4->sin_addr;
-		len = sizeof(in_addr);
-	} else if (type == AF_INET6) {
-		sockaddr_in6* sin6 = sock_address.in6;
-		p_addr = (const char*)&sin6->sin6_addr;
-		len = sizeof(in6_addr);
-	} else {
-		dprintf(D_ALWAYS, "condor_gethostbyaddr_ipv6 was passed an sa_family of %d. Only AF_INET (%d) and AF_INET6 (%d) can be handled.", type, int(AF_INET), int(AF_INET6));
-		sockaddr_in* sin4 = sock_address.in;
-		p_addr = (const char*)&sin4->sin_addr;
-		len = 0;
+	double timediff = _condor_debug_get_time_double() - begin;
+	if (timediff > getnameinfo_slow_limit) {
+		dprintf(D_ALWAYS, "WARNING: Saw slow DNS query, which may impact entire system: getnameinfo(%s) took %f seconds.\n", addr.to_ip_string().Value(), timediff);
 	}
-
-	ret = gethostbyaddr(p_addr, len, type);
 	return ret;
 }
 
@@ -158,41 +124,9 @@ int condor_getsockname_ex(int sockfd, condor_sockaddr& addr)
 	ret = condor_getsockname(sockfd, addr);
 	if (ret == 0 && addr.is_addr_any()) {
 		unsigned short portno = addr.get_port();
-		addr = get_local_ipaddr();
+		addr = get_local_ipaddr(addr.get_protocol());
 		addr.set_port(portno);
 	}
 
 	return ret;
 }
-
-
-
-//const char* ipv6_addr_to_hostname(const condor_sockaddr& addr, char* buf, int len)
-//{
-//    struct hostent  *hp;
-//    struct sockaddr_in caddr;
-//
-//	if ( !addr.is_valid() ) return NULL;
-//
-//	hp = condor_gethostbyaddr_ipv6(addr);
-//	if (!hp) return NULL;
-//	return hp->h_name;
-//}
-
-//int ipv6_is_ipaddr(const char* host, condor_sockaddr& addr)
-//{
-//	int ret = FALSE;
-//	in_addr v4_addr;
-//	in6_addr v6_addr;
-//
-//	if ( inet_pton( AF_INET, host, &v4_addr) > 0 ) {
-//		addr = condor_sockaddr(v4_addr, 0);
-//		ret = TRUE;
-//	}
-//	else if ( inet_pton( AF_INET6, host, &v6_addr ) > 0 ) {
-//		addr = condor_sockaddr(v6_addr, 0);
-//		ret = TRUE;
-//	}
-//
-//	return ret;
-//}

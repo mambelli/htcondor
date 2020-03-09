@@ -25,11 +25,18 @@
 #include "selector.h"
 #include <queue>
 
+#ifdef LINUX
+#define USE_ABSTRACT_DOMAIN_SOCKET 1
+#endif
+
 // SharedPortEndpoint receives connections forwarded from SharedPortServer.
 // This enables Condor daemons to share a single network port.
 
 class SharedPortEndpoint: Service {
  public:
+
+	static MyString GenerateEndpointName(char const *daemon_name=NULL,
+		bool addSequenceNo = true);
 
 	SharedPortEndpoint(char const *sock_name=NULL);
 	~SharedPortEndpoint();
@@ -45,10 +52,14 @@ class SharedPortEndpoint: Service {
 
 	void StopListener();
 
-		// returns a contact string suitable for connecting to the
+		// returns the best contact string suitable for connecting to the
 		// SharedPortServer that will forward the connection to us.
 		// May return NULL if remote address cannot be determined.
 	char const *GetMyRemoteAddress();
+
+		// Returns a vector of contact strings suitable for connecting
+		// to the shared port server.  May be empty!
+	const std::vector<Sinful> &GetMyRemoteAddresses();
 
 		// Force an immediate reload of the shared port server's
 		// address.
@@ -78,7 +89,7 @@ class SharedPortEndpoint: Service {
 
 		// Restore state of object stored with serialize().
 		// Returns pointer to anything trailing in inherit_buf.
-	char *deserialize(char *inherit_buf);
+	const char *deserialize(const char *inherit_buf);
 
 		// Do not remove named socket when we stop listening.
 		// Used in parent process when passing this object to a child.
@@ -90,7 +101,8 @@ class SharedPortEndpoint: Service {
 #ifdef WIN32
 	void PipeListenerThread();
 
-	void PipeListenerHelper();
+	static int PipeListenerHelper(void* pthis, void* data);
+	static int DebugLogHelper(void* pthis, void* data);
 
 	//Event used to notify the class that the thread is dead.
 	HANDLE thread_killed;
@@ -117,17 +129,26 @@ class SharedPortEndpoint: Service {
 
 	void DoListenerAccept(ReliSock *return_remote_sock);
 
-	static void paramDaemonSocketDir(MyString &result);
+	static void InitializeDaemonSocketDir();
+	static bool GetDaemonSocketDir(std::string &result);
+	static bool GetAltDaemonSocketDir(std::string &result);
+	static bool CreatedSharedPortDirectory() {return m_created_shared_port_dir;}
 
  private:
+	static bool m_created_shared_port_dir;
+	static bool m_initialized_socket_dir;
+
+	bool m_is_file_socket; // Set to false if we are using a Linux abstract socket.
 	bool m_listening;
 	bool m_registered_listener;
 	MyString m_socket_dir;// dirname of socket
 	MyString m_full_name; // full path of socket
 	MyString m_local_id;  // basename of socket
 	MyString m_remote_addr;  // SharedPortServer addr with our local_id inserted
+	std::vector<Sinful> m_remote_addrs;
 	MyString m_local_addr;
 	int m_retry_remote_addr_timer;
+	int m_max_accepts;
 #ifdef WIN32
 	//Lock for accessing the queue that holds onto the received data structures.
 	CRITICAL_SECTION received_lock;
@@ -140,6 +161,8 @@ class SharedPortEndpoint: Service {
 	bool kill_thread;
 	//Handle to the pipe that listens for connections.
 	HANDLE pipe_end;
+	//temporary inheritable handle to above pipe
+	HANDLE inheritable_to_child;
 
 	//Bookkeeping information for the listener thread.
 	HANDLE thread_handle;
@@ -152,6 +175,8 @@ class SharedPortEndpoint: Service {
 	ReliSock m_listener_sock; // named socket to receive forwarded connections
 #endif
 	int m_socket_check_timer;
+
+	void EnsureInitRemoteAddress();
 
 	int HandleListenerAccept( Stream * stream );
 #ifndef WIN32

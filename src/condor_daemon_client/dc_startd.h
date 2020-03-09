@@ -47,7 +47,8 @@ public:
 			@param id The ClaimId, NULL if unknown
 		*/
 	DCStartd( const char* const name, const char* const pool,
-			  const char* const addr, const char* const id );
+			  const char* const addr, const char* const id,
+			  const char* const ids = NULL);
 
 	DCStartd( const ClassAd *ad, const char *pool = NULL );
 
@@ -59,11 +60,12 @@ public:
 			@return true on success, false on invalid input (NULL)
 		*/
 	bool setClaimId( const char* id );
+	bool setClaimId( const std::string &id ) {return setClaimId(id.c_str());}
 
 		/** @return the ClaimId string for this startd, NULL if we
 			don't have a value yet.
 		*/
-	char* getClaimId( void ) { return claim_id; };
+	const char* getClaimId( void ) { return claim_id; };
 
 		/** This is the old-style way of requesting a claim, not the
 			"generic ClassAd" way, which currently only supports COD
@@ -196,15 +198,19 @@ public:
 		// call error() to get a descriptive error message
 		// how_fast: DRAIN_GRACEFUL, DRAIN_QUICK, DRAIN_FAST
 		// check_expr: optional expression that must be true for all slots to be drained or request fails
-	bool drainJobs(int how_fast,bool resume_on_completion,char const *check_expr,std::string &request_id);
+		// start_expr: optional, specifies START expression to use while draining
+	bool drainJobs(int how_fast,bool resume_on_completion,char const *check_expr,char const *start_expr,std::string &request_id);
 
 		// request_id: the draining request id
 		// returns: true/false on success/failure
 		// call error() to get a descriptive error message
 	bool cancelDrainJobs(char const *request_id);
 
+	bool updateMachineAd( const ClassAd * update, ClassAd * reply, int timeout = -1 );
+
  private:
 	char* claim_id;
+	char* extra_ids;
 
 		// Helper methods
 	bool checkClaimId( void );
@@ -218,7 +224,7 @@ public:
 
 class ClaimStartdMsg: public DCMsg {
 public:
-	ClaimStartdMsg( char const *claim_id, ClassAd const *job_ad, char const *description, char const *scheduler_addr, int alive_interval );
+	ClaimStartdMsg( char const *claim_id, char const *extra_ids, ClassAd const *job_ad, char const *description, char const *scheduler_addr, int alive_interval );
 
 		// Functions that override DCMsg
 	bool writeMsg( DCMessenger *messenger, Sock *sock );
@@ -244,8 +250,10 @@ public:
 		{ return m_have_paired_slot ? &m_paired_startd_ad : NULL; }
 
 	const ClassAd *getJobAd() { return &m_job_ad;}
+	bool putExtraClaims(Sock *sock);
 private:
 	std::string m_claim_id;
+	std::string m_extra_claims;
 	ClassAd m_job_ad;
 	std::string m_description;
 	std::string m_scheduler_addr;

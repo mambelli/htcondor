@@ -62,8 +62,8 @@ EXTERN_C_BEGIN
 extern time_t _sysapi_last_x_event;
 
 /* needed by free_fs_blocks.c */
-extern int _sysapi_reserve_afs_cache;
-extern int _sysapi_reserve_disk;
+extern long long _sysapi_reserve_afs_cache;
+extern long long _sysapi_reserve_disk;
 
 /* needed by idle_time.C */
 extern int _sysapi_startd_has_bad_utmp;
@@ -84,9 +84,6 @@ extern const char * _sysapi_processor_flags;
 /* needed by phys_mem.c */
 extern int _sysapi_memory;
 extern int _sysapi_reserve_memory;
-
-/* needed by ckptpltfrm.c */
-extern char* _sysapi_ckptpltfrm;
 
 /* needed by load_avg.c */
 extern int _sysapi_getload;

@@ -35,7 +35,9 @@
 #include "classad/classad_distribution.h"
 #include "file_transfer.h"
 #include "exit.h"
+#include "condor_holdcodes.h"
 #include "spooled_job_files.h"
+#include "classad_helpers.h"
 
 	// Simplify my error handling and reporting code
 class FailObj {
@@ -81,10 +83,10 @@ public:
 
 		if(cluster != -1) {
 			msg += "(";
-			msg += cluster;
+			msg += IntToStr( cluster );
 			if(proc != -1) {
 				msg += ".";
-				msg += proc;
+				msg += IntToStr( proc );
 			}
 			msg += ") ";
 		}
@@ -179,10 +181,10 @@ static Qmgr_connection *open_q_as_owner(char const *effective_owner,DCSchedd &sc
 static Qmgr_connection *open_job(ClassAd &job,DCSchedd &schedd,FailObj &failobj)
 {
 		// connect to the q as the owner of this job
-	MyString effective_owner;
+	std::string effective_owner;
 	job.LookupString(ATTR_OWNER,effective_owner);
 
-	return open_q_as_owner(effective_owner.Value(),schedd,failobj);
+	return open_q_as_owner(effective_owner.c_str(),schedd,failobj);
 }
 
 static Qmgr_connection *open_job(classad::ClassAd const &job,DCSchedd &schedd,FailObj &failobj)
@@ -251,9 +253,8 @@ ClaimJobResult claim_job(classad::ClassAd const &ad, const char * pool_name, con
 
 		// chown the src job sandbox to the user if appropriate
 	if( result == CJR_OK && !target_is_sandboxed ) {
-		ClassAd old_job_ad(ad); // TODO: get rid of this copy
-		if( SpooledJobFiles::jobRequiresSpoolDirectory(&old_job_ad) ) {
-			if( !SpooledJobFiles::createJobSpoolDirectory(&old_job_ad,PRIV_USER) ) {
+		if( SpooledJobFiles::jobRequiresSpoolDirectory(&ad) ) {
+			if( !SpooledJobFiles::createJobSpoolDirectory(&ad,PRIV_USER) ) {
 				if( error_details ) {
 					error_details->formatstr("Failed to create/chown source job spool directory to the user.");
 				}
@@ -309,9 +310,8 @@ bool yield_job(bool done, int cluster, int proc, classad::ClassAd const &job_ad,
 
 		// chown the src job sandbox back to condor is appropriate
 	if( !target_is_sandboxed ) {
-		ClassAd old_job_ad(job_ad); // TODO: get rid of this copy
-		if( SpooledJobFiles::jobRequiresSpoolDirectory(&old_job_ad) ) {
-			SpooledJobFiles::chownSpoolDirectoryToCondor(&old_job_ad);
+		if( SpooledJobFiles::jobRequiresSpoolDirectory(&job_ad) ) {
+			SpooledJobFiles::chownSpoolDirectoryToCondor(&job_ad);
 		}
 	}
 
@@ -432,6 +432,19 @@ static bool submit_job_with_current_priv( ClassAd & src, const char * schedd_nam
 		return false;
 	}
 
+	// Starting in 8.5.8, schedd clients can't set X509-related attributes
+	// other than the name of the proxy file.
+	std::set<std::string, classad::CaseIgnLTStr> filter_attrs;
+	CondorVersionInfo ver_info( schedd.version() );
+	if ( ver_info.built_since_version( 8, 5, 8 ) ) {
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_SUBJECT );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_EXPIRATION );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_EMAIL );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_VONAME );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_FIRST_FQAN );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_FQAN );
+	}
+
 	int cluster = NewCluster();
 	if( cluster < 0 ) {
 		failobj.fail("Failed to create a new cluster (%d)\n", cluster);
@@ -456,6 +469,7 @@ static bool submit_job_with_current_priv( ClassAd & src, const char * schedd_nam
 		// we need to submit on hold (taken from condor_submit.V6/submit.C)
 		src.Assign(ATTR_JOB_STATUS, 5); // 5==HELD
 		src.Assign(ATTR_HOLD_REASON, "Spooling input data files");
+		src.Assign(ATTR_HOLD_REASON_CODE, CONDOR_HOLD_CODE_SpoolingInput);
 
 			// See the comment in the function body of ExpandInputFileList
 			// for an explanation of what is going on here.
@@ -474,10 +488,14 @@ static bool submit_job_with_current_priv( ClassAd & src, const char * schedd_nam
 	ExprTree * tree;
 	const char *lhstr = 0;
 	const char *rhstr = 0;
-	src.ResetExpr();
-	while( src.NextExpr(lhstr, tree) ) {
+	for( auto itr = src.begin(); itr != src.end(); itr++ ) {
+		lhstr = itr->first.c_str();
+		tree = itr->second;
+		if ( filter_attrs.find( lhstr ) != filter_attrs.end() ) {
+			continue;
+		}
 		rhstr = ExprTreeToString( tree );
-		if( !lhstr || !rhstr) { 
+		if( !rhstr) { 
 			failobj.fail("Problem processing classad\n");
 			return false;
 		}
@@ -503,29 +521,32 @@ static bool submit_job_with_current_priv( ClassAd & src, const char * schedd_nam
 		}
 	}
 
+	schedd.reschedule();
+
 	if(cluster_out) { *cluster_out = cluster; }
 	if(proc_out) { *proc_out = proc; }
 
 	return true;
 }
 
-bool submit_job( ClassAd & src, const char * schedd_name, const char * pool_name, bool is_sandboxed, int * cluster_out /*= 0*/, int * proc_out /*= 0 */)
+bool submit_job(const std::string & owner, const std::string &domain, ClassAd & src, const char * schedd_name, const char * pool_name, bool is_sandboxed, int * cluster_out /*= 0*/, int * proc_out /*= 0 */)
 {
 	bool success;
-	priv_state priv = set_user_priv_from_ad(src);
+
+	if (!init_user_ids(owner.c_str(), domain.c_str()))
+	{
+		dprintf(D_ALWAYS, "Failed in init_user_ids(%s,%s)\n",
+			owner.c_str(),
+			domain.c_str());
+		return false;
+	}
+	TemporaryPrivSentry sentry(PRIV_USER);
 
 	success = submit_job_with_current_priv(src,schedd_name,pool_name,is_sandboxed,cluster_out,proc_out);
 
-	set_priv(priv);
 	uninit_user_ids();
 
 	return success;
-}
-
-bool submit_job( classad::ClassAd & src, const char * schedd_name, const char * pool_name, bool is_sandboxed, int * cluster_out /*= 0*/, int * proc_out /*= 0 */)
-{
-	ClassAd src2 = src;
-	return submit_job(src2, schedd_name, pool_name, is_sandboxed, cluster_out, proc_out);
 }
 
 /*
@@ -771,14 +792,21 @@ static bool finalize_job_with_current_privs(classad::ClassAd const &job,int clus
 	return true;
 }
 
-bool finalize_job(classad::ClassAd const &ad,int cluster, int proc, const char * schedd_name, const char * pool_name, bool is_sandboxed)
+bool finalize_job(const std::string & owner, const std::string &domain, classad::ClassAd const &ad,int cluster, int proc, const char * schedd_name, const char * pool_name, bool is_sandboxed)
 {
 	bool success;
-	priv_state priv = set_user_priv_from_ad(ad);
+
+	if (!init_user_ids(owner.c_str(), domain.c_str()))
+	{
+		dprintf(D_ALWAYS, "Failed in init_user_ids(%s,%s)\n",
+			owner.c_str(),
+			domain.c_str());
+		return false;
+	}
+	TemporaryPrivSentry sentry(PRIV_USER);
 
 	success = finalize_job_with_current_privs(ad,cluster,proc,schedd_name,pool_name,is_sandboxed);
 
-	set_priv(priv);
 	uninit_user_ids();
 	return success;
 }
@@ -797,11 +825,12 @@ static bool remove_job_with_current_privs(int cluster, int proc, char const *rea
 		return false;
 	}
 
-	MyString constraint;
-	constraint.formatstr("(ClusterId==%d&&ProcId==%d)", cluster, proc);
+	std::string id_str;
+	formatstr(id_str, "%d.%d", cluster, proc);
+	StringList job_ids(id_str.c_str());
 	ClassAd *result_ad;
 
-	result_ad = schedd.removeJobs(constraint.Value(), reason, &errstack, AR_LONG);
+	result_ad = schedd.removeJobs(&job_ids, reason, &errstack, AR_LONG);
 
 	PROC_ID job_id;
 	job_id.cluster = cluster;
@@ -837,49 +866,6 @@ bool remove_job(classad::ClassAd const &ad, int cluster, int proc, char const *r
 	set_priv(priv);
 	uninit_user_ids();
 	return success;
-}
-
-bool InitializeUserLog( classad::ClassAd const &job_ad, WriteUserLog *ulog, bool *no_ulog )
-{
-	int cluster, proc;
-	std::string owner;
-	std::string userLogFile;
-	std::string domain;
-	std::string gjid;
-	std::string dagmanLogFile;
-	bool use_xml = false;
-
-	ASSERT(ulog);
-	ASSERT(no_ulog);
-
-	userLogFile[0] = '\0';
-	dagmanLogFile[0] = '\0';
-	std::vector<const char*> logfiles;
-	job_ad.EvaluateAttrString( ATTR_ULOG_FILE, userLogFile );
-	if ( userLogFile[0] != '\0' ) {
-		logfiles.push_back( userLogFile.c_str());
-	}
-	job_ad.EvaluateAttrString( ATTR_DAGMAN_WORKFLOW_LOG, dagmanLogFile );
-	if( dagmanLogFile[0] != '\0') {
-		logfiles.push_back( dagmanLogFile.c_str() );
-	}
-	*no_ulog = logfiles.empty();
-	if(*no_ulog) {
-		return true;
-	}
-
-	job_ad.EvaluateAttrString(ATTR_OWNER,owner);
-	job_ad.EvaluateAttrInt( ATTR_CLUSTER_ID, cluster );
-	job_ad.EvaluateAttrInt( ATTR_PROC_ID, proc );
-	job_ad.EvaluateAttrString( ATTR_NT_DOMAIN, domain );
-	job_ad.EvaluateAttrBool( ATTR_ULOG_USE_XML, use_xml );
-	job_ad.EvaluateAttrString( ATTR_GLOBAL_JOB_ID, gjid );
-
-	if(!ulog->initialize(owner.c_str(), domain.c_str(), logfiles, cluster, proc, 0, gjid.c_str())) {
-		return false;
-	}
-	ulog->setUseXML( use_xml );
-	return true;
 }
 
 bool InitializeAbortedEvent( JobAbortedEvent *event, classad::ClassAd const &job_ad )
@@ -1009,15 +995,14 @@ bool InitializeHoldEvent( JobHeldEvent *event, classad::ClassAd const &job_ad )
 bool WriteEventToUserLog( ULogEvent const &event, classad::ClassAd const &ad )
 {
 	WriteUserLog ulog;
-	bool no_ulog = false;
 
-	if(!InitializeUserLog(ad,&ulog,&no_ulog)) {
+	if ( ! ulog.initialize(ad, true) ) {
 		dprintf( D_FULLDEBUG,
 				 "(%d.%d) Unable to open user log (event %d)\n",
 				 event.cluster, event.proc, event.eventNumber );
 		return false;
 	}
-	if(no_ulog) {
+	if ( ! ulog.willWrite() ) {
 		return true;
 	}
 
@@ -1066,6 +1051,40 @@ bool WriteHoldEventToUserLog( classad::ClassAd const &ad )
 	return WriteEventToUserLog( event, ad );
 }
 
+bool WriteExecuteEventToUserLog( classad::ClassAd const &ad )
+{
+	int cluster;
+	int proc;
+	ad.EvaluateAttrInt( ATTR_CLUSTER_ID, cluster );
+	ad.EvaluateAttrInt( ATTR_PROC_ID, proc );
+
+	dprintf( D_FULLDEBUG,
+			 "(%d.%d) Writing execute record to user logfile\n",
+			 cluster, proc );
+
+	ExecuteEvent event;
+
+	std::string routed_id;
+	ad.EvaluateAttrString( "RoutedToJobId", routed_id );
+	event.setExecuteHost( routed_id.c_str() );
+
+	return WriteEventToUserLog( event, ad );
+}
+
+bool WriteEvictEventToUserLog( classad::ClassAd const &ad )
+{
+	int cluster;
+	int proc;
+	ad.EvaluateAttrInt( ATTR_CLUSTER_ID, cluster );
+	ad.EvaluateAttrInt( ATTR_PROC_ID, proc );
+
+	dprintf( D_FULLDEBUG,
+			 "(%d.%d) Writing evict record to user logfile\n",
+			 cluster, proc );
+	JobEvictedEvent event;
+
+	return WriteEventToUserLog( event, ad );
+}
 
 
 // The following is copied from gridmanager/basejob.C

@@ -20,7 +20,6 @@
 
 #include "condor_common.h"
 #include "condor_debug.h"
-#include "condor_syscall_mode.h"
 #include "condor_uid.h"
 #include "condor_config.h"
 #include "condor_environ.h"
@@ -28,11 +27,12 @@
 #include "my_username.h"
 #include "daemon.h"
 #include "store_cred.h"
+#include "../condor_sysapi/sysapi.h"
 
 /* See condor_uid.h for description. */
 static char* CondorUserName = NULL;
 static char* RealUserName = NULL;
-static int SwitchIds = TRUE;
+static int SetPrivIgnoreAllRequests = TRUE;  // this is true until daemon_core sets it to false for daemons
 static int UserIdsInited = FALSE;
 static int OwnerIdsInited = FALSE;
 #ifdef WIN32
@@ -154,7 +154,7 @@ static const struct {
       {SID_REVISION, 2, SECURITY_NT_AUTHORITY, {SECURITY_BUILTIN_DOMAIN_RID}}, DOMAIN_ALIAS_RID_ADMINS,
       {SID_REVISION, 2, SECURITY_NT_AUTHORITY, {SECURITY_BUILTIN_DOMAIN_RID}}, DOMAIN_ALIAS_RID_USERS,
    };
-#pragma pack(pop, 1)
+#pragma pack(pop)
 
 // return a copy of the SID of the owner of the current process
 //
@@ -186,9 +186,24 @@ const PSID my_user_Sid()
 } 
 #endif 
 
+// called by deamonCore to conditionally enable priv switching
+// returns TRUE if priv switching is enabled, FALSE if not.
+int
+set_priv_initialize(void)
+{
+	SetPrivIgnoreAllRequests = FALSE;
+	return can_switch_ids();
+}
+
 int
 can_switch_ids( void )
 {
+   static int SwitchIds = TRUE;
+
+   if (SetPrivIgnoreAllRequests) {
+	   return FALSE;
+   }
+
 #ifdef WIN32
    static bool HasChecked = false;
    // can't switch users if we're not root/SYSTEM
@@ -216,7 +231,7 @@ can_switch_ids( void )
          static const LPCTSTR needed[] = {
             SE_INCREASE_QUOTA_NAME, //needed by CreateProcessAsUser
             //SE_TCB_NAME,            //needed on Win2k to CreateProcessAsUser
-            SE_PROF_SINGLE_PROCESS_NAME, //needed?? to get CPU% and Memory/Disk useage for our children
+            SE_PROF_SINGLE_PROCESS_NAME, //needed?? to get CPU% and Memory/Disk usage for our children
             SE_CREATE_GLOBAL_NAME,  //needed to create named shared memory
             SE_CHANGE_NOTIFY_NAME,  //needed by CreateProcessAsUser
             SE_SECURITY_NAME,       //needed to change file ACL's
@@ -271,6 +286,47 @@ can_switch_ids( void )
 }
 
 
+#ifdef LINUX
+static int should_use_keyring_sessions() {
+	static int UseKeyringSessions = FALSE;
+	static int DidParamForKeyringSessions = FALSE;
+
+	if(!DidParamForKeyringSessions) {
+		UseKeyringSessions = param_boolean("USE_KEYRING_SESSIONS", false);
+
+		if (UseKeyringSessions) {
+			// pre 3.X kernels don't have full support for our use
+			// of this.  specifically, you can't create a new
+			// keyring session in a clone() which we rely on (by
+			// default) for spawning shadows.  suggest a config
+			// change as a workaround and EXCEPT if that's the
+			// case.
+			bool using_clone = param_boolean("USE_CLONE_TO_CREATE_PROCESSES", true);
+			bool is_modern = sysapi_is_linux_version_atleast("3.0.0");
+			if (using_clone && !is_modern) {
+				EXCEPT("USE_KEYRING_SESSIONS==true and USE_CLONE_TO_CREATE_PROCESSES==true are not compatible with a pre-3.0.0 kernel!");
+			}
+		}
+		DidParamForKeyringSessions = true;
+	}
+	return UseKeyringSessions;
+}
+#endif
+
+#ifdef LINUX
+static int keyring_session_creation_timeout() {
+	static int KeyringSessionCreationTimeout = 0;
+	static int DidParamForKeyringSessionCreationTimeout = FALSE;
+
+	if(!DidParamForKeyringSessionCreationTimeout) {
+		KeyringSessionCreationTimeout = param_boolean("KEYRING_SESSION_CREATION_TIMEOUT", 20);
+		DidParamForKeyringSessionCreationTimeout = true;
+	}
+	return KeyringSessionCreationTimeout;
+}
+#endif
+
+
 /* End Common Bits */
 
 
@@ -289,12 +345,52 @@ gid_t get_my_gid() { return 999999; }
 int set_file_owner_ids( uid_t uid, gid_t gid ) { return FALSE; }
 void uninit_file_owner_ids() {}
 
+DWORD Logon32Type()
+{
+	static DWORD logon32_type = 0; // 0 is undefined, default is LOGON32_LOGON_INTERACTIVE, but LOGON32_LOGON_NETWORK is allowed.
+	if ( ! logon32_type) {
+		logon32_type = 1; // default to INTERACTIVE/NETWORK (i.e. try both)
+		auto_free_ptr logon(param("WINDOWS_LOGON32_TYPE"));
+		if (logon) {
+			if (YourStringNoCase("AUTO") == logon) {
+				logon32_type = 1;
+			} else if (YourStringNoCase("NETWORK") == logon) {
+				logon32_type = LOGON32_LOGON_NETWORK;
+			} else if (YourStringNoCase("INTERACTIVE") == logon) {
+				logon32_type = LOGON32_LOGON_INTERACTIVE;
+			} else if (YourStringNoCase("BATCH") == logon) {
+				logon32_type = LOGON32_LOGON_BATCH;
+			} else if (YourStringNoCase("SERVICE") == logon) {
+				logon32_type = LOGON32_LOGON_SERVICE;
+			}
+		}
+	}
+	return logon32_type;
+}
+const char * Logon32TypeName(DWORD logon)
+{
+	static const char * const names[] = {
+		"undefined (INTERACTIVE/NETWORK)", // 0
+		"auto (INTERACTIVE/NETWORK)",   // 1
+		"LOGON_INTERACTIVE", // 2 LOGON32_LOGON_INTERACTIVE
+		"LOGON_NETWORK",     // 3 LOGON32_LOGON_NETWORK
+		"LOGON_BATCH",       // 4 LOGON32_LOGON_BATCH
+		"LOGON_SERVICE",     // 5 LOGON32_LOGON_SERVICE
+	};
+	if (logon < 0 || logon > COUNTOF(names)) {
+		return "invalid";
+	}
+	return names[logon];
+}
 
 // Cover our getuid...
 uid_t getuid() { return get_my_uid(); }
 
 // Static/Global objects
-extern dynuser *myDynuser; 	// the "system wide" dynuser object
+
+// This is the global object to access Dynuser.
+dynuser		myDyn;
+dynuser		*myDynuser = &myDyn;
 
 static HANDLE CurrUserHandle = NULL;
 static char *UserLoginName = NULL; // either a "nobody" account or the submitting user
@@ -464,22 +560,50 @@ init_user_ids(const char username[], const char domain[])
 			delete[](w_pw);
 			w_pw = NULL;
 
+			DWORD l32type = Logon32Type();
+			bool retry_with_network = false;
+			if (l32type < LOGON32_LOGON_INTERACTIVE) { // try both INTERACTIVE and NETWORK?
+				l32type = LOGON32_LOGON_INTERACTIVE;
+				retry_with_network = true;
+			}
+
 			// now that we got a password, see if it is good.
 			retval = LogonUser(
 				user,						// user name
 				dom,						// domain or server - local for now
 				pw,							// password
-				LOGON32_LOGON_INTERACTIVE,	// type of logon operation. 
-											// LOGON_BATCH doesn't seem to work right here.
+				l32type,					// type of logon operation.
 				LOGON32_PROVIDER_DEFAULT,	// logon provider
 				&CurrUserHandle				// receive tokens handle
-			);
+				);
 			
 			if ( !retval ) {
-				dprintf(D_FULLDEBUG,"Locally stored credential for %s@%s is stale\n",
-					user,dom);
+				DWORD err = GetLastError();
+				dprintf(D_FULLDEBUG,"Locally stored credential for %s@%s is invalid for %s. NTStatus=%d : %s\n",
+					user,dom, Logon32TypeName(l32type), err, GetLastErrorString(err));
 				// Set handle to NULL to make certain we recall LogonUser again below
-				CurrUserHandle = NULL;	
+				CurrUserHandle = NULL;
+
+				if ((err == ERROR_LOGON_TYPE_NOT_GRANTED) && retry_with_network) {
+					l32type = LOGON32_LOGON_NETWORK;
+					retval = LogonUser(
+						user,						// user name
+						dom,						// domain or server - local for now
+						pw,							// password
+						l32type,					// type of logon operation.
+						LOGON32_PROVIDER_DEFAULT,	// logon provider
+						&CurrUserHandle				// receive tokens handle
+						);
+					if ( ! retval) {
+						err = GetLastError();
+						dprintf(D_FULLDEBUG,"Locally stored credential for %s@%s is also invalid for %s. NTStatus=%d : %s\n",
+							user,dom, Logon32TypeName(l32type), err, GetLastErrorString(err));
+						// Set handle to NULL to make certain we recall LogonUser again below
+						CurrUserHandle = NULL;
+					} else {
+						got_password = true;	// so we don't bother going to a credd
+					}
+				}
 			} else {
 				got_password = true;	// so we don't bother going to a credd
 			}
@@ -491,7 +615,6 @@ init_user_ids(const char username[], const char domain[])
 
 		char *credd_host = param("CREDD_HOST");
 		if (credd_host && got_password==false) {
-#if 1
            got_password = get_password_from_credd(
               credd_host,
               username,
@@ -499,33 +622,6 @@ init_user_ids(const char username[], const char domain[])
               pw,
               sizeof(pw));
            got_password_from_credd = got_password;
-#else
-			dprintf(D_FULLDEBUG, "trying to fetch password from credd: %s\n", credd_host);
-			Daemon credd(DT_CREDD);
-			Sock * credd_sock = credd.startCommand(CREDD_GET_PASSWD,Stream::reli_sock,10);
-			if ( credd_sock ) {
-				credd_sock->put((char*)username);	// send user
-				credd_sock->put((char*)domain);		// send domain
-				credd_sock->end_of_message();
-				credd_sock->decode();
-				pw[0] = '\0';
-				int my_stupid_sizeof_int_for_damn_cedar = sizeof(pw);
-				char *my_buffer = pw;
-				if ( credd_sock->code(my_buffer,my_stupid_sizeof_int_for_damn_cedar) && pw[0] ) {
-					got_password = true;
-					got_password_from_credd = true;
-				} else {
-					dprintf(D_FULLDEBUG,
-							"credd (%s) did not have info for %s@%s\n",
-							credd_host, username,domain);
-				}
-				delete credd_sock;
-				credd_sock = NULL;
-			} else {
-				dprintf(D_FULLDEBUG,"Failed to contact credd %s: %s\n",
-					credd_host,credd.error() ? credd.error() : "");
-			}
-#endif
 		}
 		if (credd_host) free(credd_host);
 
@@ -536,6 +632,13 @@ init_user_ids(const char username[], const char domain[])
 		} else {
 			dprintf(D_FULLDEBUG, "Found credential for user '%s'\n", username);
 
+			DWORD l32type = Logon32Type();
+			bool retry_with_network = false;
+			if (l32type < LOGON32_LOGON_INTERACTIVE) { // try both INTERACTIVE and NETWORK?
+				l32type = LOGON32_LOGON_INTERACTIVE;
+				retry_with_network = true;
+			}
+
 			// If we have not yet called LogonUser, then CurrUserHandle is NULL,
 			// and we need to call it here.
 			if ( CurrUserHandle == NULL ) {
@@ -543,18 +646,36 @@ init_user_ids(const char username[], const char domain[])
 					user,						// user name
 					dom,						// domain or server - local for now
 					pw,							// password
-					LOGON32_LOGON_INTERACTIVE,	// type of logon operation. 
-												// LOGON_BATCH doesn't seem to work right here.
+					l32type,					// type of logon operation.
 					LOGON32_PROVIDER_DEFAULT,	// logon provider
 					&CurrUserHandle				// receive tokens handle
 				);
+				if ( ! retval && retry_with_network && GetLastError() == ERROR_LOGON_TYPE_NOT_GRANTED) {
+					DWORD err = GetLastError();
+					l32type = LOGON32_LOGON_NETWORK;
+					retval = LogonUser(
+						user,						// user name
+						dom,						// domain or server - local for now
+						pw,							// password
+						l32type,					// type of logon operation.
+						LOGON32_PROVIDER_DEFAULT,	// logon provider
+						&CurrUserHandle				// receive tokens handle
+					);
+					if ( ! retval) {
+						DWORD err2 = GetLastError();
+						dprintf(D_FULLDEBUG,"init_user_ids: LogonUser(%s) failed with NT Status %d : %s\n\n",
+							Logon32TypeName(l32type), err2, GetLastErrorString(err2));
+
+						// put previous error and logon type back so that we get the correct error message below
+						l32type = LOGON32_LOGON_INTERACTIVE;
+						SetLastError(err);
+					}
+				}
 			} else {
 				// we already have a good user handle from calling LogonUser to check to
 				// see if our stashed credential was stale or not, so set retval to success
 				retval = 1;	// LogonUser returns nonzero value on success
 			}
-
-			dprintf(D_FULLDEBUG, "LogonUser completed.\n");
 
 			if (UserLoginName) {
 				free(UserLoginName);
@@ -568,13 +689,15 @@ init_user_ids(const char username[], const char domain[])
 			UserDomainName = strdup(domain);
 
 			if ( !retval ) {
-				dprintf(D_ALWAYS, "init_user_ids: LogonUser failed with NT Status %ld\n", 
-					GetLastError());
+				DWORD err = GetLastError();
+				dprintf(D_ALWAYS, "init_user_ids: %s@%s LogonUser(%s) failed with NT Status %d : %s\n",
+					user, dom, Logon32TypeName(l32type), err, GetLastErrorString(err));
 				retval =  0;	// return of 0 means FAILURE
 			} else {
+				dprintf(D_FULLDEBUG, "LogonUser completed.\n");
+
 				// stash the new token in our cache
-				cached_tokens.storeToken(UserLoginName, UserDomainName,
-					   	CurrUserHandle);
+				cached_tokens.storeToken(UserLoginName, UserDomainName, CurrUserHandle);
 				UserIdsInited = true;
 
 				// if we got the password from the credd, and the admin wants passwords stashed
@@ -633,6 +756,7 @@ init_user_ids(const char username[], const char domain[])
 	}
 }
 
+// WINDOWS
 priv_state
 _set_priv(priv_state s, const char *file, int line, int dologging)
 {
@@ -683,7 +807,7 @@ _set_priv(priv_state s, const char *file, int line, int dologging)
 			break;
 		case PRIV_USER:
 		case PRIV_USER_FINAL:
-			if ( dologging ) {
+			if ( dologging && IsFulldebug(D_FULLDEBUG) ) {
 				dprintf(D_FULLDEBUG, 
 						"TokenCache contents: \n%s", 
 						cached_tokens.cacheToString().Value());
@@ -739,7 +863,6 @@ const char* get_condor_username()
 	PTOKEN_USER pTokenUser = (PTOKEN_USER)InfoBuffer;
 	DWORD dwInfoBufferSize,dwAccountSize = 200, dwDomainSize = 200;
 	SID_NAME_USE snu;
-	int length;
 
 	if ( CondorUserName )
 		return CondorUserName;
@@ -756,7 +879,7 @@ const char* get_condor_username()
 	LookupAccountSid(NULL, pTokenUser->User.Sid, szAccountName,
 		&dwAccountSize,szDomainName, &dwDomainSize, &snu);
 
-	length = strlen(szAccountName) + strlen(szDomainName) + 4;
+	size_t length = strlen(szAccountName) + strlen(szDomainName) + 4;
 	CondorUserName = (char *) malloc(length);
 	if (CondorUserName == NULL) {
 		EXCEPT("Out of memory. Aborting.");
@@ -825,12 +948,6 @@ delete_passwd_cache() {
 
 #include <grp.h>
 
-#if defined(AIX31) || defined(AIX32)
-#include <sys/types.h>
-#include <sys/id.h>
-#define SET_EFFECTIVE_UID(id) setuidx(ID_REAL|ID_EFFECTIVE,id)
-#define SET_REAL_UID(id) setuidx(ID_SAVED|ID_REAL|ID_EFFECTIVE,id)
-#else
 #define SET_EFFECTIVE_UID(id) seteuid(id)
 #define SET_REAL_UID(id) setuid(id)
 #define SET_EFFECTIVE_GID(id) setegid(id)
@@ -839,7 +956,6 @@ delete_passwd_cache() {
 #define GET_REAL_UID() getuid()
 #define GET_EFFECTIVE_GID() getegid()
 #define GET_REAL_GID() getgid()
-#endif
 
 #include "condor_debug.h"
 #include "passwd_cache.unix.h"
@@ -921,20 +1037,12 @@ delete_passwd_cache() {
 void
 init_condor_ids()
 {
-	int scm;
 	bool result;
 	char* env_val = NULL;
 	char* config_val = NULL;
 	char* val = NULL;
 	uid_t envCondorUid = INT_MAX;
 	gid_t envCondorGid = INT_MAX;
-
-        /*
-        ** N.B. if we are using the yellow pages, system calls which are
-        ** not supported by either remote system calls or file descriptor
-        ** mapping will occur.  Thus we must be in LOCAL/UNRECORDED mode here.
-        */
-	scm = SetSyscalls( SYS_LOCAL | SYS_UNRECORDED );
 
 	uid_t MyUid = get_my_uid();
 	gid_t MyGid = get_my_gid();
@@ -947,11 +1055,7 @@ init_condor_ids()
 	const char	*envName = EnvGetName( ENV_UG_IDS ); 
 	if( (env_val = getenv(envName)) ) {
 		val = env_val;
-	} else if( (config_val = param_without_default(envName)) ) {
-		// I had to change this to param_without_default because there's no way
-		// to put a default value of condor.condor in the default value table.
-		// In the future, there should be a way to call a function to find out
-		// the default value for a parameter, but for now this should work.
+	} else if( (config_val = param(envName)) ) {
 		val = config_val;
 	}
 	if( val ) {  
@@ -1070,7 +1174,6 @@ init_condor_ids()
 	}
 
 	(void)endpwent();
-	(void)SetSyscalls( scm );
 	
 	CondorIdsInited = TRUE;
 }
@@ -1080,6 +1183,18 @@ static int
 set_user_ids_implementation( uid_t uid, gid_t gid, const char *username, 
 							 int is_quiet ) 
 {
+		// Don't allow changing of user ids when we're in user priv state.
+	if ( CurrentPrivState == PRIV_USER || CurrentPrivState == PRIV_USER_FINAL ) {
+		if ( uid != UserUid || gid != UserGid ) {
+			if ( !is_quiet ) {
+				dprintf( D_ALWAYS, "ERROR: Attempt to change user ids while in user privilege state\n" );
+			}
+			return FALSE;
+		} else {
+			return TRUE;
+		}
+	}
+
 	if( uid == 0 || gid == 0 ) {
 			// NOTE: we want this dprintf() even if we're in quiet
 			// mode, since we should *never* be allowing this.
@@ -1182,33 +1297,12 @@ init_nobody_ids( int is_quiet )
 	if (! result ) {
 
 
-#ifdef HPUX
-		// the HPUX9 release does not have a default entry for nobody,
-		// so we'll help condor admins out a bit here...
-		nobody_uid = 59999;
-		nobody_gid = 59999;
-#else
 		if( ! is_quiet ) {
 			dprintf( D_ALWAYS, 
 					 "Can't find UID for \"nobody\" in passwd file\n" );
 		}
 		return FALSE;
-#endif
 	} 
-
-#ifdef HPUX
-	// HPUX9 has a bug in that getpwnam("nobody") always returns
-	// a gid of 60001, no matter what the group file (or NIS) says!
-	// on top of that, legal UID/GIDs must be -1<x<60000, so unless we
-	// patch here, we will generate an EXCEPT later when we try a
-	// setgid().  -Todd Tannenbaum, 3/95
-	if( (nobody_uid > 59999) || (nobody_uid <= 0) ) {
-		nobody_uid = 59999;
-	}
-	if( (nobody_gid > 59999) || (nobody_gid <= 0) ) {
-		nobody_gid = 59999;
-	}
-#endif
 
 	/* WARNING: At the top of this function, we initialized 
 	   nobody_uid and nobody_gid to 0, so if for some terrible 
@@ -1230,9 +1324,20 @@ init_nobody_ids( int is_quiet )
 int
 init_user_ids_implementation( const char username[], int is_quiet )
 {
-	int					scm;
 	uid_t 				usr_uid;
 	gid_t				usr_gid;
+
+		// Don't allow changing of user ids when we're in user priv state.
+	if ( CurrentPrivState == PRIV_USER || CurrentPrivState == PRIV_USER_FINAL ) {
+		if ( strcmp( username, UserName ) ) {
+			if ( !is_quiet ) {
+				dprintf( D_ALWAYS, "ERROR: Attempt to change user ids while in user privilege state\n" );
+			}
+			return FALSE;
+		} else {
+			return TRUE;
+		}
+	}
 
 		// So if we are not root, trying to use any user id is bogus
 		// since the OS will disallow it.  So if we are not running as
@@ -1246,13 +1351,6 @@ init_user_ids_implementation( const char username[], int is_quiet )
 										NULL, is_quiet ); 
 	}
 
-	/*
-	** N.B. if we are using the yellow pages, system calls which are
-	** not supported by either remote system calls or file descriptor
-	** mapping will occur.  Thus we must be in LOCAL/UNRECORDED mode here.
-	*/
-	scm = SetSyscalls( SYS_LOCAL | SYS_UNRECORDED );
-
 	if( ! strcasecmp(username, "nobody") ) {
 			// There's so much special logic for user nobody that it's
 			// all in a seperate function now.
@@ -1265,11 +1363,9 @@ init_user_ids_implementation( const char username[], int is_quiet )
 			dprintf( D_ALWAYS, "%s not in passwd file\n", username );
 		}
 		(void)endpwent();
-		(void)SetSyscalls( scm );
 		return FALSE;
 	}
 	(void)endpwent();
-	(void)SetSyscalls( scm );
 	return set_user_ids_implementation( usr_uid, usr_gid, username, is_quiet ); 
 }
 
@@ -1376,9 +1472,106 @@ set_file_owner_ids( uid_t uid, gid_t gid )
 }
 
 
+// since this makes syscalls directly into linux kernel, don't compile
+// this code on non-linux unix. (e.g. OS X)
+#ifdef LINUX
+
+// Define some syscall keyring constants.  Normally these are in
+// <keyutils.h>, but we only need a few values that are not changing,
+// and by placing them here we do not require keyutils development
+// package from being installed at compile time.
+#ifndef KEYCTL_JOIN_SESSION_KEYRING   // don't redefine if keyutils.h included
+  typedef int32_t key_serial_t;
+  #define KEYCTL_JOIN_SESSION_KEYRING     1       /* join or start named session keyring */
+  #define KEYCTL_DESCRIBE                 6       /* describe a key */
+  #define KEYCTL_LINK                     8       /* link a key into a keyring */
+  #define KEYCTL_UNLINK                   9       /* unlink a key from a keyring */
+  #define KEYCTL_SEARCH                   10      /* search for a key in a keyring */
+  #define KEY_SPEC_SESSION_KEYRING        -3      /* - key ID for session-specific keyring */
+  #define KEY_SPEC_USER_KEYRING           -4      /* - key ID for UID-specific keyring */
+  #define KEY_SPEC_INVALID_KEYRING        -99     /* - key ID for "invalid keyring" */
+  #define KEY_SPEC_INVALID_UID            -1      /* - user ID for "invalid user" */
+#endif  // of ifndef KEYCTL_JOIN_SESSION_KEYRING
+
+// helper functions to avoid importing libkeyutils
+static key_serial_t condor_keyctl_session(const char* n) {
+  return syscall(__NR_keyctl, KEYCTL_JOIN_SESSION_KEYRING, n);
+}
+
+static key_serial_t condor_keyctl_search(key_serial_t k, const char* t, const char* d, key_serial_t r) {
+  return syscall(__NR_keyctl, KEYCTL_SEARCH, k, t, d, r);
+}
+
+static long condor_keyctl_link(key_serial_t k, key_serial_t r) {
+  return syscall(__NR_keyctl, KEYCTL_LINK, k, r);
+}
+
+static int   CurrentSessionKeyring = KEY_SPEC_INVALID_KEYRING;
+static uid_t CurrentSessionKeyringUID = KEY_SPEC_INVALID_UID;
+static int   PreviousSessionKeyring = KEY_SPEC_INVALID_KEYRING;
+static uid_t PreviousSessionKeyringUID = KEY_SPEC_INVALID_UID;
+
+#endif
+
+
+// UNIX
 priv_state
 _set_priv(priv_state s, const char *file, int line, int dologging)
 {
+	/* NOTE  NOTE   NOTE  NOTE
+	 * This function is called from deep inside dprintf.  To
+	 * avoid potentially nasty recursive situations, ONLY call
+	 * dprintf() from inside of this function if the
+	 * dologging parameter is non-zero.
+	 * THIS IS A LIE, SEE COMMENT DIRECTLY BELOW.
+	 */
+
+	// dologging is NOT a boolean!  It currently can be one of:
+	//
+	// 0 == no logging (avoid recursion because of priv changes inside dprintf itself)
+	// 1 == go ahead and log
+	// 999 == in between clone() and exec(), so DEFINITELY DO NOT CALL dprintf()!!!!
+	//
+	// apparently, all the places that currently treat non-zero as true are not
+	// in execution paths that occur in practice.  however, the new keyring session
+	// code definitely hits this case.  in order to leave old code alone, I am only
+	// using the really_dologging inside the new keyring session code, but perhaps all
+	// instances of dologging should be changed to really_dologging in this function.
+	//
+
+	// H   H  EEEEE  Y   Y
+	// H   H  E       Y Y
+	// HHHHH  EEEE     Y
+	// H   H  E        Y
+	// H   H  EEEEE    Y
+
+	// You do not want to call dprintf() in this function AT ALL unless you
+	// really know what you are doing.  Normally, it's not a problem to
+	// call this function in PRIV_ROOT or PRIV_USER.  But you can't do it
+	// from inside *this* function.  If you are unlucky, doing so might
+	// cause the log to rotate, and when it does, the log rotation calls
+	// _set_priv to become condor to rotate the logs.  However, this
+	// function is NOT re-entrant because of the global variables that get
+	// modified and Bad Things(TM) that are Extremely Hard To Debug(TM) can
+	// happen.  (Namely, the new log file after rotation is created with
+	// the wrong priv.  This will likely fail if attempted as the user, due
+	// to log directory permissions.  But if it happens as root, it will
+	// succeed, and the next time a daemon tries to open the file as
+	// condor, it will fail and not start up.
+
+	// It can be extremely tricky to get right, so the matter is resolved
+	// for now by declaring that NO printfing is allowed except for the few
+	// below that were carefully studied to make sure that cannot cause
+	// this issue.
+
+	// instead, use the mechanism that buffers the debug messages in RAM
+	// and then dumps them out at the end when it is safe to do so because
+	// the internal state is consistent with reality.
+
+#ifdef LINUX
+	bool really_dologging = (dologging && (dologging != NO_PRIV_MEMORY_CHANGES));
+#endif
+
 	priv_state PrevPrivState = CurrentPrivState;
 	if (s == CurrentPrivState) return s;
 	if (CurrentPrivState == PRIV_USER_FINAL) {
@@ -1399,6 +1592,86 @@ _set_priv(priv_state s, const char *file, int line, int dologging)
 	CurrentPrivState = s;
 
 	if (can_switch_ids()) {
+		if ((s == PRIV_USER || s == PRIV_USER_FINAL) && !UserIdsInited ) {
+			EXCEPT("Programmer Error: attempted switch to user privilege, "
+				   "but user ids are not initialized");
+		}
+
+		// We only get here if we are actually switching state. (Not if we
+		// requested to to switch to the current state, or if we requested
+		// to switch away from a _FINAL state).
+
+#ifdef LINUX
+		if(should_use_keyring_sessions()) {
+
+			// capture current priv state.  we will need to become root to link/unlink keys,
+			// create new sessions, etc.  but if we need to switch back to PRIV_UNKNOWN, or
+			// hit the 'default' case in the switch statement below, the result should be
+			// that we didn't change euid or egid.
+			uid_t saveeuid = geteuid();
+			uid_t saveegid = getegid();
+
+
+			// no matter what state we're switching to, we always create a new
+			// session.  that way we drop the user's creds if switching to condor
+			// or root priv.  we'll have our own keyring if we just recently forked
+			// as well.  and if we're switching to user priv we'll attach the AFS
+			// keyring to this new session.
+			//
+			// creating sessions is cheap and they are garbage
+			// collected very agressively so this is not a problem.
+
+
+			// create a new session
+			set_root_euid();
+
+			// if session creation fails, it could be that old
+			// sessions have not yet been garbage collected.
+			//
+			// since we can't continue without success, sleep a
+			// tiny amount and try again, up to a maximum timeout
+			// in which case we EXCEPT.
+
+			// get the timeout.  if we're going to sleep for 1 millisecond,
+			// convert the timeout to a count and only try that many times.
+			int timeout = keyring_session_creation_timeout();
+			const int sleep_amount = 1000; // 1000 usec == 1 millisec
+			int max_attempts = timeout * (1000000/sleep_amount);
+
+			// attempt creation and loop until success or timeout.
+			while( condor_keyctl_session(NULL) == -1 ) {
+				if (errno == EDQUOT) {
+					// check for timeout
+					if (max_attempts-- <= 0) {
+						EXCEPT("FATAL: Unable to create new session keyring when switching priv.");
+					}
+
+					// sleep briefly, squash return value, try again
+					if(usleep(sleep_amount)) {}
+				} else {
+					_exit(98);
+				}
+			}
+
+			// if we were in priv user and are switching out, we record the keyring
+			// id holding the user's AFS token, since it's likely we'll switch back
+			// to it and can avoid looking it up again.
+
+			if(PrevPrivState == PRIV_USER) {
+				// update state
+				PreviousSessionKeyring = CurrentSessionKeyring;
+				PreviousSessionKeyringUID = CurrentSessionKeyringUID;
+			}
+
+			// restore us to the same euid and egid as when we were called.
+			// the if statements are there just to avoid a compiler warning
+			// about not checking the return value.
+			set_root_euid();
+			if(setegid(saveegid)) {}
+			if(seteuid(saveeuid)) {}
+		}
+#endif
+
 		switch (s) {
 		case PRIV_ROOT:
 			set_root_euid();
@@ -1410,19 +1683,82 @@ _set_priv(priv_state s, const char *file, int line, int dologging)
 			set_condor_euid();
 			break;
 		case PRIV_USER:
-			set_root_euid();	/* must be root to switch */
-			set_user_egid();
-			set_user_euid();
+		case PRIV_USER_FINAL:
+// we can only use linux-specific kernel keyrings
+#ifdef LINUX
+			if(should_use_keyring_sessions()) {
+
+				// First, see if we can simply attach the previously-used keyring
+				if(UserUid != PreviousSessionKeyringUID) {
+					set_root_euid();
+					// no. lookup the new one
+
+					// locate the master keyring.
+					// KEY_SPEC_USER_KEYRING is the uid keyring for root.
+					key_serial_t htcondor_keyring = KEY_SPEC_USER_KEYRING;
+
+					// create the keyring name for user keyring
+					MyString ring_name = "htcondor_uid";
+					ring_name += IntToStr( UserUid );
+
+					// locate the user keyring
+					key_serial_t user_keyring = condor_keyctl_search(htcondor_keyring, "keyring", ring_name.Value(), 0);
+					if(user_keyring == -1) {
+						CurrentSessionKeyring = KEY_SPEC_INVALID_KEYRING;
+						CurrentSessionKeyringUID = KEY_SPEC_INVALID_UID;
+						if (really_dologging) _condor_save_dprintf_line(D_ALWAYS,
+							"KEYCTL: unable to find keyring '%s', error: %s\n",
+							ring_name.Value(), strerror(errno));
+					} else {
+						CurrentSessionKeyring = user_keyring;
+						CurrentSessionKeyringUID = UserUid;
+						if (really_dologging) _condor_save_dprintf_line(D_SECURITY,
+							 "KEYCTL: found user keyring %s (%li) for uid %i.\n",
+							 ring_name.Value(), (long)user_keyring, UserUid);
+					}
+				} else {
+					CurrentSessionKeyring = PreviousSessionKeyring;
+					CurrentSessionKeyringUID = PreviousSessionKeyringUID;
+					if (really_dologging) _condor_save_dprintf_line(D_SECURITY, "KEYCTL: resuming stored keyring %i and uid %i.\n",
+						CurrentSessionKeyring, CurrentSessionKeyringUID);
+				}
+
+
+				// only link if there's something to link to
+				if(CurrentSessionKeyringUID != (uid_t)KEY_SPEC_INVALID_UID) {
+					set_root_euid();
+					// locate the session keyring and uid 0 keyring.
+					key_serial_t user_keyring = CurrentSessionKeyring;
+					key_serial_t sess_keyring = KEY_SPEC_SESSION_KEYRING;
+
+					// link the user keyring to our session keyring
+					long link_success = condor_keyctl_link(user_keyring, sess_keyring);
+					if(link_success == -1) {
+						if (really_dologging) _condor_save_dprintf_line(D_ALWAYS, "KEYCTL: link(%li,%li) error: %s\n",
+							(long)user_keyring, (long)sess_keyring, strerror(errno));
+					} else {
+						if (really_dologging) _condor_save_dprintf_line(D_SECURITY, "KEYCTL: linked key %li to %li\n",
+							(long)user_keyring, (long)sess_keyring);
+					}
+				}
+			}
+#endif // LINUX
+
+			set_root_euid();
+			if(s == PRIV_USER) {
+				// PRIV_USER: change effective
+				set_user_egid();
+				set_user_euid();
+			} else {
+				// PRIV_USER_FINAL: change real
+				set_user_rgid();
+				set_user_ruid();
+			}
 			break;
 		case PRIV_FILE_OWNER:
 			set_root_euid();	/* must be root to switch */
 			set_owner_egid();
 			set_owner_euid();
-			break;
-		case PRIV_USER_FINAL:
-			set_root_euid();	/* must be root to switch */
-			set_user_rgid();
-			set_user_ruid();
 			break;
 		case PRIV_CONDOR_FINAL:
 			set_root_euid();	/* must be root to switch */
@@ -1432,7 +1768,7 @@ _set_priv(priv_state s, const char *file, int line, int dologging)
 			break;
 		default:
 			if ( dologging ) {
-				dprintf( D_ALWAYS, "set_priv: Unknown priv state %d\n", (int)s);
+				_condor_save_dprintf_line( D_ALWAYS, "set_priv: Unknown priv state %d\n", (int)s);
 			}
 		}
 	}
@@ -1451,6 +1787,11 @@ _set_priv(priv_state s, const char *file, int line, int dologging)
 		CurrentPrivState = PrevPrivState;
 	}
 	else if( dologging ) {
+		// this is an okay place to dprintf, so let's dump all the
+		// stuff we've buffered (if any), and then log change in priv
+		// state.
+
+		_condor_dprintf_saved_lines();
 		log_priv(PrevPrivState, CurrentPrivState, file, line);
 	}
 
@@ -1644,15 +1985,17 @@ set_user_egid()
 		// belonging to his/her default group, and might be left
 		// with access to the groups that root belongs to, which 
 		// is a serious security problem.
+		// If we have a user UID but no username, still call setgroups(),
+		// as that will clear out the groups of the UID we're switching
+		// from. In that case, UserGidListSize will be 0, and UserGidList
+		// points to valid memory.
 		
-	if( UserName ) {
-		errno = 0;
-		if ( setgroups( UserGidListSize, UserGidList ) < 0 &&
-			 _setpriv_dologging ) {
-			dprintf( D_ALWAYS, 
-					 "set_user_egid - ERROR: setgroups for %s (gid %d) failed, "
-					 "errno: %s\n", UserName, UserGid, strerror(errno) );
-		}			
+	errno = 0;
+	if ( setgroups( UserGidListSize, UserGidList ) < 0 &&
+		 _setpriv_dologging ) {
+		dprintf( D_ALWAYS,
+				 "set_user_egid - ERROR: setgroups for %s (uid %d, gid %d) failed, "
+				 "errno: (%d) %s\n", UserName ? UserName : "<NULL>", UserUid, UserGid, errno, strerror(errno) );
 	}
 	return SET_EFFECTIVE_GID(UserGid);
 }
@@ -1689,23 +2032,25 @@ set_user_rgid()
 		// belonging to his/her default group, and might be left
 		// with access to the groups that root belongs to, which 
 		// is a serious security problem.
+		// If we have a user UID but no username, still call setgroups(),
+		// as that will clear out the groups of the UID we're switching
+		// from. In that case, UserGidListSize will be 0, and UserGidList
+		// points to valid memory.
 		
-	if( UserName ) {
-		errno = 0;
-		// UserGidList is guaranteed to be allocated and able to hold
-		// one more gid_t beyond UserGidListSize.
-		// If we have a TrackingGid, we stick it in that slot.
-		int size = UserGidListSize;
-		if ( TrackingGid > 0 ) {
-			UserGidList[size] = TrackingGid;
-			size++;
-		}
-		if ( setgroups( size, UserGidList ) < 0 &&
-			 _setpriv_dologging ) {
-			dprintf( D_ALWAYS, 
-					 "set_user_rgid - ERROR: setgroups for %s (gid %d) failed, "
-					 "errno: %d\n", UserName, UserGid, errno );
-		}
+	errno = 0;
+	// UserGidList is guaranteed to be allocated and able to hold
+	// one more gid_t beyond UserGidListSize.
+	// If we have a TrackingGid, we stick it in that slot.
+	int size = UserGidListSize;
+	if ( TrackingGid > 0 ) {
+		UserGidList[size] = TrackingGid;
+		size++;
+	}
+	if ( setgroups( size, UserGidList ) < 0 &&
+		 _setpriv_dologging ) {
+		dprintf( D_ALWAYS, 
+				 "set_user_rgid - ERROR: setgroups for %s (uid %d, gid %d) failed, "
+				 "errno: %d (%s)\n", UserName ? UserName : "<NULL>", UserUid, UserGid, errno, strerror(errno) );
 	}
 	return SET_REAL_GID(UserGid);
 }

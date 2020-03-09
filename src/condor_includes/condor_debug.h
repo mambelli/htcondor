@@ -21,16 +21,8 @@
 #ifndef CONDOR_DEBUG_H
 #define CONDOR_DEBUG_H
 
-// Write a line to the audit log, if configured. Always insert the
-// connection id from the relevant Sock object.
-// TODO This declaration may need to be moved elsewhere
-// TODO Do we like this name?
-// TODO Once we have a connection id in Sock, use that
-#if defined(WIN32)
-#  define audit_log(df, sock, fmt, ...) dprintf(D_AUDIT | D_IDENT | df, (DPF_IDENT)((sock)->get_timeout_raw()), fmt, __VA_ARGS__)
-#else
-#  define audit_log(df, sock, fmt, ...) dprintf(D_AUDIT | D_IDENT | df, (DPF_IDENT)((sock)->get_timeout_raw()), fmt, ##__VA_ARGS__)
-#endif
+#include "condor_system.h"
+#include "condor_header_features.h"
 
 /*
 **	Definitions for category and flags to pass to dprintf
@@ -74,8 +66,8 @@ enum {
    D_NFS,
    D_AUDIT, // messages for the audit log
    D_TEST,  // messages with this category are parsed by various tests.
-   D_UNUSED29,
-   D_UNUSED30,
+   D_STATS,
+   D_MATERIALIZE,
    D_BUG,   // messages that indicate the daemon is going down.
 
    // NOTE: can't go beyond 31 categories so long as DebugOutputChoice is just an unsigned int.
@@ -98,9 +90,10 @@ enum {
 
 
 // format-modifying flags to change the appearance of the dprintf line
+#define D_BACKTRACE     (1<<24) // print stack backtrace
 #define D_IDENT         (1<<25) // 
-#define D_SUB_SECOND    (1<<26) // future: print sub-second timestamp
-#define D_TIMESTAMP     (1<<27) // future: print unix timestamp rather than human-readable time.
+#define D_SUB_SECOND    (1<<26) // print sub-second timestamp
+#define D_TIMESTAMP     (1<<27) // print unix timestamp rather than human-readable time.
 #define D_PID           (1<<28)
 #define D_FDS           (1<<29)
 #define D_CAT           (1<<30)
@@ -126,7 +119,6 @@ enum {
 #ifdef __cplusplus
 #include <string>
 #include <map>
-#include "param_functions.h"
 extern "C" {
 #endif
 
@@ -163,7 +155,7 @@ void dprintf ( int flags, const char *fmt, ... ) CHECK_PRINTF_FORMAT(2,3);
 }
 void dprintf ( int flags, DPF_IDENT ident, const char *fmt, ... ) CHECK_PRINTF_FORMAT(3,4);
 extern "C" {
-// parse config files (via param_functions) and use them to fill out the array of dprintf_output_settings
+// parse config files and use them to fill out the array of dprintf_output_settings
 // one for each output log file. returns the number of entries needed in p_info, (may be larger than c_info!)
 // if p_info is NULL, then dprintf_set_outputs is called with the dprintf_output_settings array.  if != NULL, then
 // the array is returned, calling dprintf_set_outputs is left to the caller.
@@ -176,8 +168,16 @@ int dprintf_config(
 	struct dprintf_output_settings *p_info = NULL, // in,out: if != NULL results of config parsing returned here
 	int c_info = 0); // in: number of entries in p_info array on input.                  
 
-int dprintf_config_tool(const char* subsys = NULL, int flags = 0);
+int dprintf_config_tool(const char* subsys = NULL, int flags = 0, const char * logfile = NULL);
 int dprintf_config_tool_on_error(int flags = 0);
+
+// parse a string of the form "NNN Unit" where NNN is an integer, and Unit is b, Kb, Mb, Gb, or Tb (size units) or s, m, h, d, or w (time units)
+bool dprintf_parse_log_size(const char * input, long long  & value, bool & is_time);
+
+// call when you want to insure that dprintfs are thread safe on Linux regardless of
+// wether daemon core threads are enabled. thread safety cannot be disabled once enabled
+// note that this is always implicitly called on Windows
+void dprintf_make_thread_safe();
 
 // parse strflags and cat_and_flags and merge them into the in,out args
 // for backward compatibility, the D_ALWAYS bit will always be set in basic
@@ -195,12 +195,16 @@ bool dprintf_to_term_check();
 void _condor_dprintf_va ( int flags, DPF_IDENT ident, const char* fmt, va_list args );
 int _condor_open_lock_file(const char *filename,int flags, mode_t perm);
 void PREFAST_NORETURN _EXCEPT_ ( const char *fmt, ... ) CHECK_PRINTF_FORMAT(1,2) GCC_NORETURN;
-void Suicide(void);
+void Suicide(void) GCC_NORETURN;
 void set_debug_flags( const char *strflags, int cat_and_flags );
 void PREFAST_NORETURN _condor_dprintf_exit( int error_code, const char* msg ) GCC_NORETURN;
 void _condor_fd_panic( int line, const char *file );
 void _condor_set_debug_flags( const char *strflags, int cat_and_flags );
 int  _condor_dprintf_is_initialized();
+void _condor_save_dprintf_line_va( int flags, const char* fmt, va_list args );
+void _condor_save_dprintf_line( int flags, const char* fmt, ... );
+void _condor_dprintf_saved_lines( void );
+void condor_except_should_dump_core(int flag);
 
 int  dprintf_config_ContinueOnFailure( int fContinue );
 
@@ -210,16 +214,22 @@ void dprintf_before_shared_mem_clone( void );
 /* must call this after clone(CLONE_VM|CLONE_VFORK) returns */
 void dprintf_after_shared_mem_clone( void );
 
-/* must call this upon entering child of fork() if child calls dprintf */
-void dprintf_init_fork_child( void );
-
-/* call this when done with dprintf in child of fork()
- * This is not necessary if child is just going to exit.  It just
- * ensures that nothing gets inherited by exec().
+/* A simple function for writing to the primary daemon log in an
+ * async-safe manner (e.g. from a signal handler).
+ * See safe_async_simple_fwrite_fd() for argument usage.
  */
-void dprintf_wrapup_fork_child( void );
+#ifdef _WIN64
+void dprintf_async_safe(char const *msg, ULONG_PTR *args, unsigned int num_args);
+#else
+void dprintf_async_safe( char const *msg, unsigned long *args, unsigned int num_args );
+#endif
 
 void dprintf_dump_stack(void);
+
+/* If outputs haven't been configured yet, stop buffering dprintf()
+ * output until they are configured.
+ */
+void dprintf_pause_buffering();
 
 time_t dprintf_last_modification(void);
 void dprintf_touch_log(void);
@@ -288,6 +298,7 @@ extern int	_EXCEPT_Line;			/* Line number of the exception    */
 extern const char	*_EXCEPT_File;		/* File name of the exception      */
 extern int	_EXCEPT_Errno;			/* errno from most recent system call */
 extern int (*_EXCEPT_Cleanup)(int,int,const char*);	/* Function to call to clean up (or NULL) */
+extern void (*_EXCEPT_Reporter)(const char * msg, int line, const char * file); /* called instead of dprintf if non-NULL */
 extern PREFAST_NORETURN void _EXCEPT_(const char*, ...) CHECK_PRINTF_FORMAT(1,2) GCC_NORETURN;
 
 #if defined(__cplusplus)
@@ -295,16 +306,61 @@ extern PREFAST_NORETURN void _EXCEPT_(const char*, ...) CHECK_PRINTF_FORMAT(1,2)
 #endif
 
 #if defined(__cplusplus)
+
+class dprintf_on_function_exit {
+public:
+	dprintf_on_function_exit(bool on_entry, int _flags, const char * fmt, ...);
+	~dprintf_on_function_exit();
+	std::string msg;
+	int flags;
+	bool print_on_exit;
+};
+
+// get (and reset) dprintf runtime statistics (if they are enabled)
+bool _condor_dprintf_runtime (
+	double & disabled_runtime,
+	long & disabled_count,
+	double & enabled_runtime,
+	long & enabled_count,
+	bool clear);
+
+/* must call this upon entering child of fork() if child calls dprintf */
+void dprintf_init_fork_child( bool cloned = false );
+
+/* call this when done with dprintf in child of fork()
+ * This is not necessary if child is just going to exit.  It just
+ * ensures that nothing gets inherited by exec().
+ */
+void dprintf_wrapup_fork_child( bool cloned = false );
+
 bool debug_open_fds(std::map<int,bool> &open_fds);
 
-class _condor_auto_save_runtime
+// fetch a monotonic timer intended for measuring the time spent
+// doing various things.  this timer can NOT be counted on to
+// be a normal timestamp! use double condor_gettimestamp_double() for that..
+// The seconds value might be epoch time
+// or it might be uptime depending on which system clock is used.
+extern double _condor_debug_get_time_double();
+
+class _condor_runtime
 {
 public:
-    _condor_auto_save_runtime(double & store); // save result here
-    ~_condor_auto_save_runtime();
-    double   current_runtime();
-    double & runtime;
-    double   begin;
+	_condor_runtime() : begin(0) { begin = _condor_debug_get_time_double(); }; // save result here
+	double elapsed_runtime() { return _condor_debug_get_time_double() - begin; }
+	double tick(double & last) { double now = _condor_debug_get_time_double(); double diff = now - last; last = now; return diff; }
+	double reset() { return tick(begin); } // resets begin to now and returns the difference between now and former begin.
+	double begin;
+};
+
+// use this class to automatically add time runtime between constructor and destructor
+// into the given variable.
+template <typename T>
+class _condor_auto_accum_runtime : public _condor_runtime
+{
+public:
+	_condor_auto_accum_runtime(T & store) : runtime(store) { }; // remember where to save result
+	~_condor_auto_accum_runtime() { runtime += elapsed_runtime(); };
+	T & runtime;
 };
 
 #endif // defined(__cplusplus)
@@ -343,6 +399,14 @@ char    *mymalloc(), *myrealloc(), *mycalloc();
         (ptr)->ru_stime.tv_usec ); \
 }
 
+#ifndef ABEND
+#define ABEND(cond) \
+	if( !(cond) ) { \
+		dprintf( D_ERROR | D_BACKTRACE, "Failed to assert (%s) at %s, line %d; aborting.\n", #cond, __FILE__, __LINE__ ); \
+		abort(); \
+	}
+#endif /* ABEND */
+
 #ifndef PRAGMA_REMIND
 # ifdef _MSC_VER // for Microsoft C, prefix file and line to the the message
 #  define PRAGMA_QUOTE(x)   #x
@@ -366,6 +430,12 @@ char    *mymalloc(), *myrealloc(), *mycalloc();
 # endif
 #endif // REMIND
 
+// disabled REMIND when building non-debug
+#if defined NDEBUG && ! defined ENABLE_PRAGMA_REMIND
+#  undef PRAGMA_REMIND
+#  define PRAGMA_REMIND(str)
+#endif
+
 #if defined _MSC_VER && defined _DEBUG // WIN32
 # ifdef _X86_
 #  define DEBUG_BREAK_INTO_DEBUGGER _asm {int 3}
@@ -379,6 +449,7 @@ char    *mymalloc(), *myrealloc(), *mycalloc();
 #endif
 
 #define dprintf_set_tool_debug(name, flags) dprintf_config_tool(name, flags)
+#define dprintf_set_tool_debug_log(name, flags, filename) dprintf_config_tool(name, flags, filename)
 
 #endif /* CONDOR_DEBUG_H */
 

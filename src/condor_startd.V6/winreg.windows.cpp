@@ -56,21 +56,6 @@ struct WinPerf_Query
 
 #include <hashtable.h>
 
-// This is a simple wrapper class to enable char *'s
-// that we don't manage to be put into HashTables
-
-// HashTable needs operator==, which we define to be
-// case-insensitive for ClassAds
-
-class YourString 
-{
-	public:
-		YourString() : s(0) {}
-		YourString(const char *str) : s(str) {}
-		bool operator==(const YourString &rhs) { return (lstrcmpi(s,rhs.s) == 0); }
-		const char *s; // Someone else owns this
-};
-
 // D_NORMAL can be set to D_ALWAYS to cause a LOT more output from the WinReg code
 #define D_NORMAL D_FULLDEBUG
 
@@ -329,6 +314,7 @@ char * get_windows_reg_value(
 		//
 		if (ERROR_MORE_DATA == lres || ERROR_SUCCESS == lres)
 		{
+			uli.QuadPart = 0; // make sure that our volatile uli is zero'ed out.
 			if (vtype == REG_MULTI_SZ || vtype == REG_SZ || vtype == REG_EXPAND_SZ || vtype == REG_LINK || vtype == REG_BINARY)
 			{
 				value = (char*)malloc(cbData+1);	
@@ -337,7 +323,6 @@ char * get_windows_reg_value(
 			else
 			{
 				cbData = sizeof(uli);
-				uli.QuadPart = 0; // in case we don't read the whole 8 bytes.
 				lres = RegQueryValueEx(hkey, pszName, NULL, &vtype, (byte*)&uli, &cbData);
 			}
 		}
@@ -392,6 +377,7 @@ char * get_windows_reg_value(
 				break;
 
 			case REG_DWORD_BIG_ENDIAN:
+				// htonl converts from native endian to big-endian (i.e network byte order)
 				uli.LowPart = htonl(uli.LowPart);
 				// fall though
 			case REG_DWORD:
@@ -469,7 +455,7 @@ char * get_windows_reg_value(
 //
 char * generate_reg_key_attr_name(const char * pszPrefix, const char * pszKeyName)
 {
-	int cchPrefix = pszPrefix ? strlen(pszPrefix) : 0;
+	size_t cchPrefix = pszPrefix ? strlen(pszPrefix) : 0;
 
 	// is the input of the form attr_name=reg_path?  if so, then
 	// we want to return prefix + attr_name. 
@@ -510,7 +496,7 @@ char * generate_reg_key_attr_name(const char * pszPrefix, const char * pszKeyNam
 	// allocate space for prefix + key_part and copy
 	// both into the allocated buffer.
 	//
-	int cch = strlen(psz);
+	size_t cch = strlen(psz);
 	bool fPercent = false;
 	if (strchr(psz, '%'))
 	{
@@ -578,23 +564,7 @@ char * generate_reg_key_attr_name(const char * pszPrefix, const char * pszKeyNam
 }
 
 
-
-
-// Chris Torek's world famous hashing function
-// Modified to be case-insensitive
-static unsigned int torekHash(const YourString &s) {
-	unsigned int hash = 0;
-
-	const char *p = s.s;
-	while (*p) {
-		hash = (hash<<5)+hash + (unsigned char)tolower(*p);
-		p++;
-	}
-
-	return hash;
-}
-
-static unsigned int
+static size_t
 DWORDHash( const DWORD & n )
 {
 	return n;
@@ -842,7 +812,7 @@ static struct {
 	// the performance registry.  We keep that set of strings in pszzNames
 	// and we hash name->index and index->name in two hashtables. 
 	char * pszzNames; // holds all of the strings that the two hash tables refer to.
-	HashTable<YourString, const char *> * pPerfTable;
+	std::map<YourStringNoCase, std::vector<const char *>> * pPerfTable;
 	HashTable<DWORD, const char *> * pNameTable;
     HashTable<DWORD, WinPerf_QueryResult> * pQueries;
 } rl = {0};
@@ -880,9 +850,9 @@ static bool init_windows_performance_hashtable()
 	}
 	else if (REG_MULTI_SZ == vtype)
 	{
-		rl.pQueries   = new HashTable<DWORD, WinPerf_QueryResult>(2, DWORDHash, updateDuplicateKeys);
-		rl.pPerfTable = new HashTable<YourString, const char *>(4000, torekHash, allowDuplicateKeys);
-		rl.pNameTable = new HashTable<DWORD, const char *>(4000, DWORDHash, rejectDuplicateKeys);
+		rl.pQueries   = new HashTable<DWORD, WinPerf_QueryResult>(DWORDHash);
+		rl.pPerfTable = new std::map<YourStringNoCase, std::vector<const char *>>();
+		rl.pNameTable = new HashTable<DWORD, const char *>(DWORDHash);
 		if (rl.pPerfTable)
 		{
 			char * psz = rl.pszzNames;
@@ -891,7 +861,7 @@ static bool init_windows_performance_hashtable()
 				char * pszIndex = psz;
 				char * pszName = psz + lstrlen(psz)+1;
 				if (*pszName) psz = pszName + lstrlen(pszName)+1;
-				rl.pPerfTable->insert(pszName, pszIndex);
+				(*rl.pPerfTable)[pszName].push_back(pszIndex);
 				if (rl.pNameTable)
 				{
 					DWORD ix = atoi(pszIndex);
@@ -1094,7 +1064,7 @@ bool WinPerf_Object::GetValue(
 		ULONGLONG old = GetRawValue(pCounter, prev);
 		if (ctval.value.ul >= old)
 			ctval.value.ul = ctval.value.ul - old;
-		//else dprintf(D_FULLDEBUG, "  PrintValue: negative delta from winreg performance data.");
+		//else dprintf(D_FULLDEBUG, "  PrintValue: negative delta from winreg performance data.\n");
 	}
 
 	// number are easy, they can be decimal or hex
@@ -1270,7 +1240,7 @@ char * WinPerf_Object::PrintValue(
 		if (val >= old)
 			val = val - old;
 		else
-			dprintf(D_FULLDEBUG, "  PrintValue: negative delta from winreg performance data.");
+			dprintf(D_FULLDEBUG, "  PrintValue: negative delta from winreg performance data.\n");
 		//dprintf(D_FULLDEBUG, "  PrintValue: delta %I64d - %I64d = %I64d,  %I64d/%I64d %I64d/%I64d %I64d %I64d\n", 
 		//	val, old, val - old, time.head, time.headfreq, time.obj, time.objfreq, time.nanos, time.objabs);
 	}
@@ -1429,11 +1399,11 @@ bool init_WinPerf_Query(
 	else
 	{
 		init_windows_performance_hashtable();  // this is quick if we already init'd
-		const char * pszPerfIndex = NULL;
-		if (rl.pPerfTable && 
-			(rl.pPerfTable->lookup(pszRegKey, pszPerfIndex) >= 0))
+		std::map<YourStringNoCase, std::vector<const char *>>::iterator it;
+		if (rl.pPerfTable &&
+			(it = rl.pPerfTable->find(pszRegKey)) != rl.pPerfTable->end())
 		{
-			query.idKey = atoi(pszPerfIndex);
+			query.idKey = atoi(it->second.back());
 		}
 	}
 
@@ -1445,20 +1415,20 @@ bool init_WinPerf_Query(
 		{
 			init_windows_performance_hashtable();  // this is quick if we already init'd
 			const char * pszCounterIndex = NULL;
-			if (rl.pPerfTable)
+			std::map<YourStringNoCase, std::vector<const char *>>::iterator it;
+			if (rl.pPerfTable &&
+				(it = rl.pPerfTable->find(pszValueName)) != rl.pPerfTable->end())
 			{
 				//if (rl.pPerfTable->lookup(pszValueName, pszCounterIndex) >= 0)
 				//	query.idCounter = atoi(pszCounterIndex);
-				void * cur = NULL, *next = NULL;
 				int ix = 0;
-				while (rl.pPerfTable->getNext(pszValueName, cur, pszCounterIndex, next) >= 0)
+				for (size_t i = 0; i < it->second.size(); i++)
 				{
-					((DWORD*)&query.idCounter)[ix++] = atoi(pszCounterIndex);
-					cur = next;
+					((DWORD*)&query.idCounter)[ix++] = atoi(it->second[i]);
 				}
 				if (query.idAlt[NUM_ELEMENTS(query.idAlt)-1] != 0)
 				{
-					dprintf (D_ALWAYS, "Error: too many counter ids map to the same name!");
+					dprintf (D_ALWAYS, "Error: too many counter ids map to the same name!\n");
 					query.idAlt[NUM_ELEMENTS(query.idAlt)-1] = 0;
 				}
 			}
@@ -1508,7 +1478,7 @@ int WinPerf_CounterValue::Print(char * psz, int cchMax, bool fIncludeUnits) cons
 		{
 			//psz[cch++] = ' ';
 			strcpy(&psz[cch], pszUnits);
-			cch += strlen(pszUnits);
+			cch += (int)strlen(pszUnits);
 		}
 	}
 
@@ -1636,7 +1606,7 @@ void update_all_WinPerf_results()
         while (rl.pQueries->iterate(result)) 
         {
             update_windows_performance_result(result);
-            rl.pQueries->insert(result.idObject, result);
+            rl.pQueries->insert(result.idObject, result, true);
         }
     }
 }
@@ -1809,7 +1779,7 @@ AttribValue * add_WinPerf_Query(
 
 		// add this this key to the list of queries
 		WinPerf_QueryResult result = {query.idKey, 0, NULL, NULL};
-		rl.pQueries->insert(query.idKey, result);
+		rl.pQueries->insert(query.idKey, result, true);
         /*
         bool found = false;
         lst_WinPerf.Rewind();

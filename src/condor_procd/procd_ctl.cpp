@@ -110,7 +110,7 @@ main(int argc, char* argv[])
 				argv[0]);
 			list_commands();
 			return 1;
-			continue;
+			//continue;
 		}
 
 		// This is the failure case if we manage to pass all checks above.
@@ -294,12 +294,6 @@ track_by_associated_cgroup(ProcFamilyClient& pfc, int argc, char* argv[])
 		return 1;
 	}
 	return 0;
-}
-#else
-static int
-track_by_associated_cgroup(ProcFamilyClient&, int, char**) {
-	fprintf(stderr, "error: cgroups not supported not compiled into this client\n");
-	return 1;
 }
 #endif
 

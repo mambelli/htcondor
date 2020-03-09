@@ -31,14 +31,15 @@ void MergeClassAds(ClassAd *merge_into, ClassAd *merge_from,
 		return;
 	}
 
-	merge_from->ResetName();
-	merge_from->ResetExpr();
+	bool was_dirty_tracking = merge_into->SetDirtyTracking(mark_dirty);
 
 	const char     *name;
 	ExprTree       *expression;
 
-	while ( merge_from->NextExpr(name, expression) ) {
+	for ( auto itr = merge_from->begin(); itr != merge_from->end(); itr++ ) {
 
+		name = itr->first.c_str();
+		expression = itr->second;
 		if (merge_conflicts || !merge_into->LookupExpr(name)) {
 			if( keep_clean_when_possible ) {
 				char *from_expr = NULL;
@@ -60,16 +61,12 @@ void MergeClassAds(ClassAd *merge_into, ClassAd *merge_from,
 				}
 			}
 
-			ExprTree  *copy_expression;
-
-			copy_expression = expression->Copy();
-			merge_into->Insert(name, copy_expression,false);
-			if ( !mark_dirty ) {
-				merge_into->SetDirtyFlag(name, false);
-			}
+			ExprTree *copy_expression = expression->Copy();
+			merge_into->Insert(name, copy_expression);
 		}
 	}
 
+	merge_into->SetDirtyTracking(was_dirty_tracking);
 	return;
 }
 
@@ -77,3 +74,33 @@ void MergeClassAdsCleanly(ClassAd *merge_into, ClassAd *merge_from)
 {
 	return MergeClassAds(merge_into,merge_from,true,true,true);
 }
+
+
+int MergeClassAdsIgnoring(ClassAd *merge_into, ClassAd *merge_from, const AttrNameSet & ignore, bool mark_dirty /*=true*/)
+{
+	if (!merge_into || !merge_from) {
+		return 0;
+	}
+
+	bool was_dirty_tracking = merge_into->SetDirtyTracking(mark_dirty);
+
+	int cMerged = 0; // count of merged items
+	const char *name;
+	ExprTree   *expression;
+	for ( auto itr = merge_from->begin(); itr != merge_from->end(); itr++ ) {
+
+		name = itr->first.c_str();
+		expression = itr->second;
+		// don't merge attributes if the name is in the ignore list.
+		if (ignore.find(name) != ignore.end())
+			continue;
+
+		ExprTree  *copy_expression = expression->Copy();
+		merge_into->Insert(name, copy_expression);
+		++cMerged;
+	}
+
+	merge_into->SetDirtyTracking(was_dirty_tracking);
+	return cMerged;
+}
+

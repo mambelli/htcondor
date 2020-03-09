@@ -31,8 +31,6 @@
 	//changed isSeparator to allow constructor to redefine
 //#define isSeparator(x) (isspace(x) || x == ',' )
 
-char *strnewp( const char * );
-
 int
 StringList::isSeparator( char x )
 {
@@ -47,12 +45,25 @@ StringList::isSeparator( char x )
 StringList::StringList(const char *s, const char *delim ) 
 {
 	if ( delim ) {
-		m_delimiters = strnewp( delim );
+		m_delimiters = strdup( delim );
 	} else {
-		m_delimiters = strnewp( "" );
+		m_delimiters = strdup( "" );
 	}
 	if ( s ) {
 		initializeFromString(s);
+	}
+}
+
+StringList::StringList(const char *s, char delim_char, bool keep_empty_fields )
+{
+	char delims[2] = { delim_char, 0 };
+	m_delimiters = strdup( delims );
+	if ( s ) {
+		if (keep_empty_fields) {
+			initializeFromString(s, delim_char);
+		} else {
+			initializeFromString(s);
+		}
 	}
 }
 
@@ -64,7 +75,7 @@ StringList::StringList( const StringList &other )
 
 	const char *delim = other.getDelimiters();
 	if ( delim ) {
-		m_delimiters = strnewp( delim );
+		m_delimiters = strdup( delim );
 	}
 
 	// Walk through the other list, verify that everything is in my list
@@ -105,13 +116,18 @@ StringList::initializeFromString (const char *s)
 
 		// mark the beginning of this String in the list.
 		const char *begin_ptr = walk_ptr;
+		const char *end_ptr = begin_ptr;
 
 		// walk to the end of this string
-		while (!isSeparator (*walk_ptr) && *walk_ptr != '\0')
+		while (!isSeparator (*walk_ptr) && *walk_ptr != '\0') {
+			if ( !isspace(*walk_ptr) ) {
+				end_ptr = walk_ptr;
+			}
 			walk_ptr++;
+		}
 
 		// malloc new space for just this item
-		int len = (walk_ptr - begin_ptr);
+		int len = (end_ptr - begin_ptr) + 1;
 		char *tmp_string = (char*)malloc( 1 + len );
 		ASSERT( tmp_string );
 		strncpy (tmp_string, begin_ptr, len);
@@ -119,6 +135,47 @@ StringList::initializeFromString (const char *s)
 		
 		// put the string into the StringList
 		m_strings.Append (tmp_string);
+	}
+}
+
+// This version allows for a single delimiter character,
+// it will trim leading and trailing whitespace from items, but
+// it will not skip empty items or extra delimiters.
+void
+StringList::initializeFromString (const char *s, char delim_char)
+{
+	if(!s)
+	{
+		EXCEPT("StringList::initializeFromString passed a null pointer");
+	}
+
+	const char * p = s;
+	while (*p) {
+
+		// skip leading whitespace but not leading separators.
+		while (isspace(*p)) ++p;
+
+		// scan for end of string or for a delimiter char
+		const char * e = p;
+		while (*e && *e != delim_char) ++e;
+
+		size_t len = e-p;
+
+		// rewind back over trailing whitespace
+		while (len && isspace(p[len-1])) --len;
+
+		char *tmp_string = (char*)malloc(1 + len);
+		ASSERT(tmp_string);
+		strncpy(tmp_string, p, len);
+		tmp_string[len] = 0;
+
+		// put the string into the StringList
+		m_strings.Append (tmp_string);
+
+		p = e;
+
+		// if we ended at a delimiter, skip over it.
+		if (*p == delim_char) ++p;
 	}
 }
 
@@ -145,8 +202,7 @@ StringList::clearAll()
 StringList::~StringList ()
 {
 	clearAll();
-	if ( m_delimiters )
-		delete [] m_delimiters;
+	free(m_delimiters);
 }
 
 
@@ -252,15 +308,29 @@ StringList::remove_anycase(const char *str)
 }
 
 bool
-StringList::substring( const char *st )
+StringList::prefix( const char *st )
 {
 	char    *x;
-	int len;
-	
+
 	m_strings.Rewind ();
 	while( (x = m_strings.Next()) ) {
-		len = strlen(x);
+		size_t len = strlen(x);
 		if( strncmp(st, x, len) == MATCH ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+StringList::prefix_anycase( const char *st )
+{
+	char    *x;
+
+	m_strings.Rewind ();
+	while( (x = m_strings.Next()) ) {
+		size_t len = strlen(x);
+		if( strncasecmp(st, x, len) == MATCH ) {
 			return true;
 		}
 	}
@@ -298,7 +368,6 @@ StringList::contains_withwildcard(const char *string, bool anycase, StringList *
 	char *matchstart;
 	char *matchend;
 	char *asterisk;
-	int matchendlen, len;
     bool result;
 	int temp;
 	
@@ -394,8 +463,8 @@ StringList::contains_withwildcard(const char *string, bool anycase, StringList *
 				result = false;
 		}
 		if ( matchend && result == true) {
-			len = strlen(string);
-			matchendlen = strlen(matchend);
+			size_t len = strlen(string);
+			size_t matchendlen = strlen(matchend);
 			if ( matchendlen > len )	// make certain we do not SEGV below
 				result = false;
 			if ( result == true ) {
@@ -427,7 +496,7 @@ StringList::contains_withwildcard(const char *string, bool anycase, StringList *
 	return NULL;
 }
 
-bool
+const char *
 StringList::find( const char *str, bool anycase ) const
 {
 	char	*x;
@@ -436,13 +505,13 @@ StringList::find( const char *str, bool anycase ) const
     iter.ToBeforeFirst ();
 	while ( iter.Next(x) ) {
 		if( (anycase) && (strcasecmp( str, x ) == MATCH) ) {
-			return true;
+			return x;
 		}
 		else if( (!anycase) && (strcmp(str, x) == MATCH) ) {
-			return true;
+			return x;
 		}
 	}
-	return false;
+	return NULL;
 }
 
 bool
@@ -504,7 +573,7 @@ StringList::print_to_delimed_string(const char *delim) const
 
     iter.Initialize( m_strings );
     iter.ToBeforeFirst ();
-	int		len = 1;
+	size_t len = 1;
 	while ( iter.Next(tmp) ) {
 		len += ( strlen(tmp) + strlen(delim) );
 	}
@@ -582,7 +651,7 @@ StringList::shuffle() {
 	}
 
 	for (i = 0; i+1 < count; i++) {
-		unsigned int j = (unsigned int)(i + (get_random_float() * (count-i)));
+		unsigned int j = (unsigned int)(i + (get_random_float_insecure() * (count-i)));
 		// swap m_strings at i and j
 		str = list[i];
 		list[i] = list[j];

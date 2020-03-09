@@ -54,12 +54,16 @@ ProcessId::ProcessId(FILE* fp, int& status)
 	status = FAILURE;
 	
 		// extract the signature
-	pid_t tmp_pid = UNDEF;
-	pid_t tmp_ppid = UNDEF;
-	long tmp_bday = UNDEF;
-	int tmp_precision_range = UNDEF;
-	double tmp_time_units_in_sec = (double)UNDEF;
-	long tmp_id_ctl_time = UNDEF;
+	pid_t tmp_pid = pid = UNDEF;
+	pid_t tmp_ppid = ppid = UNDEF;
+	long tmp_bday = bday = UNDEF;
+	int tmp_precision_range = precision_range = UNDEF;
+	double tmp_time_units_in_sec = time_units_in_sec = (double)UNDEF;
+	long tmp_id_ctl_time = ctl_time = UNDEF;
+
+	confirmed = false;
+	confirm_time = 0;
+
 	int nr_extracted = extractProcessId( fp, 
 										 tmp_ppid, 
 										 tmp_pid,
@@ -407,7 +411,7 @@ ProcessId::writeConfirmationOnly(FILE* fp) const
 	}
 		// its an error otherwise
 	else{
-		dprintf(D_PROCFAMILY, "ERROR: Attempted to write a confirmation for a process id that was not confirmed");
+		dprintf(D_PROCFAMILY, "ERROR: Attempted to write a confirmation for a process id that was not confirmed\n");
 		return FAILURE;
 	}
 

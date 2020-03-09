@@ -27,11 +27,10 @@
 #include "master.h"
 #include "subsystem_info.h"
 #include "condor_daemon_core.h"
-#include "condor_collector.h"
 #include "condor_attributes.h"
-#include "condor_network.h"
 #include "condor_adtypes.h"
 #include "condor_io.h"
+#include "directory.h"
 #include "exit.h"
 #include "string_list.h"
 #include "get_daemon_name.h"
@@ -44,6 +43,7 @@
 #include "file_lock.h"
 #include "shared_port_server.h"
 #include "shared_port_endpoint.h"
+#include "credmon_interface.h"
 
 #if defined(WANT_CONTRIB) && defined(WITH_MANAGEMENT)
 #if defined(HAVE_DLOPEN) || defined(WIN32)
@@ -54,6 +54,9 @@ extern int load_master_mgmt(void);
 #endif
 #endif
 
+#include "systemd_manager.h"
+#include <sstream>
+
 #ifdef WIN32
 
 #include "firewall.WINDOWS.h"
@@ -62,37 +65,31 @@ extern DWORD start_as_service();
 extern void terminate(DWORD);
 #endif
 
-typedef void (*SIGNAL_HANDLER)();
-
-// prototypes of library functions
-extern "C"
-{
-	void install_sig_handler( int, SIGNAL_HANDLER );
-}
-
 
 // local function prototypes
 void	init_params();
 void	init_daemon_list();
 void	init_classad();
 void	init_firewall_exceptions();
-void	check_uid_for_privsep();
 void	lock_or_except(const char * );
 time_t 	GetTimeStamp(char* file);
 int 	NewExecutable(char* file, time_t* tsp);
 void	RestartMaster();
-void	run_preen();
+void	run_preen();	 // timer handler
+int		run_preen_now(); // actually start preen if it is not already running.
 void	usage(const char* );
 void	main_shutdown_graceful();
 void	main_shutdown_normal(); // do graceful or peaceful depending on daemonCore state
 void	main_shutdown_fast();
 void	invalidate_ads();
 void	main_config();
-int	agent_starter(ReliSock *);
+int	agent_starter(ReliSock *, Stream *);
 int	handle_agent_fetch_log(ReliSock *);
-int	admin_command_handler(Service *, int, Stream *);
+int	admin_command_handler(int, Stream *);
+int	ready_command_handler(int, Stream *);
 int	handle_subsys_command(int, Stream *);
 int     handle_shutdown_program( int cmd, Stream* stream );
+int     set_shutdown_program( const char * name );
 void	time_skip_handler(void * /*data*/, int delta);
 void	restart_everyone();
 
@@ -104,6 +101,7 @@ int		MasterLockFD;
 int		update_interval;
 int		check_new_exec_interval;
 int		preen_interval;
+int		preen_pid = -1;
 int		new_bin_delay;
 StopStateT new_bin_restart_mode = GRACEFUL;
 char	*MasterName = NULL;
@@ -126,23 +124,119 @@ int		AllowAdminCommands = FALSE;
 int		StartDaemons = TRUE;
 int		GotDaemonsOff = FALSE;
 int		MasterShuttingDown = FALSE;
+static int dummyGlobal;
 
-const char	*default_daemon_list[] = {
-	"MASTER",
-	"STARTD",
-	"SCHEDD",
-	0};
+// daemons in this list are used when DAEMON_LIST is not configured
+// all will added to the list of daemons that condor_on can use
+// auto_start daemons will be started automatically when the master starts up
+// this list must contain only DC daemons
+static const struct {
+	const char * name;
+	bool auto_start;           // start automatically on startup
+	bool only_if_shared_port;  // start automatically only if shared port is enabled
+} default_daemon_list[] = {
+	{ "MASTER",       true , false},
+	{ "SHARED_PORT",  true,  true},
+	{ "COLLECTOR",    false, false},
+	{ "NEGOTIATOR",   false, false},
+	{ "STARTD",       false, false},
+	{ "SCHEDD",       false, false},
+	{ NULL, false, false}, // mark of list record
+};
 
 // NOTE: When adding something here, also add it to the various condor_config
 // examples in src/condor_examples
 char	default_dc_daemon_list[] =
 "MASTER, STARTD, SCHEDD, KBDD, COLLECTOR, NEGOTIATOR, EVENTD, "
-"VIEW_SERVER, CONDOR_VIEW, VIEW_COLLECTOR, CREDD, HAD, HDFS, "
-"REPLICATION, DBMSD, QUILL, JOB_ROUTER, ROOSTER, SHARED_PORT, "
-"DEFRAG, GANGLIAD";
+"VIEW_SERVER, CONDOR_VIEW, VIEW_COLLECTOR, CREDD, HAD, "
+"REPLICATION, JOB_ROUTER, ROOSTER, SHARED_PORT, "
+"DEFRAG, GANGLIAD, ANNEXD";
 
 // create an object of class daemons.
 class Daemons daemons;
+
+class SystemdNotifier : public Service {
+
+public:
+	SystemdNotifier() : m_watchdog_timer(-1) {}
+
+	void
+	config()
+	{
+		const condor_utils::SystemdManager & sd = condor_utils::SystemdManager::GetInstance();
+		int watchdog_secs = sd.GetWatchdogUsecs();
+		if ( watchdog_secs > 0 ) {
+			watchdog_secs = watchdog_secs / 1e6 / 3;
+			if (watchdog_secs <= 0) { watchdog_secs = 1; }
+			if (watchdog_secs > 20) { watchdog_secs = 10; }
+			Timeslice ts;
+			ts.setDefaultInterval(watchdog_secs);
+			m_watchdog_timer = daemonCore->Register_Timer(ts,
+					static_cast<TimerHandlercpp>(&SystemdNotifier::status_handler),
+					"systemd status updater", this);
+			if (m_watchdog_timer < 0) {
+				dprintf(D_ALWAYS, "Failed to register systemd update timer.\n");
+			} else {
+				dprintf(D_FULLDEBUG, "Set systemd to be notified once every %d seconds.\n", watchdog_secs);
+			}
+		} else {
+			dprintf(D_FULLDEBUG, "Not setting systemd watchdog timer\n");
+		}
+	}
+
+	void status_handler()
+	{
+		char *name;
+		class daemon *daemon;
+
+		daemons.ordered_daemon_names.rewind();
+		std::stringstream ss;
+		ss << "Problems: ";
+		bool had_prior = false;
+		bool missing_daemons = false;
+		while( (name = daemons.ordered_daemon_names.next()) ) {
+			daemon = daemons.FindDaemon( name );
+			if (!daemon->pid)
+			{
+				if (had_prior) { ss << ", "; }
+				else { had_prior = true; }
+				missing_daemons = true;
+				time_t starttime = daemon->GetNextRestart();
+				if (starttime)
+				{
+					time_t secs_to_start = starttime-time(NULL);
+					if (secs_to_start > 0)
+					{ ss << name << "=RESTART in " << secs_to_start << "s"; }
+					else
+					{ ss << name << "=RESTARTNG"; }
+				}
+				else
+				{ ss << name << "=STOPPED"; }
+			}
+		}
+		std::string status = ss.str();
+
+		const char * format_string = "STATUS=%s\nWATCHDOG=1";
+		if (!missing_daemons)
+		{
+			format_string = "READY=1\nSTATUS=%s\nWATCHDOG=1";
+			status = "All daemons are responding";
+		}
+
+		const condor_utils::SystemdManager &sd = condor_utils::SystemdManager::GetInstance();
+		int result = sd.Notify(format_string, status.c_str());
+		if (result == 0)
+		{
+			dprintf(D_ALWAYS, "systemd watchdog notification support not available.\n");
+			daemonCore->Cancel_Timer(m_watchdog_timer);
+			m_watchdog_timer = -1;
+		}
+	}
+
+private:
+	int m_watchdog_timer;
+};
+SystemdNotifier g_systemd_notifier;
 
 // called at exit to deallocate stuff so that memory checking tools are
 // happy and don't think we leaked any of this...
@@ -154,7 +248,7 @@ cleanup_memory( void )
 		ad = NULL;
 	}
 	if ( MasterName ) {
-		delete [] MasterName;
+		free( MasterName );
 		MasterName = NULL;
 	}
 	if ( FS_Preen ) {
@@ -163,14 +257,87 @@ cleanup_memory( void )
 	}
 }
 
+#ifdef WIN32
+// we can't use execl on Windows (read the docs), and anyway, we don't want to
+// if we are running as a serices because we MUST call our terminate() function to exit
+static void Win32RunShutdownProgram(char * shutdown_program)
+{
+	STARTUPINFO si;
+	ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+
+	HANDLE hLog = INVALID_HANDLE_VALUE;
+
+	// Open a log file for the shutdown programs stdout and stderr
+	std::string shutdown_log;
+	if (param(shutdown_log, "MASTER_SHUTDOWN_LOG") &&  ! shutdown_log.empty()) {
+		SECURITY_ATTRIBUTES sa;
+		ZeroMemory(&sa, sizeof(sa));
+		sa.bInheritHandle = TRUE;
+
+		hLog = CreateFile(shutdown_log.c_str(), FILE_APPEND_DATA,
+			FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (INVALID_HANDLE_VALUE != hLog) { si.hStdError = si.hStdOutput = hLog; }
+
+		si.dwFlags = STARTF_USESTDHANDLES;
+	}
+
+	// create the shutdown program, we create it suspended so that we can log success or failure
+	// and then get a head start to exit before it actually begins running.  That still doesn't
+	// guarantee that we have exited before it starts though...
+	PROCESS_INFORMATION pi;
+	ZeroMemory(&pi, sizeof(pi));
+	priv_state p = set_root_priv( );
+	BOOL exec_status = CreateProcess( NULL, shutdown_program, NULL, NULL, TRUE, DETACHED_PROCESS | CREATE_SUSPENDED, NULL, NULL, &si, &pi );
+	set_priv( p );
+
+	if (INVALID_HANDLE_VALUE != hLog) {
+		formatstr(shutdown_log, "==== Master (pid %d) shutting down. output of shutdown script '%s' (pid %d) follows ====\n",
+			GetCurrentProcessId(), shutdown_program, pi.dwProcessId);
+		DWORD dwWrote;
+		WriteFile(hLog, shutdown_log.c_str(), (DWORD)shutdown_log.size(), &dwWrote, NULL);
+		CloseHandle(hLog);
+	}
+
+	if ( ! exec_status ) {
+		dprintf( D_ALWAYS, "**** CreateProcess(%s) FAILED %d %s\n",
+					shutdown_program, GetLastError(), GetLastErrorString(GetLastError()) );
+	} else {
+		dprintf( D_ALWAYS, "**** CreateProcess(%s) SUCCEEDED pid=%lu\n", shutdown_program, pi.dwProcessId );
+		ResumeThread(pi.hThread); // let the shutdown process start.
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+	}
+}
+#endif
+
 
 int
 master_exit(int retval)
 {
+	// If a shutdown_program has not been setup via the admin
+	// command-line tool, see if the condor_config specifies
+	// a default shutdown program to use.
+	if ( !shutdown_program ) {
+		char *defshut = param("DEFAULT_MASTER_SHUTDOWN_SCRIPT");
+		if (defshut) {
+			set_shutdown_program(defshut);
+			free(defshut);
+		}
+	}
+
 	cleanup_memory();
 
 #ifdef WIN32
 	if ( NT_ServiceFlag == TRUE ) {
+		// retval == 2 indicates that we never actually started
+		// so we don't want to invoke the shutdown program in that case.
+		if (retval != 2 && shutdown_program) {
+			dprintf( D_ALWAYS,
+						"**** %s (%s_%s) pid %lu EXECING SHUTDOWN PROGRAM %s\n",
+						"condor_master", "condor", "MASTER", GetCurrentProcessId(), shutdown_program );
+			Win32RunShutdownProgram(shutdown_program);
+			shutdown_program = NULL; // in case terminate doesn't kill us, make sure we don't run the shutdown program more than once.
+		}
 		terminate(retval);
 	}
 #endif
@@ -181,7 +348,34 @@ master_exit(int retval)
 #endif
 #endif
 
-	DC_Exit(retval, shutdown_program );
+		// If we're positive that we are going to shut down,
+		// we should clean out the shared port directory if
+		// we created it.
+	std::string dirname;
+	if ( SharedPortEndpoint::CreatedSharedPortDirectory() &&
+		 SharedPortEndpoint::GetDaemonSocketDir(dirname) ) {
+
+		TemporaryPrivSentry tps(PRIV_CONDOR);
+		Directory d(dirname.c_str());
+		d.Remove_Entire_Directory();
+		if (-1 == rmdir(dirname.c_str())) {
+			dprintf(D_ALWAYS, "ERROR: failed to remove shared port temporary directory: %s (errno=%d).\n", strerror(errno), errno);
+		}
+	}
+
+	// Exit via specified shutdown_program UNLESS retval is 2, which
+	// means the master never started and we are exiting via usage() message.
+#ifdef WIN32
+	if (retval != 2 && shutdown_program) {
+		dprintf( D_ALWAYS,
+					"**** %s (%s_%s) pid %lu RUNNING SHUTDOWN PROGRAM %s\n",
+					"condor_master", "condor", "MASTER", GetCurrentProcessId(), shutdown_program );
+		Win32RunShutdownProgram(shutdown_program);
+		shutdown_program = NULL; // don't let DC_Exit run the shutdown program on Windows.
+	}
+#endif
+	DC_Exit(retval, retval == 2 ? NULL : shutdown_program );
+
 	return 1;	// just to satisfy vc++
 }
 
@@ -189,7 +383,8 @@ void
 usage( const char* name )
 {
 	dprintf( D_ALWAYS, "Usage: %s [-f] [-t] [-n name]\n", name );
-	master_exit( 1 );
+	// Note: master_exit with value of 2 means do NOT run any shutdown_program
+	master_exit( 2 );
 }
 
 int
@@ -221,6 +416,139 @@ DoCleanup(int,int,const char*)
 	}
 }
 
+#if defined( LINUX )
+void do_linux_kernel_tuning() {
+	std::string kernelTuningScript;
+	if(! param( kernelTuningScript, "LINUX_KERNEL_TUNING_SCRIPT" )) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: LINUX_KERNEL_TUNING_SCRIPT not defined.\n" );
+		return;
+	}
+
+	std::string kernelTuningLogFile;
+	param( kernelTuningLogFile, "KERNEL_TUNING_LOG" );
+	if( kernelTuningLogFile.empty() ) {
+		kernelTuningLogFile = "/dev/null";
+	}
+
+	if(! can_switch_ids() ) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: can't switch IDs.\n" );
+		return;
+	}
+
+	priv_state prev = set_root_priv();
+	int fd = safe_open_no_create( kernelTuningScript.c_str(), O_RDONLY );
+	set_priv( prev );
+	if( -1 == fd ) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: can't open file '%s'\n", kernelTuningScript.c_str() );
+		return;
+	}
+
+	struct stat stats;
+	int rv = fstat( fd, & stats );
+	if( rv != 0 ) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: can't stat file '%s'\n", kernelTuningScript.c_str() );
+		close( fd );
+		return;
+	}
+	if( stats.st_uid != 0 ) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: file '%s' must be owned by root.\n", kernelTuningScript.c_str() );
+		close( fd );
+		return;
+	}
+	if( (stats.st_mode & S_IWGRP) || (stats.st_mode & S_IWOTH) ) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: file '%s' is group or world -writeable\n", kernelTuningScript.c_str() );
+		close( fd );
+		return;
+	}
+	if(! (stats.st_mode & S_IXUSR)) {
+		dprintf( D_FULLDEBUG, "Not tuning kernel parameters: file '%s' is not executable.\n", kernelTuningScript.c_str() );
+		close( fd );
+		return;
+	}
+	close( fd );
+
+	// Redirect the script's output into the log directory, in case anybody
+	// else cares about it.  This simplifies our code, since we don't.
+	// Do NOT block waiting for the script to exit -- shoot it in the head
+	// after twenty seconds and report an error.  Otherwise, use its exit
+	// code appropriately (may report an error).
+	pid_t childPID = fork();
+	if( childPID == 0 ) {
+		daemonCore->Forked_Child_Wants_Fast_Exit( true );
+		dprintf_init_fork_child();
+
+		priv_state prev = set_root_priv();
+
+		int fd = open( "/dev/null", O_RDONLY );
+		if( fd == -1 ) {
+			dprintf( D_FULLDEBUG, "Not tuning kernel parameters: child failed to open /dev/null: %d.\n", errno );
+			exit( 1 );
+		}
+		if( dup2( fd, 0 ) == -1 ) {
+			dprintf( D_FULLDEBUG, "Not tuning kernel parameters: child failed to dup /dev/null: %d.\n", errno );
+			exit( 1 );
+		}
+		fd = open( kernelTuningLogFile.c_str(), O_WRONLY | O_APPEND, 0644 );
+		if ((fd < 0) && (errno == ENOENT)) {
+			fd = open( kernelTuningLogFile.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644 );
+		}
+		if( fd == -1 ) {
+			dprintf( D_FULLDEBUG, "Not tuning kernel parameters: child failed to open '%s': %d.\n", kernelTuningLogFile.c_str(), errno );
+			exit( 1 );
+		}
+		if( dup2( fd, 1 ) == -1 ) {
+			dprintf( D_FULLDEBUG, "Not tuning kernel parameters: child failed to dup log file '%s' to stdout: %d.\n", kernelTuningLogFile.c_str(), errno );
+			exit( 1 );
+		}
+		if( dup2( fd, 2 ) == -1 ) {
+			dprintf( D_FULLDEBUG, "Not tuning kernel parameters: child failed to dup log file '%s' to stderr: %d.\n", kernelTuningLogFile.c_str(), errno );
+			exit( 1 );
+		}
+
+		execl( kernelTuningScript.c_str(), kernelTuningScript.c_str(), (char *) NULL );
+
+		set_priv( prev );
+		dprintf( D_ALWAYS, "Did not tune kernel paramters: execl() failed: %d.\n", errno );
+		exit( 1 );
+	} else {
+		int status = 0;
+		pid_t wait = 0;
+		unsigned timer = 20;
+
+		while( true ) {
+			wait = waitpid( childPID, & status, WNOHANG );
+			if( wait == childPID ) {
+				if( WIFEXITED(status) && WEXITSTATUS(status) == 0 ) {
+					dprintf( D_FULLDEBUG, "Kernel parameters tuned.\n" );
+					return;
+				} else {
+					dprintf( D_FULLDEBUG, "Failed to tune kernel parameters, status code %d.\n", status );
+					return;
+				}
+			} else if( wait == 0 ) {
+				if( --timer > 0 ) {
+					dprintf( D_FULLDEBUG, "Sleeping one second for kernel parameter tuning (pid %d).\n", childPID );
+					sleep( 1 );
+				} else {
+					dprintf( D_FULLDEBUG, "Waited too long for kernel parameters to be tuned, hard-killing script.\n" );
+					kill( childPID, SIGKILL );
+					// Collect the zombie.
+					wait = waitpid( childPID, &status, WNOHANG );
+					ASSERT( wait != childPID );
+					return;
+				}
+			} else {
+				dprintf( D_FULLDEBUG, "waitpid() failed while waiting for kernel tuning (%d).  Killing child %d.\n", errno, childPID );
+				kill( childPID, SIGKILL );
+				// Try again to collect the zombie?
+				waitpid( childPID, & status, WNOHANG );
+				return;
+			}
+		}
+	}
+
+}
+#endif
 
 void
 main_init( int argc, char* argv[] )
@@ -243,6 +571,9 @@ main_init( int argc, char* argv[] )
 			if( !(ptr && *ptr) ) {
 				EXCEPT( "-n requires another argument" );
 			}
+			if (MasterName) {
+				free(MasterName);
+			}
 			MasterName = build_valid_daemon_name( *ptr );
 			dprintf( D_ALWAYS, "Using name: %s\n", MasterName );
 			break;
@@ -250,6 +581,47 @@ main_init( int argc, char* argv[] )
 			usage( argv[0] );
 		}
 	}
+
+#ifdef LINUX
+	if ( can_switch_ids() &&
+		 param_boolean("DISCARD_SESSION_KEYRING_ON_STARTUP",true) )
+	{
+#ifndef KEYCTL_JOIN_SESSION_KEYRING
+  #define KEYCTL_JOIN_SESSION_KEYRING 1
+#endif
+		// Create a new empty session keyring, discarding the old one.
+		// We do this in the master so a session keyring containing
+		// root keys is not inadvertantly leaked to jobs
+		// (esp scheduler universe jobs, since
+		// KEYCTL_JOIN_SESSION_KEYRING will fail in RHEL6 if the calling
+		// process has more than one thread, which is true when spawning
+		// scheduler universe jobs as the schedd clones by default instead
+		// of forking).  We also do this in the master instead
+		// of daemonCore, since we don't want to create a brand new
+		// session keyring for every shadow (each keyring uses up kernel resources).
+		// If the syscall fails due to ENOSYS, don't worry about it,
+		// since that simply says the keyring facility is not installed.
+		if (syscall(__NR_keyctl, KEYCTL_JOIN_SESSION_KEYRING, "htcondor")==-1 &&
+			errno != ENOSYS)
+		{
+			int saved_errno = errno;
+#if defined(EDQUOT)
+			if (saved_errno == EDQUOT) {
+				dprintf(D_ALWAYS | D_FAILURE,
+				   "Error during DISCARD_SESSION_KEYRING_ON_STARTUP, suggest "
+				   "increasing /proc/sys/kernel/keys/root_maxkeys\n");
+			}
+#endif /* defined EDQUOT */
+
+			if (saved_errno == EPERM) {
+				dprintf(D_ALWAYS, "Permission denied error during DISCARD_SESSION_KEYRING_ON_STARTUP, continuing anyway\n");
+			} else {
+				EXCEPT("Failed DISCARD_SESSION_KEYRING_ON_STARTUP=True errno=%d",
+						saved_errno);
+			}
+		}
+	}
+#endif /* defined LINUX */
 
     if (runfor != 0) {
         // We will construct an environment variable that 
@@ -267,6 +639,7 @@ main_init( int argc, char* argv[] )
 	
 		// Grab all parameters needed by the master.
 	init_params();
+	validate_config(0, CONFIG_OPT_DEPRECATION_WARNINGS);
 		// param() for DAEMON_LIST and initialize our daemons object.
 	init_daemon_list();
 	if ( daemons.SetupControllers() < 0 ) {
@@ -278,8 +651,6 @@ main_init( int argc, char* argv[] )
 	init_classad();  
 		// Initialize the master entry in the daemons data structure.
 	daemons.InitMaster();
-		// Make sure if PrivSep is on we're not running as root
-	check_uid_for_privsep();
 		// open up the windows firewall 
 	init_firewall_exceptions();
 
@@ -292,64 +663,75 @@ main_init( int argc, char* argv[] )
 	MasterPluginManager::Initialize();
 #endif
 
+	g_systemd_notifier.config();
+
 		// Register admin commands
 	daemonCore->Register_Command( RESTART, "RESTART",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( RESTART_PEACEFUL, "RESTART_PEACEFUL",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMONS_OFF, "DAEMONS_OFF",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMONS_OFF_FAST, "DAEMONS_OFF_FAST",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMONS_OFF_PEACEFUL, "DAEMONS_OFF_PEACEFUL",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMONS_ON, "DAEMONS_ON",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( MASTER_OFF, "MASTER_OFF",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( MASTER_OFF_FAST, "MASTER_OFF_FAST",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMON_ON, "DAEMON_ON",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMON_OFF, "DAEMON_OFF",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMON_OFF_FAST, "DAEMON_OFF_FAST",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( DAEMON_OFF_PEACEFUL, "DAEMON_OFF_PEACEFUL",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( CHILD_ON, "CHILD_ON",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( CHILD_OFF, "CHILD_OFF",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( CHILD_OFF_FAST, "CHILD_OFF_FAST",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	daemonCore->Register_Command( SET_SHUTDOWN_PROGRAM, "SET_SHUTDOWN_PROGRAM",
-								  (CommandHandler)admin_command_handler, 
-								  "admin_command_handler", 0, ADMINISTRATOR );
+								  admin_command_handler, 
+								  "admin_command_handler", ADMINISTRATOR );
 	// Command handler for stashing the pool password
 	daemonCore->Register_Command( STORE_POOL_CRED, "STORE_POOL_CRED",
-								(CommandHandler)&store_pool_cred_handler,
-								"store_pool_cred_handler", NULL, CONFIG_PERM,
+								&store_pool_cred_handler,
+								"store_pool_cred_handler", CONFIG_PERM,
 								D_FULLDEBUG );
+
+	// Command handler for handling the ready state
+	daemonCore->Register_CommandWithPayload( DC_SET_READY, "DC_SET_READY",
+								  ready_command_handler,
+								  "ready_command_handler", WRITE );
+	daemonCore->Register_CommandWithPayload( DC_QUERY_READY, "DC_QUERY_READY",
+								  ready_command_handler,
+								  "ready_command_handler", READ );
+
 	/*
 	daemonCore->Register_Command( START_AGENT, "START_AGENT",
-					  (CommandHandler)admin_command_handler, 
-					  "admin_command_handler", 0, ADMINISTRATOR );
+					  admin_command_handler, 
+					  "admin_command_handler", ADMINISTRATOR );
 	*/
 
 	daemonCore->RegisterTimeSkipCallback(time_skip_handler,0);
@@ -372,7 +754,52 @@ main_init( int argc, char* argv[] )
 
 
 int
-admin_command_handler( Service*, int cmd, Stream* stream )
+ready_command_handler(int cmd, Stream* stm )
+{
+	ReliSock* stream = (ReliSock*)stm;
+	ClassAd cmdAd;
+
+	stream->decode();
+	stream->timeout(15);
+	if( !getClassAd(stream, cmdAd) || !stream->end_of_message()) {
+		dprintf( D_ALWAYS, "Failed to receive ready command (%d) on TCP: aborting\n", cmd );
+		return FALSE;
+	}
+	std::string daemon_name;
+	cmdAd.LookupString("DaemonName", daemon_name);
+	int daemon_pid = 0;
+	cmdAd.LookupInteger("DaemonPID", daemon_pid);
+
+	dprintf( D_FULLDEBUG, "Got ready command (%d) from %s pid=%d\n", cmd, daemon_name.c_str(), daemon_pid );
+
+	switch (cmd) {
+		case DC_SET_READY:
+		{
+			std::string state;
+			cmdAd.LookupString("DaemonState", state);
+			class daemon* daemon = daemons.FindDaemonByPID(daemon_pid);
+			if ( ! daemon) {
+				dprintf(D_ALWAYS, "Cant find daemon %s to set ready state '%s'\n", daemon_name.c_str(), state.c_str());
+			} else {
+				dprintf(D_ALWAYS, "Setting ready state '%s' for %s\n", state.c_str(), daemon_name.c_str());
+				daemon->SetReadyState(state.c_str());
+			}
+		}
+		return TRUE;
+
+		case DC_QUERY_READY:
+			return daemons.QueryReady(cmdAd, stm);
+		return FALSE;
+
+		default:
+			EXCEPT("Unknown ready command (%d) in ready_command_handler", cmd);
+	}
+
+	return FALSE;
+}
+
+int
+admin_command_handler(int cmd, Stream* stream )
 {
 	if(! AllowAdminCommands ) {
 		dprintf( D_FULLDEBUG, 
@@ -442,7 +869,7 @@ admin_command_handler( Service*, int cmd, Stream* stream )
 }
 
 int
-agent_starter( ReliSock * s )
+agent_starter( ReliSock * s, Stream * )
 {
 	ReliSock* stream = (ReliSock*)s;
 	char *subsys = NULL;
@@ -472,41 +899,35 @@ agent_starter( ReliSock * s )
 int
 handle_agent_fetch_log (ReliSock* stream) {
 
-	char *daemon_name = NULL;
-	char *daemon_paramname = NULL;
-	char *daemon_filename = NULL;
+	MyString daemon;
 	int  res = FALSE;
 
-	if( ! stream->code(daemon_name) ||
+	if( ! stream->code(daemon) ||
 		! stream->end_of_message()) {
 		dprintf( D_ALWAYS, "ERROR: fetch_log can't read daemon name\n" );
-		free( daemon_name );
 		return FALSE;
 	}
 
-	dprintf( D_ALWAYS, "INFO: daemon_name: %s\n", daemon_name );
+	dprintf( D_ALWAYS, "INFO: daemon_name: %s\n", daemon.c_str() );
 
-	daemon_paramname = (char*)malloc (strlen(daemon_name) + 5);
-	strcpy (daemon_paramname, daemon_name);
-	strcat (daemon_paramname, "_LOG");
+	// append _LOG to get the param name of the daemon log file
+	daemon += "_LOG";
 
-	dprintf( D_ALWAYS, "INFO: daemon_paramname: %s\n", daemon_paramname );
+	dprintf( D_ALWAYS, "INFO: daemon_paramname: %s\n", daemon.c_str() );
 
-	if( (daemon_filename = param(daemon_paramname)) ) {
+	auto_free_ptr daemon_filename(param(daemon.c_str()));
+	if ( daemon_filename ) {
 		filesize_t	size;
-		dprintf( D_ALWAYS, "INFO: daemon_filename: %s\n", daemon_filename );
+		dprintf( D_ALWAYS, "INFO: daemon_filename: %s\n", daemon_filename.ptr() );
 		stream->encode();
-		res = (stream->put_file(&size, daemon_filename) < 0);
-		free (daemon_filename);
+		res = (stream->put_file(&size, daemon_filename.ptr()) < 0);
 	} else {
-		dprintf( D_ALWAYS, "ERROR: fetch_log can't param for log name\n" );
+		dprintf( D_ALWAYS, "ERROR: fetch_log can't param for %s\n", daemon.c_str() );
 	}
-
-	free (daemon_paramname);
-	free (daemon_name);
 
 	return res;
 }
+
 
 int
 handle_subsys_command( int cmd, Stream* stream )
@@ -525,6 +946,14 @@ handle_subsys_command( int cmd, Stream* stream )
 		free( subsys );
 		return FALSE;
 	}
+
+	// for testing condor_on -preen is allowed, but preen is not really a daemon
+	// so we intercept it here and 
+	if (strcasecmp(subsys, "preen") == MATCH) {
+		free(subsys);
+		return run_preen_now();
+	}
+
 	subsys = strupr( subsys );
 	if( !(daemon = daemons.FindDaemon(subsys)) ) {
 		dprintf( D_ALWAYS, "Error: Can't find daemon of type \"%s\"\n", 
@@ -577,13 +1006,13 @@ handle_shutdown_program( int cmd, Stream* stream )
 		EXCEPT( "Unknown command (%d) in handle_shutdown_program", cmd );
 	}
 
-	char	*name = NULL;
+	MyString name;
 	stream->decode();
 	if( ! stream->code(name) ) {
-		dprintf( D_ALWAYS, "Can't read program name\n" );
-		if ( name ) {
-			free( name );
-		}
+		dprintf( D_ALWAYS, "Can't read program name in handle_shutdown_program\n" );
+	}
+
+	if ( name.IsEmpty() ) {
 		return FALSE;
 	}
 
@@ -593,10 +1022,20 @@ handle_shutdown_program( int cmd, Stream* stream )
 	pname += name;
 	char	*path = param( pname.Value() );
 	if ( NULL == path ) {
-		dprintf( D_ALWAYS, "No shutdown program defined for '%s'\n", name );
+		dprintf( D_ALWAYS, "No shutdown program defined for '%s'\n", name.c_str() );
 		return FALSE;
 	}
 
+	int ret_val = set_shutdown_program( path );
+
+	if (path) free(path);
+
+	return ret_val;
+}
+
+int
+set_shutdown_program(const char *path)
+{
 	// Try to access() it
 # if defined(HAVE_ACCESS)
 	priv_state	priv = set_root_priv();
@@ -613,7 +1052,7 @@ handle_shutdown_program( int cmd, Stream* stream )
 	if ( shutdown_program ) {
 		free( shutdown_program );
 	}
-	shutdown_program = path;
+	shutdown_program = strdup(path);
 	dprintf( D_ALWAYS,
 			 "Shutdown program path set to %s\n", shutdown_program );
 	return TRUE;
@@ -637,7 +1076,7 @@ init_params()
 			} 
 		}
 	} else {
-		delete [] MasterName;
+		free( MasterName );
 		tmp = param( "MASTER_NAME" );
 		MasterName = build_valid_daemon_name( tmp );
 		free( tmp );
@@ -824,6 +1263,12 @@ init_daemon_list()
 			// Tolerate a trailing comma in the list
 		daemon_names.remove( "" );
 
+			// if the master is not in the list, pretend it is.
+			// so we end up creating a daemon object for it, and don't just abort
+		if ( ! daemon_names.contains("MASTER")) {
+			daemon_names.append("MASTER");
+		}
+
 
 			/*
 			  Make sure that if COLLECTOR is in the list, put it at
@@ -862,6 +1307,7 @@ init_daemon_list()
 				daemon_names.insert( "SHARED_PORT" );
 			}
 		}
+
 		daemons.ordered_daemon_names.create_union( daemon_names, false );
 
 		daemon_names.rewind();
@@ -875,10 +1321,21 @@ init_daemon_list()
 			}
 		}
 	} else {
-		daemons.ordered_daemon_names.create_union( dc_daemon_names, false );
-		for(int i = 0; default_daemon_list[i]; i++) {
-			new class daemon(default_daemon_list[i]);
+		// some daemons should start only if shared port is enabled
+		bool shared_port = SharedPortEndpoint::UseSharedPort() && param_boolean("AUTO_INCLUDE_SHARED_PORT_IN_DAEMON_LIST", true);
+
+		// use the default daemon list to decide which daemons to start now, and which will we allow to start
+		for(int i = 0; default_daemon_list[i].name; i++) {
+			const char * name = default_daemon_list[i].name;
+			daemon_names.append(name); // add to list of allowed daemons
+			// should we start it now?
+			if (default_daemon_list[i].auto_start) {
+				if (shared_port || ! default_daemon_list[i].only_if_shared_port) {
+					new class daemon(default_daemon_list[i].name);
+				}
+			}
 		}
+		daemons.ordered_daemon_names.create_union(daemon_names, false);
 	}
 
 }
@@ -901,7 +1358,7 @@ init_classad()
 			EXCEPT( "default_daemon_name() returned NULL" );
 		}
 		ad->Assign(ATTR_NAME, default_name);
-		delete [] default_name;
+		free(default_name);
 	}
 
 #if !defined(WIN32)
@@ -958,6 +1415,7 @@ main_config()
 
 		// Reset our config values
 	init_params();
+	validate_config(0, CONFIG_OPT_DEPRECATION_WARNINGS);
 
 		// Reset the daemon list
 	init_daemon_list();
@@ -1092,18 +1550,18 @@ invalidate_ads() {
 	
 	MyString line;
 	std::string escaped_name;
-	char* default_name = ::strnewp(MasterName);
+	char* default_name = MasterName ? ::strdup(MasterName) : NULL;
 	if(!default_name) {
 		default_name = default_daemon_name();
 	}
 	
-	EscapeAdStringValue( default_name, escaped_name );
-	line.formatstr( "( TARGET.%s == \"%s\" )", ATTR_NAME, escaped_name.c_str() );
+	QuoteAdStringValue( default_name, escaped_name );
+	line.formatstr( "( TARGET.%s == %s )", ATTR_NAME, escaped_name.c_str() );
 	cmd_ad.AssignExpr( ATTR_REQUIREMENTS, line.Value() );
 	cmd_ad.Assign( ATTR_NAME, default_name );
 	cmd_ad.Assign( ATTR_MY_ADDRESS, daemonCore->publicNetworkIpAddr());
 	daemonCore->sendUpdates( INVALIDATE_MASTER_ADS, &cmd_ad, NULL, false );
-	delete [] default_name;
+	free( default_name );
 }
 
 static const struct {
@@ -1148,6 +1606,25 @@ StopStateT StringToStopState(const char * psz)
 time_t
 GetTimeStamp(char* file)
 {
+#ifdef WIN32
+	ULARGE_INTEGER nanos;
+	HANDLE hfile = CreateFile(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (hfile == INVALID_HANDLE_VALUE) {
+		return (time_t)-1;
+	} else {
+		BOOL fGotTime = GetFileTime(hfile, NULL, NULL, (FILETIME*)&nanos);
+		CloseHandle(hfile);
+		if ( ! fGotTime) {
+			return (time_t)-1;
+		}
+	}
+	// Windows filetimes are in 100 nanosecond intervals since January 1, 1601 (UTC)
+	// NOTE: FAT records times on-disk in localtime, so daylight savings time can end up changing what is reported
+	// the good news is NTFS stores UTC, so it doesn't have that problem.
+	ULONGLONG nt_sec = nanos.QuadPart / (10 * 1000 * 1000); // convert to seconds,
+	time_t epoch_sec = nt_sec - 11644473600; // convert from Windows 1600 epoch, to unix 1970 epoch
+	return epoch_sec;
+#else
 	struct stat sbuf;
 	
 	if( stat(file, &sbuf) < 0 ) {
@@ -1155,6 +1632,7 @@ GetTimeStamp(char* file)
 	}
 	
 	return( sbuf.st_mtime );
+#endif
 }
 
 
@@ -1179,38 +1657,45 @@ NewExecutable(char* file, time_t *tsp)
 	return( cts != *tsp );
 }
 
-void
-run_preen()
+int
+run_preen_now()
 {
-	int		child_pid;
 	char *args=NULL;
 	const char	*preen_base;
 	ArgList arglist;
 	MyString error_msg;
 
 	dprintf(D_FULLDEBUG, "Entered run_preen.\n");
+	if ( preen_pid > 0 ) {
+		dprintf( D_ALWAYS, "WARNING: Preen is already running (pid %d), ignoring command to run Preen.\n", preen_pid );
+		return FALSE;
+	}
 
 	if( FS_Preen == NULL ) {
-		return;
+		dprintf( D_ALWAYS, "WARNING: PREEN has no configured value, ignoring command to run Preen.\n" );
+		return FALSE;
 	}
 	preen_base = condor_basename( FS_Preen );
 	arglist.AppendArg(preen_base);
 
 	args = param("PREEN_ARGS");
 	if(!arglist.AppendArgsV1RawOrV2Quoted(args,&error_msg)) {
-		EXCEPT("ERROR: failed to parse preen args: %s\n",error_msg.Value());
+		EXCEPT("ERROR: failed to parse preen args: %s",error_msg.Value());
 	}
 	free(args);
 
-	child_pid = daemonCore->Create_Process(
+	preen_pid = daemonCore->Create_Process(
 					FS_Preen,		// program to exec
 					arglist,   		// args
 					PRIV_ROOT,		// privledge level
 					1,				// which reaper ID to use; use default reaper
 					FALSE );		// we do _not_ want this process to have a command port; PREEN is not a daemon core process
-	dprintf( D_ALWAYS, "Preen pid is %d\n", child_pid );
+	dprintf( D_ALWAYS, "Preen pid is %d\n", preen_pid );
+	return TRUE;
 }
 
+// this is the preen timer callback
+void run_preen() { run_preen_now(); }
 
 void
 RestartMaster()
@@ -1222,9 +1707,9 @@ void
 main_pre_command_sock_init()
 {
 	/* Make sure we are the only copy of condor_master running */
+	char*  p;
 #ifndef WIN32
 	MyString lock_file;
-	char*  p;
 
 	// see if a file is given explicitly
 	p = param ("MASTER_INSTANCE_LOCK");
@@ -1256,16 +1741,39 @@ main_pre_command_sock_init()
 	lock_or_except( lock_file.Value() );
 	dprintf (D_FULLDEBUG, "Obtained lock on %s.\n", lock_file.Value() );
 #endif
-	MyString daemon_list;
-	if( param(daemon_list,"DAEMON_LIST") ) {
-		StringList sl(daemon_list.Value());
-		if( sl.contains("SHARED_PORT") ) {
-				// in case a shared port address file got left behind by an
-				// unclean shutdown, clean it up now before we create our
-				// command socket to avoid confusion
-			SharedPortServer::RemoveDeadAddressFile();
-		}
+
+	// Do any kernel tuning we've been configured to do.
+	if( param_boolean( "ENABLE_KERNEL_TUNING", false ) ) {
+#ifdef LINUX
+		do_linux_kernel_tuning();
+#endif
 	}
+
+	// If using CREDENTIAL_DIRECTORY, blow away the CREDMON_COMPLETE file
+	// to force the credmon to refresh everything and to prevent the schedd
+	// from starting up until credentials are ready.
+	auto_free_ptr cred_dir(param("SEC_CREDENTIAL_DIRECTORY_KRB"));
+	if (cred_dir) {
+		credmon_clear_completion(credmon_type_KRB, cred_dir);
+	}
+	cred_dir.set(param("SEC_CREDENTIAL_DIRECTORY_OAUTH"));
+	if (cred_dir) {
+		credmon_clear_completion(credmon_type_OAUTH, cred_dir);
+	}
+
+ 	// in case a shared port address file got left behind by an
+ 	// unclean shutdown, clean it up now before we create our
+ 	// command socket to avoid confusion
+	// Do so unconditionally, because the master will decide later (when
+	// it's ready to start daemons) if it will be starting the shared
+	// port daemon.
+ 	SharedPortServer::RemoveDeadAddressFile();
+
+	// The master and its daemons may disagree on if they're using shared
+	// port, so make sure everything's ready, just in case.
+	//
+	// FIXME: condor_preen doesn't look to know about "auto" directories.
+	SharedPortEndpoint::InitializeDaemonSocketDir();
 }
 
 #ifdef WIN32
@@ -1290,10 +1798,13 @@ bool main_has_console()
 int
 main( int argc, char **argv )
 {
+    // as of 8.9.6 daemon core defaults to foreground
+    // for the master (and only the master) we change it to default to background
+    dc_args_default_to_background(true);
+
     // parse args to see if we have been asked to run as a service.
     // services are started without a console, so if we have one
     // we can't possibly run as a service.
-    //
 #ifdef WIN32
     bool has_console = main_has_console();
     bool is_daemon = dc_args_is_background(argc, argv);
@@ -1329,6 +1840,31 @@ main( int argc, char **argv )
     }
 #endif
 
+#ifdef LINUX
+    // Check for necessary directories if we were started by the system
+    if (getuid() == 0 && getppid() == 1) {
+        // If the condor user is in LDAP, systemd will silently fail to create
+        // these necessary directories at boot. The condor user and paths are
+        // hard coded here, because they match the systemd configuration.
+        struct stat sbuf;
+        struct passwd *pwbuf = getpwnam("condor");
+        if (pwbuf) {
+            if (stat("/var/run/condor", &sbuf) != 0 && errno == ENOENT) {
+                if (mkdir("/var/run/condor", 0775) == 0) {
+                    dummyGlobal = chown("/var/run/condor", pwbuf->pw_uid, pwbuf->pw_gid);
+                    dummyGlobal = chmod("/var/run/condor", 0775); // Override umask
+                }
+            }
+            if (stat("/var/lock/condor", &sbuf) != 0 && errno == ENOENT) {
+                if (mkdir("/var/lock/condor", 0775) == 0) {
+                    dummyGlobal = chown("/var/lock/condor", pwbuf->pw_uid, pwbuf->pw_gid);
+                    dummyGlobal = chmod("/var/lock/condor", 0775); // Override umask
+                }
+            }
+        }
+    }
+#endif
+
 	return dc_main( argc, argv );
 }
 
@@ -1337,21 +1873,21 @@ void init_firewall_exceptions() {
 
 	bool add_exception;
 	char *master_image_path, *schedd_image_path, *startd_image_path,
-		 *dbmsd_image_path, *quill_image_path, *dagman_image_path, 
-		 *negotiator_image_path, *collector_image_path, *starter_image_path,
-		 *shadow_image_path, *gridmanager_image_path, *gahp_image_path,
-		 *gahp_worker_image_path, *credd_image_path, 
-		 *vmgahp_image_path, *kbdd_image_path, *hdfs_image_path, *bin_path;
+		 *dagman_image_path, *negotiator_image_path, *collector_image_path, 
+		 *starter_image_path, *shadow_image_path, *gridmanager_image_path, 
+		 *gahp_image_path, *gahp_worker_image_path, *credd_image_path, 
+		 *vmgahp_image_path, *kbdd_image_path, *bin_path;
 	const char* dagman_exe = "condor_dagman.exe";
 
 	WindowsFirewallHelper wfh;
 	
-	add_exception = param_boolean("ADD_WINDOWS_FIREWALL_EXCEPTION", true);
+	add_exception = param_boolean("ADD_WINDOWS_FIREWALL_EXCEPTION", NT_ServiceFlag);
 
 	if ( add_exception == false ) {
-		dprintf(D_FULLDEBUG, "ADD_WINDOWS_FIREWALL_EXCEPTION is false, skipping\n");
+		dprintf(D_FULLDEBUG, "ADD_WINDOWS_FIREWALL_EXCEPTION is false, skipping firewall configuration\n");
 		return;
 	}
+	dprintf(D_ALWAYS, "Adding/Checking Windows firewall exceptions for all daemons\n");
 
 	// We use getExecPath() here instead of param() since it's
 	// possible the the Windows Service Control Manager
@@ -1374,11 +1910,6 @@ void init_firewall_exceptions() {
 	schedd_image_path = param("SCHEDD");
 	startd_image_path = param("STARTD");
 
-	// We to also add exceptions for Quill and DBMSD
-
-	quill_image_path = param("QUILL");
-	dbmsd_image_path = param("DBMSD");
-
 	// And add exceptions for all the other daemons, since they very well
 	// may need to open a listen port for mechanisms like CCB, or HTTPS
 	negotiator_image_path = param("NEGOTIATOR");
@@ -1390,12 +1921,12 @@ void init_firewall_exceptions() {
 	gahp_worker_image_path = param("CONDOR_GAHP_WORKER");
 	credd_image_path = param("CREDD");
 	kbdd_image_path = param("KBDD");
-	hdfs_image_path = param("HDFS");
 	vmgahp_image_path = param("VM_GAHP_SERVER");
 	
 	// We also want to add exceptions for the DAGMan we ship
 	// with Condor:
 
+	dagman_image_path = NULL; // make sure it's initialized.
 	bin_path = param ( "BIN" );
 	if ( bin_path ) {
 		dagman_image_path = (char*) malloc (
@@ -1480,22 +2011,6 @@ void init_firewall_exceptions() {
 		}
 	}
 
-	if ( (daemons.FindDaemon("QUILL") != NULL) && quill_image_path ) {
-		if ( !SUCCEEDED(wfh.addTrusted(quill_image_path)) ) {
-			dprintf(D_FULLDEBUG, "WinFirewall: unable to add %s to the "
-				"windows firewall exception list.\n",
-				quill_image_path);
-		}
-	}
-
-	if ( (daemons.FindDaemon("DBMSD") != NULL) && dbmsd_image_path ) {
-		if ( !SUCCEEDED(wfh.addTrusted(dbmsd_image_path)) ) {
-			dprintf(D_FULLDEBUG, "WinFirewall: unable to add %s to the "
-				"windows firewall exception list.\n",
-				dbmsd_image_path);
-		}
-	}
-
 	if ( starter_image_path ) {
 		if ( !SUCCEEDED(wfh.addTrusted(starter_image_path)) ) {
 			dprintf(D_FULLDEBUG, "WinFirewall: unable to add %s to the "
@@ -1509,13 +2024,6 @@ void init_firewall_exceptions() {
 			dprintf(D_FULLDEBUG, "WinFirewall: unable to add %s to the "
 				"windows firewall exception list.\n",
 				credd_image_path);
-		}
-	}
-
-	if ( (daemons.FindDaemon("HDFS") != NULL) && hdfs_image_path ) {
-		if ( !SUCCEEDED(wfh.addTrusted(hdfs_image_path)) ) {
-			dprintf(D_FULLDEBUG, "WinFirewall: unable to add %s to the "
-				"windows firewall exception list.\n", hdfs_image_path);
 		}
 	}
 
@@ -1538,8 +2046,6 @@ void init_firewall_exceptions() {
 	if ( master_image_path ) { free(master_image_path); }
 	if ( schedd_image_path ) { free(schedd_image_path); }
 	if ( startd_image_path ) { free(startd_image_path); }
-	if ( quill_image_path )  { free(quill_image_path); }
-	if ( dbmsd_image_path )  { free(dbmsd_image_path); }
 	if ( dagman_image_path ) { free(dagman_image_path); }
 	if ( negotiator_image_path ) { free(negotiator_image_path); }
 	if ( collector_image_path ) { free(collector_image_path); }
@@ -1549,29 +2055,6 @@ void init_firewall_exceptions() {
 	if ( credd_image_path ) { free(credd_image_path); }	
 	if ( vmgahp_image_path ) { free(vmgahp_image_path); }
 	if ( kbdd_image_path ) { free(kbdd_image_path); }
-#endif
-}
-
-void
-check_uid_for_privsep()
-{
-#if !defined(WIN32)
-	if (param_boolean("PRIVSEP_ENABLED", false) && (getuid() == 0)) {
-		uid_t condor_uid = get_condor_uid();
-		if (condor_uid == 0) {
-			EXCEPT("PRIVSEP_ENABLED set, but current UID is 0 "
-			           "and condor UID is also set to root");
-		}
-		dprintf(D_ALWAYS,
-		        "PRIVSEP_ENABLED set, but UID is 0; "
-		            "will drop to UID %u and restart\n",
-		        (unsigned)condor_uid);
-		daemons.CleanupBeforeRestart();
-		set_condor_priv_final();
-		daemons.ExecMaster();
-		EXCEPT("attempt to restart (via exec) failed (%s)",
-		       strerror(errno));
-	}
 #endif
 }
 

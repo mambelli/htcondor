@@ -18,7 +18,6 @@
  ***************************************************************/
 
 #include "condor_common.h"
-#include "condor_string.h"  /* for strnewp() */
 #include "MyString.h"
 #include "debug.h"
 #include "jobstate_log.h"
@@ -42,7 +41,7 @@ static const char *RECOVERY_FINISHED_NAME = "RECOVERY_FINISHED";
 static const char *RECOVERY_FAILURE_NAME = "RECOVERY_FAILURE";
 static const char *SUBMIT_FAILURE_NAME = "SUBMIT_FAILURE";
 
-	// Default Condor ID to use to check for invalid IDs.
+	// Default HTCondor ID to use to check for invalid IDs.
 static const CondorID DEFAULT_CONDOR_ID;
 
 //---------------------------------------------------------------------------
@@ -56,7 +55,7 @@ JobstateLog::JobstateLog()
 //---------------------------------------------------------------------------
 JobstateLog::~JobstateLog()
 {
-	delete [] _jobstateLogFile;
+	free( _jobstateLogFile );
 	if ( _outfile ) {
 		fclose( _outfile );
 		_outfile = NULL;
@@ -312,7 +311,7 @@ JobstateLog::WriteEvent( const ULogEvent *event, Job *node )
 	ASSERT( node );
 
 	const char *prefix = "ULOG_";
-	const char *eventName = ULogEventNumberNames[event->eventNumber];
+	const char *eventName = event->eventName();
 	if ( strstr( eventName, prefix ) != eventName ) {
        	debug_printf( DEBUG_QUIET, "Warning: didn't find expected prefix "
 					"%s in event name %s\n", prefix, eventName );
@@ -324,8 +323,7 @@ JobstateLog::WriteEvent( const ULogEvent *event, Job *node )
 	if ( eventName != NULL ) {
 		MyString condorID;
 		CondorID2Str( event->cluster, event->proc, condorID );
-		struct tm eventTm = event->eventTime;
-		time_t eventTime = mktime( &eventTm );
+		time_t eventTime = event->GetEventclock();
 		Write( &eventTime, node, eventName, condorID.Value() );
 	}
 }
@@ -485,7 +483,7 @@ JobstateLog::Write( const time_t *eventTimeP, const MyString &info )
 void
 JobstateLog::CondorID2Str( int cluster, int proc, MyString &idStr )
 {
-		// Make sure Condor ID is valid.
+		// Make sure HTCondor ID is valid.
 	if ( cluster != DEFAULT_CONDOR_ID._cluster ) {
 		idStr.formatstr( "%d.%d", cluster, proc );
 	} else {
@@ -501,14 +499,15 @@ JobstateLog::ParseLine( MyString &line, time_t &timestamp,
 			MyString &nodeName, int &seqNum )
 {
 	line.chomp();
-	line.Tokenize();
-	const char* timestampTok = line.GetNextToken( " ", false );
-	const char* nodeNameTok = line.GetNextToken( " ", false );
-	(void)line.GetNextToken( " ", false ); // event name
-	(void)line.GetNextToken( " ", false ); // condor id
-	(void)line.GetNextToken( " ", false ); // job tag (pegasus site)
-	(void)line.GetNextToken( " ", false ); // unused
-	const char* seqNumTok = line.GetNextToken( " ", false );
+	MyStringTokener tok;
+	tok.Tokenize(line.Value());
+	const char* timestampTok = tok.GetNextToken( " ", false );
+	const char* nodeNameTok = tok.GetNextToken( " ", false );
+	(void)tok.GetNextToken( " ", false ); // event name
+	(void)tok.GetNextToken( " ", false ); // condor id
+	(void)tok.GetNextToken( " ", false ); // job tag (pegasus site)
+	(void)tok.GetNextToken( " ", false ); // unused
+	const char* seqNumTok = tok.GetNextToken( " ", false );
 
 	if ( (timestampTok == NULL) || (nodeNameTok == NULL) ) {
 		debug_printf( DEBUG_QUIET, "Warning: error parsing "
@@ -517,8 +516,12 @@ JobstateLog::ParseLine( MyString &line, time_t &timestamp,
 		return false;
 	}
 
-	int items = sscanf( timestampTok, "%lu", &timestamp );
-	if ( items != 1 ) {
+		// fetch the number, and get a pointer to the first char after
+		// if the pointer did not advance, then there was no number to parse.
+	char *pend;
+	timestamp = (time_t)strtoll(timestampTok, &pend, 10);
+
+	if (pend == timestampTok) {
 		debug_printf( DEBUG_QUIET, "Warning: error reading "
 					"timestamp in jobstate.log file line <%s>\n",
 					line.Value() );
@@ -530,8 +533,8 @@ JobstateLog::ParseLine( MyString &line, time_t &timestamp,
 
 	seqNum = 0;
 	if ( seqNumTok ) {
-		items = sscanf( seqNumTok, "%d", &seqNum );
-		if ( items != 1 ) {
+		seqNum = (int)strtol(seqNumTok, &pend, 10);
+		if (pend == seqNumTok) {
 			debug_printf( DEBUG_QUIET, "Warning: error reading "
 						"sequence number in jobstate.log file line <%s>\n",
 						line.Value() );

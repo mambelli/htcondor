@@ -27,11 +27,13 @@
  * complain to the log if the processor flag strings aren't all the same.
  */
 
-const char * sysapi_processor_flags_raw( void ) {
+static struct sysapi_cpuinfo theInfo;
+
+const struct sysapi_cpuinfo *sysapi_processor_flags_raw( void ) {
     sysapi_internal_reconfig();
     
     if( _sysapi_processor_flags_raw != NULL ) {
-        return _sysapi_processor_flags_raw;
+        return &theInfo;
     }
 
     /* Set the default to the empty string so that if something goes wrong
@@ -46,7 +48,7 @@ const char * sysapi_processor_flags_raw( void ) {
     FILE * fp = safe_fopen_wrapper_follow( "/proc/cpuinfo", "r", 0644 );
     dprintf( D_LOAD, "Reading from /proc/cpuinfo\n" );
     if( fp ) {
-        size_t size = 128;
+        int size = 128;
         char * buffer = (char *)malloc( size );
         if( buffer == NULL ) {
             EXCEPT( "Failed to allocate buffer for parsing /proc/cpuinfo.\n" );
@@ -104,7 +106,19 @@ const char * sysapi_processor_flags_raw( void ) {
                     }
                     
                     foundProcessorFlags += 1;
-                }
+                } else if (strcmp(attribute, "model") == 0) {
+			int tmp = 0;
+			int r = sscanf(value, "%d", &tmp);
+			if (r > 0) theInfo.model_no = tmp;
+		} else if (strcmp(attribute,"cpu family") == 0) {
+			int tmp = 0;
+			int r = sscanf(value, "%d", &tmp);
+			if (r > 0) theInfo.family = tmp;
+		} else if (strcmp(attribute,"cache size") == 0) {
+			int tmp = 0;
+			int r = sscanf(value, "%d", &tmp);
+			if (r > 0) theInfo.cache = tmp;
+		}
             }
         }
         
@@ -112,14 +126,15 @@ const char * sysapi_processor_flags_raw( void ) {
         fclose( fp );
     }
     
-    return _sysapi_processor_flags_raw;
+    theInfo.processor_flags = _sysapi_processor_flags;
+    return &theInfo;
 }
 
-const char * sysapi_processor_flags( void ) {
+const struct sysapi_cpuinfo *sysapi_processor_flags( void ) {
     sysapi_internal_reconfig();
     
     if( _sysapi_processor_flags != NULL ) {
-        return _sysapi_processor_flags;
+        return &theInfo;
     }
     
     if( _sysapi_processor_flags_raw == NULL ) {
@@ -128,14 +143,14 @@ const char * sysapi_processor_flags( void ) {
     }
 
     /* Which flags do we care about?  You MUST terminate this list with NULL. */
-    static const char * const flagNames[] = { "ssse3", "sse4_1", "sse4_2", NULL };
+    static const char * const flagNames[] = { "avx", "avx2", "avx512f", "avx512dq", "avx512_vnni", "ssse3", "sse4_1", "sse4_2", NULL };
 
     /* Do some memory-allocation math. */
     int numFlags = 0;
     int maxFlagLength = 0;
     for( int i = 0; flagNames[i] != NULL; ++i ) {
         ++numFlags;
-        int curFlagLength = strlen( flagNames[i] );
+        int curFlagLength = (int)strlen( flagNames[i] );
         if( curFlagLength > maxFlagLength ) { maxFlagLength = curFlagLength; }
     }
 
@@ -160,7 +175,7 @@ const char * sysapi_processor_flags( void ) {
 
         for( flagEnd = flagStart; (* flagEnd != '\0') && (* flagEnd != ' '); ++flagEnd ) { ; }
 
-        int flagSize = (flagEnd - flagStart) / sizeof( char );
+        int flagSize = (flagEnd - flagStart) / (int)sizeof( char );
         if( flagSize > maxFlagLength ) {
             flagStart = flagEnd;
             continue;
@@ -187,7 +202,7 @@ const char * sysapi_processor_flags( void ) {
     /* How much space do we need? */
     int flagsLength = 1;
     for( int i = 0; i < numFlags; ++i ) {
-        int length = strlen( flags[i] );
+        int length = (int)strlen( flags[i] );
         if( length ) { flagsLength += length + 1; }
     }
     
@@ -214,7 +229,8 @@ const char * sysapi_processor_flags( void ) {
     }
     
     free( flags );
-    return _sysapi_processor_flags;
+    theInfo.processor_flags = _sysapi_processor_flags;
+    return &theInfo;
 }
 
 // ----------------------------------------------------------------------------

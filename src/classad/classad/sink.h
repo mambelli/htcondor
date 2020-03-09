@@ -59,6 +59,7 @@ class ClassAdUnParser
 		 * 	@param expr The expression to unparse
 		 */
 		void Unparse( std::string &buffer, const ExprTree *expr );
+		void Unparse( std::string &buffer, const ClassAd *ad, const References &whitelist );
 
 			//	for backcompatibility only - NAC
 			// In old ClassAd syntax, nested ads should be delimited in
@@ -89,7 +90,7 @@ class ClassAdUnParser
 		virtual void UnparseAux( std::string &buffer, std::vector<ExprTree*>& );
 
 		// to unparse attribute names (quoted & unquoted attributes)
-		virtual void UnparseAux( std::string &buffer, std::string identifier);
+		virtual void UnparseAux( std::string &buffer, const std::string &identifier);
 
 		// table of string representation of operators
 		static const char *opString[];

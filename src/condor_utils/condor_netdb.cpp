@@ -22,24 +22,10 @@
 #include "condor_config.h"
 #include "condor_debug.h"
 #include "internet.h"
-#include "condor_socket_types.h"
 #include "condor_netdb.h"
 #include "ipv6_hostname.h"
 #include "condor_sockfunc.h"
-
-#ifndef   NI_MAXHOST
-#define   NI_MAXHOST 1025
-#endif
-
-typedef union sockaddr_storage_ptr_u {
-	struct sockaddr    *raw;
-	struct sockaddr_in *in;
-} sockaddr_storage_ptr;
-
-typedef union in_addr_ptr_u {
-	const char         *as_char;
-	struct in_addr     *in;
-} in_addr_ptr;
+#include "my_hostname.h"
 
 /* SPECIAL NAMES:
  *
@@ -50,219 +36,12 @@ typedef union in_addr_ptr_u {
  * XXX.XXX.XXX.XXX.
  */
 
-/* param_boolean() and param_boolean_int() are C++-only functions, so
- * we roll our own version for checking NO_DNS. :-(
- */
-static int
-nodns_enabled( void )
-{
-	return param_boolean_crufty("NO_DNS", false) ? 1 : 0;
-}
-
 /* WARNING: None of these functions properly set h_error, or errno */
-
-int
-convert_ip_to_hostname(const char *addr,
-					   char *h_name,
-					   int maxlen);
-
-int
-convert_hostname_to_ip(const char *name,
-					   char **h_addr_list,
-					   int maxaddrs);
-
-struct hostent * get_nodns_hostent(const char* name)
-{
-		// We simulate at most 1 addr
-	#define MAXSIMULATEDADDRS 2 
-
-	static struct hostent hostent;
-	static char *h_aliases[1] = {NULL};
-	static char *h_addr_list[MAXSIMULATEDADDRS];
-	static char h_name[NI_MAXHOST];
-
-		if (convert_hostname_to_ip(name, h_addr_list, MAXSIMULATEDADDRS)) {
-				// We've failed
-			return NULL;
-		} else {
-			memset(h_name, 0, MAXSIMULATEDADDRS);
-        strncpy(h_name, name, NI_MAXHOST - 1);
-			hostent.h_name = h_name;
-			hostent.h_aliases = h_aliases;
-			hostent.h_addrtype = AF_INET;
-			hostent.h_length = sizeof(struct in_addr);
-			hostent.h_addr_list = h_addr_list;
-
-			return &hostent;
-		}
-}
-
-struct hostent *
-condor_gethostbyname_ipv4(const char *name) {
-	if (nodns_enabled()) {
-	    return get_nodns_hostent(name);
-	} else {
-		return gethostbyname(name);
-	}
-}
-
-// This is obsolete function. do not use.
-struct hostent *
-condor_gethostbyname_ipv6(const char* name) {
-    #define MAXADDR 16
-    static struct hostent hostent;
-	static struct in_addr addr_list[MAXADDR];
-	static char *h_addr_list[MAXADDR+1];
-	static char h_name[NI_MAXHOST];
-	struct addrinfo hints;
-	struct addrinfo* res = NULL;
-	struct addrinfo* iter;
-	struct hostent* hostent_alias = NULL;
-	int e;
-	int addrcount = 0;
-	int first = 1;
-
-    if (nodns_enabled()) {
-        return get_nodns_hostent(name);
-    }
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-#ifdef WIN32
-	// AI_ADDRCONFIG is supported since Windows Server 2008 SDK.
-    hints.ai_flags = AI_CANONNAME;
-#else
-    hints.ai_flags = AI_ADDRCONFIG | AI_CANONNAME;
-#endif 
-
-    e = getaddrinfo(name, NULL, &hints, &res);
-    if (e != 0)
-        return NULL;
-
-    memset(h_addr_list, 0, sizeof(h_addr_list));
-    memset(h_name, 0, sizeof(h_name));
-    memset(&hostent, 0, sizeof(hostent));
-    hostent.h_name = h_name;
-
-	// fill up h_aliases field by calling gethostbyname().
-	// it seems there is no way to get DNS aliases from IPv6 functions.
-	// **YOU SHOULD NOT CALL gethostbyname() inside this fn after this point**
-	hostent_alias = gethostbyname(name);
-	if (hostent_alias) {
-		hostent.h_aliases = hostent_alias->h_aliases;
-	}
-
-    hostent.h_addrtype = AF_INET;
-    hostent.h_length = sizeof(struct in_addr);
-    hostent.h_addr_list = &h_addr_list[0];
-
-    for ( iter = res; iter != NULL; iter = iter->ai_next ) {
-        if (first) {
-            // first canonical name is primary name for the host.
-            // rest is aliases
-            if ( iter->ai_canonname ) {
-                strncpy(h_name, iter->ai_canonname, sizeof(h_name)-1);
-                first = 0;
-            }
-        }
-        // pick only IPv4 address
-        if (iter->ai_addr && iter->ai_addr->sa_family == AF_INET) {
-            sockaddr_storage_ptr sock_address;
-            sock_address.raw = iter->ai_addr;
-            struct sockaddr_in* _sin = sock_address.in;
-            memcpy(&addr_list[addrcount], &_sin->sin_addr, sizeof(struct in_addr));
-            h_addr_list[addrcount] = (char*)&addr_list[addrcount];
-            addrcount++;
-            if (addrcount == MAXADDR)
-                break;
-        }
-    }
-
-    h_addr_list[addrcount] = NULL;
-    freeaddrinfo(res);
-    return &hostent;
-}
-
-struct hostent *
-condor_gethostbyname(const char *name)
-{
-		// condor_gethostbyname_ipv6 is obsolete
-    return condor_gethostbyname_ipv4(name);
-}
-
-struct hostent* get_nodns_addr(const char* addr) {
-	static struct hostent hostent;
-	static char *h_aliases[1] = {NULL};
-	static char h_name[NI_MAXHOST]; // from /usr/include/sys/param.h
-
-		if (convert_ip_to_hostname(addr, h_name, MAXHOSTNAMELEN)) {
-				// We've failed
-			return NULL;
-		} else {
-			hostent.h_name = h_name;
-			hostent.h_aliases = h_aliases;
-			hostent.h_addrtype = AF_INET;
-			hostent.h_length = 0;
-			hostent.h_addr_list = NULL;
-
-			return &hostent;
-		}
-}
-
-struct hostent *
-condor_gethostbyaddr_ipv4(const char *addr, SOCKET_LENGTH_TYPE len, int type) {
-	if (nodns_enabled()) {
-	    return get_nodns_addr(addr);
-	} else {
-		return gethostbyaddr(addr, len, type);
-	}
-}
-
-// This is obsolete function. do not use.
-struct hostent *
-condor_gethostbyaddr_ipv6(const char *addr, SOCKET_LENGTH_TYPE len, int type) {
-    char _hostname[NI_MAXHOST];
-    struct sockaddr_in sinaddr;
-    int e;
-
-    MSC_SUPPRESS_WARNING(6287) // warning: Redundant code: the left and right sub-expressions are identical
-    if (type != AF_INET || type != PF_INET) {
-        // fallback
-        return condor_gethostbyaddr_ipv4(addr, len, type);
-    }
-
-	if (nodns_enabled()) {
-	    return get_nodns_addr(addr);
-	}
-
-	memset(&sinaddr, 0, sizeof(sinaddr));
-	sinaddr.sin_family = type;
-	in_addr_ptr in_address_ptr;
-	in_address_ptr.as_char = addr;
-	sinaddr.sin_addr = *(in_address_ptr.in);
-
-#ifdef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN
-	sinaddr.sin_len = sizeof(struct sockaddr_in);
-#endif
-
-	e = getnameinfo((const struct sockaddr*)&sinaddr, sizeof(sinaddr), _hostname, sizeof(_hostname), NULL, 0, 0);
-	if (e != 0)
-        return NULL;
-
-    // getnameinfo only returns hostname. in order to fill up struct hostent, call condor_gethotsbyname_ipv6
-    return condor_gethostbyname_ipv6(_hostname);
-}
-
-struct hostent *
-condor_gethostbyaddr(const char *addr, SOCKET_LENGTH_TYPE len, int type) {
-		// condor_gethostbyaddr_ipv6 is obsolete
-    return condor_gethostbyaddr_ipv4(addr, len, type);
-}
 
 int
 condor_gethostname(char *name, size_t namelen) {
 
-	if (nodns_enabled()) {
+	if (param_boolean("NO_DNS", false)) {
 
 		char tmp[MAXHOSTNAMELEN];
 		char *param_buf;
@@ -277,7 +56,15 @@ condor_gethostname(char *name, size_t namelen) {
 			dprintf( D_HOSTNAME, "NO_DNS: Using NETWORK_INTERFACE='%s' "
 					 "to determine hostname\n", param_buf );
 
-			snprintf( ip_str, MAXHOSTNAMELEN, "%s", param_buf );
+			std::string ipv4;
+			std::string ipv6;
+			std::string ipbest;
+			if ( !network_interface_to_ip("NETWORK_INTERFACE", param_buf, ipv4, ipv6, ipbest) ) {
+				dprintf(D_HOSTNAME, "NO_DNS: network_interface_to_ip() failed\n");
+				free( param_buf );
+				return -1;
+			}
+			snprintf( ip_str, MAXHOSTNAMELEN, "%s", ipbest.c_str() );
 			free( param_buf );
 
 			if (!addr.from_ip_string(ip_str)) {
@@ -287,7 +74,7 @@ condor_gethostname(char *name, size_t namelen) {
 				return -1;
 			}
 
-			MyString hostname = convert_ipaddr_to_hostname(addr);
+			MyString hostname = convert_ipaddr_to_fake_hostname(addr);
 			if (hostname.Length() >= (int) namelen) {
 				return -1;
 			}
@@ -305,12 +92,9 @@ condor_gethostname(char *name, size_t namelen) {
 			// use to contact the COLLECTOR_HOST
 		if ( (param_buf = param( "COLLECTOR_HOST" )) ) {
 
-			//struct hostent *collector_ent;
 			int s;
-			//SOCKET_LENGTH_TYPE addr_len;
 			char collector_host[MAXHOSTNAMELEN];
 			char *idx;
-			//struct sockaddr_in addr, collector_addr;
 			condor_sockaddr collector_addr;
 			condor_sockaddr addr;
 			std::vector<condor_sockaddr> collector_addrs;
@@ -365,7 +149,7 @@ condor_gethostname(char *name, size_t namelen) {
 			}
 
 			close(s);
-			MyString hostname = convert_ipaddr_to_hostname(addr);
+			MyString hostname = convert_ipaddr_to_fake_hostname(addr);
 			if (hostname.Length() >= (int) namelen) {
 				return -1;
 			}
@@ -389,7 +173,7 @@ condor_gethostname(char *name, size_t namelen) {
 				return -1;
 			}
 
-			MyString hostname = convert_ipaddr_to_hostname(addrs.front());
+			MyString hostname = convert_ipaddr_to_fake_hostname(addrs.front());
 			if (hostname.Length() >= (int) namelen) {
 				return -1;
 			}
@@ -406,128 +190,3 @@ condor_gethostname(char *name, size_t namelen) {
 	}
 }
 
-int
-convert_ip_to_hostname(const char *addr,
-					   char *h_name,
-					   int maxlen) {
-	char *default_domain_name;
-
-	if (NULL != (default_domain_name = param("DEFAULT_DOMAIN_NAME"))) {
-		int h_name_len;
-		int i;
-		in_addr_ptr in_address_ptr;
-		in_address_ptr.as_char = addr;
-		strncpy(h_name, inet_ntoa(*(in_address_ptr.in)), maxlen - 1);
-		for (i = 0; h_name[i]; i++) {
-			if ('.' == h_name[i]) {
-				h_name[i] = '-';
-			}
-		}
-		h_name[maxlen-1] = 0; // make sure of null term
-		h_name_len = strlen(h_name);
-		snprintf(&(h_name[h_name_len]), maxlen - h_name_len, ".%s",
-				 default_domain_name);
-
-		free(default_domain_name);
-		return 0;
-	} else {
-		dprintf(D_HOSTNAME,
-				"NO_DNS: DEFAULT_DOMAIN_NAME must be defined in your "
-				"top-level config file\n");
-		return -1;
-	}
-}
-
-int
-convert_hostname_to_ip(const char *name,
-					   char **h_addr_list,
-					   int maxaddrs) {
-	static struct in_addr addr;
-	char tmp_name[MAXHOSTNAMELEN]; // could get away with 16 for IPv4
-	char *default_domain_name;
-	int ret;
-
-		// We need at least one place for an address
-	if (2 > maxaddrs) {
-		return -1;
-	}
-
-		// We do at most one address
-	h_addr_list[1] = NULL;
-
-	if (NULL != (default_domain_name = param("DEFAULT_DOMAIN_NAME"))) {
-		int i;
-		const char *idx;
-			// XXX: What I really want to do here is to not try to
-			// parse names that do not contain the DEFAULT_DOMAIN_NAME
-			// suffix, but for some reason line 517 of condor_config.C
-			// tries to reconfigure the full_hostname and subsequently
-			// calls this function with a hostname that is of the form
-			// XXX-XXX-XXX-XXX except without a suffix. Argh, so
-			// instead of failing when there is no suffix I must try
-			// to parse anyway!
-// This is the code I want, but it's not what I get to use (below)
-// 		if (NULL != (idx = strstr(name, default_domain_name))) {
-//			int i;
-//    		memset(tmp_name, 0, MAXHOSTNAMELEN);
-// 			strncpy(tmp_name, name, idx - name);
-// 			for (i = 0; tmp_name[i]; i++) {
-// 				if ('-' == tmp_name[i]) {
-// 					tmp_name[i] = '.';
-// 				}
-// 			}
-//
-//			addr.s_addr = inet_addr(tmp_name);
-// 			if (addr.s_addr == (unsigned long)(-1L)) {
-// 					// Parsing failed, so we will too
-// 				h_addr_list[0] = NULL;
-//
-// 				return -1;
-// 			} else {
-// 				h_addr_list[0] = (char *) &addr;
-//
-// 				return 0;
-// 			}
-// 		} else {
-// 			dprintf(D_HOSTNAME,
-// 					"All hostnames must end with '%s' "
-// 					"(DEFAULT_DOMAIN_NAME) in NODNS operation\n",
-// 					default_domain_name);
-//
-// 			return -1;
-// 		}
-
-		memset(tmp_name, 0, MAXHOSTNAMELEN);
-		idx = strstr(name, default_domain_name);
-		if (NULL != idx) {
-			strncpy(tmp_name, name, idx - name - 1);
-		} else {
-			strncpy(tmp_name, name, MAXHOSTNAMELEN - 1);
-		}
-
-		free( default_domain_name );
-
-		for (i = 0; tmp_name[i]; i++) {
-			if ('-' == tmp_name[i]) {
-				tmp_name[i] = '.';
-			}
-		}
-
-        ret = inet_pton( AF_INET, tmp_name, &addr.s_addr);
-		if (ret<=0) {
-				// Parsing failed, so we will too
-			h_addr_list[0] = NULL;
-
-			return -1;
-		} else {
-			h_addr_list[0] = (char *) &addr;
-
-			return 0;
-		}
-	} else {
-		dprintf(D_HOSTNAME,
-				"NO_DNS: DEFAULT_DOMAIN_NAME must be defined in your "
-				"top-level config file\n");
-		return -1;
-	}	
-}

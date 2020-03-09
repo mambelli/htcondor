@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -33,8 +34,6 @@ $worked = "yes";
 
 #my %broken = 
 #(
-	#"AIX52" => "broken",
-	#"HPUX10" => "broken",
 	#"OSX_UNK" => "broken",
 	#"SOLARIS28" => "broken",
 	#"SOLARIS29" => "broken",

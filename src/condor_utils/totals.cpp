@@ -32,7 +32,7 @@
 
 
 TrackTotals::
-TrackTotals (ppOption m) : allTotals(16, MyStringHash)
+TrackTotals (ppOption m) : allTotals(hashFunction)
 {
 	ppo = m;
 	malformed = 0;
@@ -51,13 +51,13 @@ TrackTotals::
 }
 
 int TrackTotals::
-update (ClassAd *ad)
+update (ClassAd *ad, int options, const char * _key /*=NULL*/)
 {
 	ClassTotal *ct;
-	MyString	key;
+	MyString	key(_key);
 	int		   	rval;
 
-	if (!ClassTotal::makeKey(key, ad, ppo)) 
+	if ( key.empty() && ! ClassTotal::makeKey(key, ad, ppo))
 	{
 		malformed++;
 		return 0;
@@ -74,12 +74,33 @@ update (ClassAd *ad)
 		}
 	}
 
-	rval = ct->update(ad);
-	topLevelTotal->update(ad);
+	rval = ct->update(ad, options);
+	topLevelTotal->update(ad, options);
 
 	if (rval == 0) malformed++;
 
 	return rval;
+}
+
+bool TrackTotals::haveTotals()
+{
+	// display totals only for meaningful modes
+	switch (ppo)
+	{
+    	case PP_STARTD_NORMAL:
+    	case PP_STARTD_SERVER:
+    	case PP_STARTD_RUN:
+		case PP_STARTD_STATE:
+    	case PP_STARTD_COD:
+    	case PP_SCHEDD_NORMAL:
+    	case PP_SUBMITTER_NORMAL:
+    	case PP_CKPT_SRVR_NORMAL:
+			break;
+
+		default:
+			return false;
+	}
+	return true;
 }
 
 
@@ -89,37 +110,16 @@ displayTotals (FILE *file, int keyLength)
 	ClassTotal *ct=0;
 	MyString	key;
 	int k;
+	bool auto_key_length = keyLength < 0;
+	if (auto_key_length) { keyLength = 5; } // must be at least 5 for "Total"
 
 	// display totals only for meaningful modes
-	switch (ppo)
-	{
-    	case PP_STARTD_NORMAL:
-    	case PP_STARTD_SERVER:
-    	case PP_STARTD_RUN:
-		case PP_STARTD_STATE:
-    	case PP_STARTD_COD:
-
-#ifdef HAVE_EXT_POSTGRESQL
-    	case PP_QUILL_NORMAL:
-#endif /* HAVE_EXT_POSTGRESQL */
-
-    	case PP_SCHEDD_NORMAL:
-    	case PP_SCHEDD_SUBMITTORS:   
-    	case PP_CKPT_SRVR_NORMAL:
-			break;
-
-		default:
-			return;
-	}
+	if ( ! haveTotals()) return;
 
 		
-	// display the lead of the header
-	fprintf (file, "%*.*s", keyLength, keyLength, "");
-	topLevelTotal->displayHeader(file);
-	fprintf (file, "\n");
-
 	// sort the keys (insertion sort) so we display totals in sorted order
-	const char **keys = new const char* [allTotals.getNumElements()];
+	char **keys = new char* [allTotals.getNumElements()];
+	ASSERT(keys);
 	allTotals.startIterations();
 	for (k = 0; k < allTotals.getNumElements(); k++) // for each key
 	{
@@ -136,17 +136,29 @@ displayTotals (FILE *file, int keyLength)
 		}
 		// insert the key in the right position in the list
 		keys[pos] = strdup(key.Value());
+		if (auto_key_length) {
+			keyLength = MAX(keyLength, key.Length());
+		}
 	}
+
+	// display the lead of the header
+	fprintf (file, "%*.*s", keyLength, keyLength, "");
+	topLevelTotal->displayHeader(file);
+	fprintf (file, "\n");
+
 	// now that our keys are sorted, display the totals in sort order
+	bool had_tot_keys = false;
 	for (k = 0; k < allTotals.getNumElements(); k++)
 	{
 		fprintf (file, "%*.*s", keyLength, keyLength, keys[k]);
 		allTotals.lookup(MyString(keys[k]), ct);
-		free((void *)const_cast<char*>(keys[k]));
+		free(keys[k]);
 		ct->displayInfo(file);
+		had_tot_keys = true;
 	}
 	delete [] keys;
-	fprintf (file, "\n%*.*s", keyLength, keyLength, "Total");
+	if (had_tot_keys) fprintf(file, "\n");
+	fprintf (file, "%*.*s", keyLength, keyLength, "Total");
 	topLevelTotal->displayInfo(file,1);
 
 	if (malformed > 0)
@@ -176,11 +188,41 @@ StartdNormalTotal()
 
 
 int StartdNormalTotal::
-update (ClassAd *ad)
+update (ClassAd *ad, int options)
 {
 	char state[32];
 
-	if (!ad->LookupString (ATTR_STATE, state, sizeof(state))) return 0;
+	bool partitionable_slot = false;
+	bool dynamic_slot = false;
+	if (options) {
+		ad->LookupBool(ATTR_SLOT_PARTITIONABLE, partitionable_slot);
+		if ( ! partitionable_slot) { ad->LookupBool(ATTR_SLOT_DYNAMIC, dynamic_slot); }
+	}
+
+	if ((options & TOTALS_OPTION_IGNORE_PARTITIONABLE) && partitionable_slot) return 1;
+	if ((options & TOTALS_OPTION_IGNORE_DYNAMIC) && dynamic_slot) return 1;
+	if ((options & TOTALS_OPTION_ROLLUP_PARTITIONABLE) && partitionable_slot) {
+		classad::Value lval;
+		const classad::ExprList* plist = NULL;
+		if ( ! ad->EvaluateAttr("Child" ATTR_STATE, lval) || ! lval.IsListValue(plist)) return 1; // ChildState can be validly empty
+		classad::ExprList::const_iterator it;
+		for (it = plist->begin(); it != plist->end(); ++it) {
+			const classad::ExprTree * pexpr = *it;
+			classad::Value val;
+			if (pexpr->Evaluate(val) && val.IsStringValue(state,sizeof(state))) {
+				update(state);
+			}
+		}
+		return 1;
+	} else {
+		if (!ad->LookupString (ATTR_STATE, state, sizeof(state))) return 0;
+		return update(state);
+	}
+}
+
+int StartdNormalTotal::
+update (const char * state)
+{
 	switch (string_to_state (state))
 	{
 		case owner_state: 		owner++; 		break;
@@ -203,12 +245,12 @@ void StartdNormalTotal::
 displayHeader(FILE *file)
 {
 #if HAVE_BACKFILL
-	fprintf (file, "%6.6s %5.5s %7.7s %9.9s %7.7s %10.10s %8.8s\n",
+	fprintf (file, "%6.6s %5.5s %7.7s %9.9s %7.7s %10.10s %8.8s %6.6s\n",
 					"Total", "Owner", "Claimed", "Unclaimed", "Matched",
-					"Preempting", "Backfill");
+					"Preempting", "Backfill", "Drain");
 #else
-	fprintf (file, "%9.9s %5.5s %7.7s %9.9s %7.7s %10.10s\n", "Machines", 
-					"Owner", "Claimed", "Unclaimed", "Matched", "Preempting");
+	fprintf (file, "%9.9s %5.5s %7.7s %9.9s %7.7s %10.10s %6.6s\n", "Machines",
+					"Owner", "Claimed", "Unclaimed", "Matched", "Preempting", "Drain");
 #endif /* HAVE_BACKFILL */
 }
 
@@ -217,12 +259,12 @@ void StartdNormalTotal::
 displayInfo (FILE *file, int)
 {
 #if HAVE_BACKFILL
-	fprintf ( file, "%6d %5d %7d %9d %7d %10d %8d\n", machines, owner,
-			  claimed, unclaimed, matched, preempting, backfill );
+	fprintf ( file, "%6d %5d %7d %9d %7d %10d %8d %6d\n", machines, owner,
+			  claimed, unclaimed, matched, preempting, backfill, drained );
 
 #else 
-	fprintf (file, "%9d %5d %7d %9d %7d %10d\n", machines, owner, claimed,
-					unclaimed, matched, preempting);
+	fprintf (file, "%9d %5d %7d %9d %7d %10d %6d\n", machines, owner, claimed,
+					unclaimed, matched, preempting, drained);
 #endif /* HAVE_BACKFILL */
 }
 
@@ -241,12 +283,18 @@ StartdServerTotal()
 
 
 int StartdServerTotal::
-update (ClassAd *ad)
+update (ClassAd *ad, int options)
 {
 	char state[32];
-	int	 attrMem, attrDisk, attrMips, attrKflops;
+	int	 attrMem, attrDisk, attrMips, attrKflops = 0;
 	bool badAd = false;
-	State s;
+
+	bool partitionable_slot = false;
+	bool dynamic_slot = false;
+	if (options) {
+		ad->LookupBool(ATTR_SLOT_PARTITIONABLE, partitionable_slot);
+		if ( ! partitionable_slot) { ad->LookupBool(ATTR_SLOT_DYNAMIC, dynamic_slot); }
+	}
 
 	// if ATTR_STATE is not found, abort this ad
 	if (!ad->LookupString (ATTR_STATE, state, sizeof(state))) return 0;
@@ -257,7 +305,7 @@ update (ClassAd *ad)
 	if (!ad->LookupInteger(ATTR_MIPS,  attrMips)){ badAd = true; attrMips = 0;}
 	if (!ad->LookupInteger(ATTR_KFLOPS,attrKflops)){badAd= true;attrKflops = 0;}
 
-	s = string_to_state(state);
+	State s = string_to_state(state);
 	if (s == claimed_state || s == unclaimed_state)
 		avail++;
 
@@ -302,11 +350,18 @@ StartdRunTotal()
 
 
 int StartdRunTotal::
-update (ClassAd *ad)
+update (ClassAd *ad, int options)
 {
 	int attrMips, attrKflops;
 	float attrLoadAvg;
 	bool badAd = false;
+
+	bool partitionable_slot = false;
+	bool dynamic_slot = false;
+	if (options) {
+		ad->LookupBool(ATTR_SLOT_PARTITIONABLE, partitionable_slot);
+		if ( ! partitionable_slot) { ad->LookupBool(ATTR_SLOT_DYNAMIC, dynamic_slot); }
+	}
 
 	if (!ad->LookupInteger(ATTR_MIPS, attrMips)) { badAd = true; attrMips = 0;}
 	if (!ad->LookupInteger(ATTR_KFLOPS, attrKflops)){badAd=true; attrKflops=0;}
@@ -357,16 +412,43 @@ StartdStateTotal()
 }
 
 int StartdStateTotal::
-update( ClassAd *ad )
+update (ClassAd *ad, int options)
 {
-	char	stateStr[32];
-	State	state;
+	char state[32];
 
-	machines ++;
+	bool partitionable_slot = false;
+	bool dynamic_slot = false;
+	if (options) {
+		ad->LookupBool(ATTR_SLOT_PARTITIONABLE, partitionable_slot);
+		if ( ! partitionable_slot) { ad->LookupBool(ATTR_SLOT_DYNAMIC, dynamic_slot); }
+	}
 
-	if( !ad->LookupString( ATTR_STATE , stateStr, sizeof(stateStr) ) ) return false;
-	state = string_to_state( stateStr );
-	switch( state ) {
+	if ((options & TOTALS_OPTION_IGNORE_PARTITIONABLE) && partitionable_slot) return 1;
+	if ((options & TOTALS_OPTION_IGNORE_DYNAMIC) && dynamic_slot) return 1;
+	if ((options & TOTALS_OPTION_ROLLUP_PARTITIONABLE) && partitionable_slot) {
+		classad::Value lval;
+		const classad::ExprList* plist = NULL;
+		if ( ! ad->EvaluateAttr("Child" ATTR_STATE, lval) || ! lval.IsListValue(plist)) return 1;
+		classad::ExprList::const_iterator it;
+		for (it = plist->begin(); it != plist->end(); ++it) {
+			const classad::ExprTree * pexpr = *it;
+			classad::Value val;
+			if (pexpr->Evaluate(val) && val.IsStringValue(state,sizeof(state))) {
+				update(state);
+			}
+		}
+		return 1;
+	} else {
+		if (!ad->LookupString (ATTR_STATE, state, sizeof(state))) return 0;
+		return update(state);
+	}
+}
+
+
+int StartdStateTotal::
+update (const char * state)
+{
+	switch (string_to_state(state)) {
 		case owner_state	:	owner++;		break;
 		case unclaimed_state:	unclaimed++;	break;
 		case claimed_state	:	claimed++;		break;
@@ -378,21 +460,21 @@ update( ClassAd *ad )
 		case drained_state:		drained++;	break;
 		default				:	return false;
 	}
-
 	return 1;
 }
-		
+
+
 
 void StartdStateTotal::
 displayHeader(FILE *file)
 {
 #if HAVE_BACKFILL
-	fprintf (file, "%6.6s %5.5s %9.9s %7.7s %10.10s %7.7s %8.8s\n",
-					"Total", "Owner", "Unclaimed", "Claimed", 
-					"Preempting", "Matched", "Backfill");
+	fprintf (file, "%6.6s %5.5s %9.9s %7.7s %10.10s %7.7s %8.8s %6.6s\n",
+					"Total", "Owner", "Unclaimed", "Claimed",
+					"Preempting", "Matched", "Backfill", "Drain");
 #else
-	fprintf( file, "%10.10s %5.5s %9.9s %7.7s %10.10s %7.7s\n", "Machines", 
-				"Owner", "Unclaimed", "Claimed", "Preempting", "Matched" );
+	fprintf( file, "%10.10s %5.5s %9.9s %7.7s %10.10s %7.7s %6.6s\n", "Machines",
+				"Owner", "Unclaimed", "Claimed", "Preempting", "Matched", "Drain" );
 #endif /* HAVE_BACKFILL */
 }
 
@@ -401,11 +483,11 @@ void StartdStateTotal::
 displayInfo( FILE *file, int )
 {
 #if HAVE_BACKFILL
-	fprintf( file, "%6d %5d %9d %7d %10d %7d %8d\n", machines, owner, 
-			 unclaimed, claimed, preempt, matched, backfill );
+	fprintf( file, "%6d %5d %9d %7d %10d %7d %8d %6d\n", machines, owner, 
+			 unclaimed, claimed, preempt, matched, backfill, drained );
 #else
-	fprintf( file, "%10d %5d %9d %7d %10d %7d\n", machines, owner, 
-			 unclaimed, claimed, preempt, matched );
+	fprintf( file, "%10d %5d %9d %7d %10d %7d %6d\n", machines, owner, 
+			 unclaimed, claimed, preempt, matched, drained );
 #endif /* HAVE_BACKFILL */
 }
 
@@ -439,7 +521,7 @@ StartdCODTotal::updateTotals( ClassAd* ad, const char* id )
 }
 
 int StartdCODTotal::
-update( ClassAd *ad )
+update (ClassAd *ad, int /*options*/)
 {
 	StringList cod_claim_list;
 	char* cod_claims = NULL;
@@ -473,50 +555,6 @@ displayInfo( FILE *file, int )
 			 running, suspended, vacating, killing );
 }
 
-QuillNormalTotal::
-QuillNormalTotal()
-{
-	numSqlTotal = 0;
-	numSqlLastBatch = 0;
-}
-
-int QuillNormalTotal::
-update (ClassAd *ad)
-{
-	int attrSqlTotal, attrSqlLastBatch;
-	bool badAd = false;
-
-	if (ad->LookupInteger(ATTR_QUILL_SQL_TOTAL, attrSqlTotal)) {
-		 numSqlTotal += attrSqlTotal;
-	} else {
-		badAd = true;
-	}
-
-	if( ad->LookupInteger(ATTR_QUILL_SQL_LAST_BATCH, 
-						  attrSqlLastBatch) ) {
-		numSqlLastBatch += attrSqlLastBatch;
-	} else {
-		badAd = true;
-	}
-
-	return !badAd;
-}
-
-
-void QuillNormalTotal::
-displayHeader(FILE *file)
-{
-	fprintf (file, "%18s %18s\n", "NumSqlTotal", "NumSqlLastBatch");
-}
-
-
-void QuillNormalTotal::
-displayInfo (FILE *file, int tl)
-{
-	if (tl) fprintf(file,"%18d %18d\n", numSqlTotal, numSqlLastBatch);
-}
-
-
 ScheddNormalTotal::
 ScheddNormalTotal()
 {
@@ -527,7 +565,7 @@ ScheddNormalTotal()
 
 
 int ScheddNormalTotal::
-update (ClassAd *ad)
+update (ClassAd *ad, int /*options*/)
 {
 	int attrRunning, attrIdle, attrHeld;;
 	bool badAd = false;
@@ -578,7 +616,7 @@ ScheddSubmittorTotal()
 
 
 int ScheddSubmittorTotal::
-update (ClassAd *ad)
+update (ClassAd *ad, int /*options*/)
 {
 	int attrRunning=0, attrIdle=0, attrHeld=0;
 	bool badAd = false;
@@ -606,14 +644,14 @@ update (ClassAd *ad)
 void ScheddSubmittorTotal::
 displayHeader(FILE *file)
 {
-	fprintf (file, "%18s %18s %18s\n", "RunningJobs", "IdleJobs", "HeldJobs");
+	fprintf (file, "%11s %10s %10s\n", "RunningJobs", "IdleJobs", "HeldJobs");
 }
 
 
 void ScheddSubmittorTotal::
 displayInfo (FILE *file, int)
 {
-	fprintf (file, "%18d %18d %18d\n", runningJobs, idleJobs, heldJobs);
+	fprintf (file, "%11d %10d %10d\n", runningJobs, idleJobs, heldJobs);
 }
 
 
@@ -625,7 +663,7 @@ CkptSrvrNormalTotal()
 }
 
 int CkptSrvrNormalTotal::
-update (ClassAd *ad)
+update (ClassAd *ad, int /*options*/)
 {
 	int attrDisk = 0;
 
@@ -678,12 +716,7 @@ makeTotalObject (ppOption ppo)
 		case PP_STARTD_STATE:		ct = new StartdStateTotal;	break;
 		case PP_STARTD_COD:			ct = new StartdCODTotal;	break;
 		case PP_SCHEDD_NORMAL:		ct = new ScheddNormalTotal; break;
-
-#ifdef HAVE_EXT_POSTGRESQL
-		case PP_QUILL_NORMAL:		ct = new QuillNormalTotal; break;
-#endif /* HAVE_EXT_POSTGRESQL */
-
-		case PP_SCHEDD_SUBMITTORS:	ct = new ScheddSubmittorTotal; break;
+		case PP_SUBMITTER_NORMAL:	ct = new ScheddSubmittorTotal; break;
 		case PP_CKPT_SRVR_NORMAL:	ct = new CkptSrvrNormalTotal; break;
 
 		default:
@@ -719,20 +752,13 @@ makeKey (MyString &key, ClassAd *ad, ppOption ppo)
 			key = buf;
 			return 1;
 
-		case PP_SCHEDD_SUBMITTORS:
+		case PP_SUBMITTER_NORMAL:
 			if (!ad->LookupString(ATTR_NAME, p1, sizeof(p1))) return 0;
 			key = p1;
 			return 1;
 
 		// all ads in the following categories hash to the same key for totals
 		case PP_CKPT_SRVR_NORMAL:
-
-		//here we might want a separate case for QUILL_NORMAL 
-		//but we keep it here for now
-#ifdef HAVE_EXT_POSTGRESQL
-		case PP_QUILL_NORMAL:
-#endif /* HAVE_EXT_POSTGRESQL */
-
 		case PP_SCHEDD_NORMAL:
 			key = " ";
 			return 1;

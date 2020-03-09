@@ -38,21 +38,19 @@
 #include "scheduler.h"
 #include "condor_debug.h"
 #include "condor_config.h"
-#include "condor_qmgr.h"
 #include "condor_query.h"
 #include "condor_adtypes.h"
 #include "condor_state.h"
-#include "condor_string.h"
 #include "string_list.h"
 #include "condor_attributes.h"
 #include "proc.h"
 #include "exit.h"
 #include "dc_startd.h"
 #include "qmgmt.h"
+#include "condor_qmgr.h"
 #include "schedd_negotiate.h"
 
 #include <vector>
-using std::vector;
 
 extern Scheduler scheduler;
 extern DedicatedScheduler dedicated_scheduler;
@@ -103,19 +101,15 @@ AllocationNode::~AllocationNode()
 	}
 	delete jobs;
 	delete matches;
-	if( claim_id ) {
-		delete [] claim_id;
-	}
+	free(claim_id);
 }
 
 
 void
 AllocationNode::setClaimId( const char* new_id )
 {
-	if( claim_id ) {
-		delete [] claim_id;
-	}
-	claim_id = strnewp( new_id );
+	free(claim_id);
+	claim_id = strdup( new_id );
 }
 
 
@@ -151,10 +145,10 @@ AllocationNode::display( void )
 
 bool satisfies(ClassAd* job, ClassAd* candidate) {
 	// Make sure the job requirements are satisfied with this resource.
-    int satisfied_req = 1;
-	if (!job || job->EvalBool(ATTR_REQUIREMENTS, candidate, satisfied_req) == 0) { 
+    bool satisfied_req = true;
+	if (!job || EvalBool(ATTR_REQUIREMENTS, job, candidate, satisfied_req) == 0) {
 		// If it's undefined, treat it as false.
-		satisfied_req = 0;
+		satisfied_req = false;
 	}
     // if reqs weren't satisfied, it's an immediate failure
     if (!satisfied_req) return false;
@@ -163,19 +157,19 @@ bool satisfies(ClassAd* job, ClassAd* candidate) {
     // Concurrency limit checking
     // This is relevant for reused claim candidates
     bool satisfied_lim = true;
-    MyString resource_state;
+    std::string resource_state;
     candidate->LookupString(ATTR_STATE, resource_state);
-    resource_state.lower_case();
+    lower_case(resource_state);
     if ((resource_state == "claimed") && param_boolean("CLAIM_RECYCLING_CONSIDER_LIMITS", true)) {
         dprintf(D_FULLDEBUG, "Entering ded-schedd concurrency limit check...\n");
-        MyString jobLimits, resourceLimits;
+		std::string jobLimits, resourceLimits;
 		job->LookupString(ATTR_CONCURRENCY_LIMITS, jobLimits);
 		candidate->LookupString(ATTR_CONCURRENCY_LIMITS, resourceLimits);
-		jobLimits.lower_case();
-		resourceLimits.lower_case();
+		lower_case(jobLimits);
+		lower_case(resourceLimits);
 
-        dprintf(D_FULLDEBUG, "job limit: \"%s\"\n", jobLimits.Value());
-        dprintf(D_FULLDEBUG, "candidate limit: \"%s\"\n", resourceLimits.Value());
+        dprintf(D_FULLDEBUG, "job limit: \"%s\"\n", jobLimits.c_str());
+        dprintf(D_FULLDEBUG, "candidate limit: \"%s\"\n", resourceLimits.c_str());
 
         // a claimed resource with limits that are equal is considered a match
 		if (jobLimits == resourceLimits) {
@@ -206,16 +200,16 @@ bool is_dynamic(ClassAd* slot) {
 }
 
 bool is_claimed(ClassAd* slot) {
-    MyString state;
+    std::string state;
     if (!slot->LookupString(ATTR_STATE, state)) return false;
-    state.lower_case();
+    lower_case(state);
     return state == "claimed";
 }
 
 bool is_idle(ClassAd* slot) {
-    MyString activ;
+    std::string activ;
     if (!slot->LookupString(ATTR_ACTIVITY, activ)) return false;
-    activ.lower_case();
+    lower_case(activ);
     return activ == "idle";
 }
 
@@ -284,9 +278,9 @@ ResList::satisfyJobs( CAList *jobs,
 		while (ClassAd* candidate = this->Next()) {
 			if (satisfies(job, candidate)) {
                 // There's a match
-                MyString slotname;
+                std::string slotname;
                 candidate->LookupString(ATTR_NAME, slotname);
-                dprintf(D_FULLDEBUG, "satisfyJobs:     %d.%d satisfied with slot %s\n", cluster, proc, slotname.Value());
+                dprintf(D_FULLDEBUG, "satisfyJobs:     %d.%d satisfied with slot %s\n", cluster, proc, slotname.c_str());
 
 				candidates->Insert( candidate );
 				candidates_jobs->Insert( job );
@@ -325,6 +319,7 @@ ResList::sortByRank(ClassAd *rankAd) {
 	this->Rewind();
 
 	struct rankSortRec *array = new struct rankSortRec[this->Number()];
+	ASSERT(array);
 	int index = 0;
 	ClassAd *machine = NULL;
 
@@ -332,7 +327,7 @@ ResList::sortByRank(ClassAd *rankAd) {
 	while ((machine = this->Next())) {
 			// If RANK undefined, default value is small
 		float rank = 0.0;
-		rankAd->EvalFloat(ATTR_RANK, machine, rank);
+		EvalFloat(ATTR_RANK, rankAd, machine, rank);
 
 			// and stick this machine and its rank in our array...
 		array[index].machineAd = machine;
@@ -441,24 +436,22 @@ DedicatedScheduler::DedicatedScheduler()
 	resources = NULL;
 
 	idle_resources = NULL;
+	serial_resources = NULL;
 	limbo_resources = NULL;
 	unclaimed_resources = NULL;
 	busy_resources = NULL;
 
+	total_cores = 0;
 	hdjt_tid = -1;
 	sanity_tid = -1;
 	rid = -1;
 
-		// TODO: Be smarter about the sizes of these tables
-	allocations = new HashTable < int, AllocationNode*> 
-		( 199, hashFuncInt );
+	allocations = new HashTable < int, AllocationNode*>( hashFuncInt );
 
 	pending_preemptions = NULL;
 
-	all_matches = new HashTable < HashKey, match_rec*>
-		( 199, hashFunction );
-	all_matches_by_id = new HashTable < HashKey, match_rec*>
-		( 199, hashFunction );
+	all_matches = new HashTable < std::string, match_rec*>( hashFunction );
+	all_matches_by_id = new HashTable < std::string, match_rec*>( hashFunction );
 
 	num_matches = 0;
 
@@ -469,6 +462,7 @@ DedicatedScheduler::DedicatedScheduler()
 	shadow_obj = NULL;
 
 	startdQueryTime = 0;
+	split_match_count = 0;
 }
 
 
@@ -478,12 +472,13 @@ DedicatedScheduler::~DedicatedScheduler()
 	if(	resources ) { delete resources; }
 
 	if (idle_resources) {delete idle_resources;}
+	if (serial_resources) {delete serial_resources;}
 	if (limbo_resources) {delete limbo_resources;}
 	if (unclaimed_resources) {delete unclaimed_resources;}
 	if (busy_resources) { delete busy_resources;}
 
-	if( ds_owner ) { delete [] ds_owner; }
-	if( ds_name ) { delete [] ds_name; }
+	if( ds_owner ) { free(ds_owner); }
+	if( ds_name ) { free(ds_name); }
 
 	if( shadow_obj ) {
 		delete shadow_obj;
@@ -534,7 +529,7 @@ DedicatedScheduler::initialize( void )
 	if( ! Name ) {
 		EXCEPT( "DedicatedScheduler::initialize(): Name is NULL" ); 
 	}
-	tmpname = strnewp( Name );
+	tmpname = strdup( Name );
 	if( (tmp = strchr(tmpname, '@')) ) {
 			// There's an '@', so use everything in front of it to
 			// uniquely identify this dedicated scheduler on this
@@ -547,11 +542,11 @@ DedicatedScheduler::initialize( void )
 			// simple string...
 		snprintf( buf, 256, "DedicatedScheduler" );
 	}
-	delete [] tmpname;
-	ds_owner = strnewp( buf );
+	free( tmpname );
+	ds_owner = strdup( buf );
 
 	snprintf( buf, 256, "DedicatedScheduler@%s", Name );
-	ds_name = strnewp( buf );
+	ds_name = strdup( buf );
 
 		// Call our reconfig() method, since any config file stuff we
 		// care about should be read at start-up, too.
@@ -627,7 +622,7 @@ DedicatedScheduler::shutdown_fast( void )
 	match_rec* mrec;
 	all_matches->startIterations();
     while( all_matches->iterate( mrec ) ) {
-		releaseClaim( mrec, false );
+		releaseClaim( mrec );
 	}
 	return TRUE;
 }
@@ -640,7 +635,7 @@ DedicatedScheduler::shutdown_graceful( void )
 	match_rec* mrec;
 	all_matches->startIterations();
     while( all_matches->iterate( mrec ) ) {
-		releaseClaim( mrec, true );
+		releaseClaim( mrec );
 	}
 	return TRUE;
 }
@@ -666,11 +661,23 @@ DedicatedScheddNegotiate::scheduler_getJobAd( PROC_ID job_id, ClassAd &job_ad )
 	return true;
 }
 
+
 bool
-DedicatedScheddNegotiate::scheduler_skipJob(PROC_ID jobid)
+DedicatedScheddNegotiate::scheduler_getRequestConstraints(PROC_ID /*job_id*/, ClassAd &/*request_ad*/, int * match_max)
 {
-	ClassAd *jobad = GetJobAd(jobid.cluster,jobid.proc);
+	// No constraints?
+	if (match_max) { *match_max = INT_MAX; }
+	return true;
+}
+
+
+bool
+DedicatedScheddNegotiate::scheduler_skipJob(JobQueueJob *jobad, ClassAd * /*match_ad*/, bool &skip_all, const char * &because) // match ad may be null
+{
+	because = "got enough matches";
+	skip_all = false;
 	if( !jobad ) {
+		because = "job was removed";
 		return true;
 	}
 
@@ -678,6 +685,7 @@ DedicatedScheddNegotiate::scheduler_skipJob(PROC_ID jobid)
 		// This is a fast claim of a split dynamic resource
 		dedicated_scheduler.incrementSplitMatchCount();
 		if (dedicated_scheduler.getSplitMatchCount() > dedicated_scheduler.getResourceRequestSize()) {
+                        dprintf(D_FULLDEBUG, "Skipping further matches: (split match count) %d > %d (resource request size)\n", dedicated_scheduler.getSplitMatchCount(), dedicated_scheduler.getResourceRequestSize());
 			FreeJobAd( jobad );
 			return true;
 		}
@@ -687,7 +695,7 @@ DedicatedScheddNegotiate::scheduler_skipJob(PROC_ID jobid)
 }
 
 bool
-DedicatedScheddNegotiate::scheduler_handleMatch(PROC_ID job_id,char const *claim_id,ClassAd &match_ad, char const *slot_name)
+DedicatedScheddNegotiate::scheduler_handleMatch(PROC_ID job_id,char const *claim_id, char const *extra_claims, ClassAd &match_ad, char const *slot_name)
 {
 	ASSERT( claim_id );
 	ASSERT( slot_name );
@@ -696,10 +704,13 @@ DedicatedScheddNegotiate::scheduler_handleMatch(PROC_ID job_id,char const *claim
 			"DedicatedScheduler: Received match for job %d.%d: %s\n",
 			job_id.cluster, job_id.proc, slot_name);
 
-	if( scheduler_skipJob(job_id) ) {
+	bool skip_all = false;
+	const char * because = "";
+	if( scheduler_skipJob(GetJobAd(job_id), &match_ad, skip_all, because) ) {
 		dprintf(D_FULLDEBUG,
-				"DedicatedScheduler: job %d.%d no longer needs a match.\n",
-				job_id.cluster,job_id.proc);
+				"DedicatedScheduler: job %d.%d %s.\n",
+				job_id.cluster,job_id.proc,
+				because);
 			// TODO: see if one of the other parallel jobs matches this machine
 		return false;
 	}
@@ -716,7 +727,7 @@ DedicatedScheddNegotiate::scheduler_handleMatch(PROC_ID job_id,char const *claim
 		return false;
 	}
 
-	ContactStartdArgs *args = new ContactStartdArgs( claim_id, startd.addr(), true );
+	ContactStartdArgs *args = new ContactStartdArgs( claim_id, extra_claims, startd.addr(), true );
 
 	if( !scheduler.enqueueStartdContact(args) ) {
 		delete args;
@@ -734,6 +745,12 @@ DedicatedScheddNegotiate::scheduler_handleJobRejected(PROC_ID job_id,char const 
 
 	dprintf(D_FULLDEBUG, "Job %d.%d rejected: %s\n",
 			job_id.cluster, job_id.proc, reason);
+
+	if ( job_id.cluster < 0 || job_id.proc < 0 ) {
+		// If we asked the negotiator for matches for jobs that can no
+		// longer use them, the negotiation code uses a job id of -1.-1.
+		return;
+	}
 
 	SetAttributeString(
 		job_id.cluster, job_id.proc,
@@ -834,11 +851,9 @@ DedicatedScheduler::callHandleDedicatedJobs( void )
 #pragma warning(suppress: 6262) // warning: function uses about 64k of stack
 #endif
 bool
-DedicatedScheduler::releaseClaim( match_rec* m_rec, bool use_tcp )
+DedicatedScheduler::releaseClaim( match_rec* m_rec )
 {
-	Sock *sock;
     ReliSock rsock;
-	SafeSock ssock;
 
 	if( ! m_rec ) {
         dprintf( D_ALWAYS, "ERROR in releaseClaim(): NULL m_rec\n" ); 
@@ -848,18 +863,16 @@ DedicatedScheduler::releaseClaim( match_rec* m_rec, bool use_tcp )
 
 	DCStartd d( m_rec->peer );
 
-    if( use_tcp ) {
-		sock = &rsock;
-	} else {
-		sock = &ssock;
+    rsock.timeout(2);
+	if (!rsock.connect( m_rec->peer)) {
+        dprintf( D_ALWAYS, "ERROR in releaseClaim(): canot connect to startd %s\n", m_rec->peer); 
+		return false;
 	}
 
-    sock->timeout(2);
-	sock->connect( m_rec->peer );
-	sock->encode();
-    d.startCommand( RELEASE_CLAIM, sock);
-	sock->put( m_rec->claimId() );
-	sock->end_of_message();
+	rsock.encode();
+    d.startCommand( RELEASE_CLAIM, &rsock);
+	rsock.put( m_rec->claimId() );
+	rsock.end_of_message();
 
 	if( IsFulldebug(D_FULLDEBUG) ) { 
 		char name_buf[256];
@@ -878,6 +891,7 @@ bool
 DedicatedScheduler::deactivateClaim( match_rec* m_rec )
 {
 	ReliSock sock;
+	ClassAd responseAd;
 
 	dprintf( D_FULLDEBUG, "DedicatedScheduler::deactivateClaim\n");
 
@@ -914,6 +928,13 @@ DedicatedScheduler::deactivateClaim( match_rec* m_rec )
 		return false;
 	}
 	
+	// Wait for response from the startd to avoid misleading errors.
+	sock.decode();
+	// Ignore decode/getClassAd errors - Failure to receive the response classad
+	// should "not be critical in any way" (see comment in startd/command.cpp 
+	//  - deactivate_claim()).
+	getClassAd(&sock, responseAd);
+
 		// Clear out this match rec, since it's no longer allocated to
 		// a given MPI job.
 	deallocMatchRec( m_rec );
@@ -927,6 +948,8 @@ DedicatedScheduler::sendAlives( void )
 {
 	match_rec	*mrec;
 	int		  	numsent=0;
+	int now = (int)time(0);
+	bool starter_handles_alives = param_boolean("STARTER_HANDLES_ALIVES",true);
 
 	BeginTransaction();
 
@@ -940,16 +963,24 @@ DedicatedScheduler::sendAlives( void )
 		}
 
 		if (mrec->m_startd_sends_alives && (mrec->status == M_ACTIVE)) {
-
 				// in receive_startd_update, we've updated the lease time only in the job ad
 				// actually write it to the job log here in one big transaction.
 			int renew_time = 0;
-			GetAttributeInt(mrec->cluster,mrec->proc, ATTR_LAST_JOB_LEASE_RENEWAL,&renew_time);
+			if ( starter_handles_alives && 
+				 mrec->shadowRec && mrec->shadowRec->pid > 0 ) 
+			{
+				// If we're trusting the existance of the shadow to 
+				// keep the claim alive (because of kernel sockopt keepalives),
+				// set ATTR_LAST_JOB_LEASE_RENEWAL to the current time.
+				renew_time = now;
+			} else {
+				GetAttributeInt(mrec->cluster,mrec->proc, ATTR_LAST_JOB_LEASE_RENEWAL,&renew_time);
+			}
 			SetAttributeInt( mrec->cluster, mrec->proc, ATTR_LAST_JOB_LEASE_RENEWAL, renew_time ); 
 		}
 	}
 
-	CommitTransaction();
+	CommitTransactionOrDieTrying();
 
 	if( numsent ) {
 		dprintf( D_PROTOCOL, "## 6. (Done sending alive messages to "
@@ -984,7 +1015,7 @@ DedicatedScheduler::reaper( int pid, int status )
 			// just goes back into the queue as idle, but if it happens
 			// to many times we relinquish the match.
 		dprintf( D_ALWAYS, 
-				 "Shadow pid %d successfully killed because it was hung.\n", 
+				 "Shadow pid %d successfully killed because the shadow was hung.\n",
 				 pid );
 		status = JOB_EXCEPTION;
 	}
@@ -1012,7 +1043,7 @@ DedicatedScheduler::reaper( int pid, int status )
 			}
 			break;
 		case JOB_SHADOW_USAGE:
-			EXCEPT("shadow exited with incorrect usage!\n");
+			EXCEPT("shadow exited with incorrect usage!");
 			break;
 		case JOB_BAD_STATUS:
 			EXCEPT("shadow exited because job status != RUNNING");
@@ -1024,6 +1055,7 @@ DedicatedScheduler::reaper( int pid, int status )
 				// just like a condor_rm
 			srec->removed = true;
 					// no break, fall through and do the action
+					//@fallthrough@
 		case JOB_NO_CKPT_FILE:
 		case JOB_KILLED:
 		case JOB_COREDUMPED:
@@ -1040,10 +1072,12 @@ DedicatedScheduler::reaper( int pid, int status )
 			shutdownMpiJob( srec );
 			break;
 		case JOB_SHOULD_HOLD:
-			dprintf( D_ALWAYS, "Putting job %d.%d on hold\n",
-					 srec->job_id.cluster, srec->job_id.proc );
-			set_job_status( srec->job_id.cluster, srec->job_id.proc, 
-							HELD );
+			if ( q_status != HELD && q_status != REMOVED ) {
+				dprintf( D_ALWAYS, "Putting job %d.%d on hold\n",
+						 srec->job_id.cluster, srec->job_id.proc );
+				set_job_status( srec->job_id.cluster, srec->job_id.proc,
+								HELD );
+			}
 			shutdownMpiJob( srec );
 			break;
 		case DPRINTF_ERROR:
@@ -1051,13 +1085,15 @@ DedicatedScheduler::reaper( int pid, int status )
 					 "ERROR: Shadow had fatal error writing to its log file.\n" );
 				// We don't want to break, we want to fall through 
 				// and treat this like a shadow exception for now.
+				//@fallthrough@
 		case JOB_EXCEPTION:
 			if ( WEXITSTATUS(status) == JOB_EXCEPTION ){
 				dprintf( D_ALWAYS,
-						 "ERROR: Shadow exited with job exception code!\n");
+						 "ERROR: Shadow exited with exception code!\n");
 			}
 				// We don't want to break, we want to fall through 
 				// and treat this like a shadow exception for now.
+				//@fallthrough@
 		default:
 				/* the default case is now a shadow exception in case ANYTHING
 				   goes wrong with the shadow exit status */
@@ -1226,7 +1262,12 @@ DedicatedScheduler::giveMatches( int, Stream* stream )
 				return FALSE;
 			}				
 			//job_ad = new ClassAd( *((*alloc->jobs)[p]) );
-			job_ad = dollarDollarExpand(0,0, (*alloc->jobs)[p], (*matches)[i]->my_match_ad, true);
+			job_ad = dollarDollarExpand(cluster,p, (*alloc->jobs)[p], (*matches)[i]->my_match_ad, true);
+			if( ! job_ad) {
+				dprintf( D_ALWAYS, "ERROR in giveMatches: "
+						 "dollarDollarExpand fails for proc %d\n", p );
+				return FALSE;
+			}
 			if( ! putClassAd(stream, *job_ad) ) {
 				dprintf( D_ALWAYS, "ERROR in giveMatches: "
 						 "can't send job classad for proc %d\n", p );
@@ -1356,7 +1397,7 @@ DedicatedScheduler::sortJobs( void )
 			continue;
 		}
 			// If we found the job ad, make sure it's still idle
-		if (job->LookupInteger(ATTR_JOB_STATUS, status) < 0) {
+		if (job->LookupInteger(ATTR_JOB_STATUS, status) == false) {
 			dprintf( D_ALWAYS, "Job %d.0 has no %s attribute.  Ignoring\n",  
 					 cluster, ATTR_JOB_STATUS );
 			continue;
@@ -1563,6 +1604,15 @@ DedicatedScheduler::getDedicatedResourceInfo( void )
 		startdQueryTime = time(0) - b4;
 		dprintf( D_ALWAYS, "Found %d potential dedicated resources in %ld seconds\n",
 				 resources->Length(),startdQueryTime);
+
+		resources->Rewind();
+		while (ClassAd *m = resources->Next()) {
+			int cpus = 0;
+			m->LookupInteger(ATTR_CPUS, cpus);
+			total_cores += cpus;
+		}
+		resources->Rewind();
+
 		return true;
 	}
 
@@ -1571,7 +1621,7 @@ DedicatedScheduler::getDedicatedResourceInfo( void )
 }
 
 
-void duplicate_partitionable_res(ResList*& resources) {
+void duplicate_partitionable_res(ResList*& resources, std::map<std::string, match_rec*> &pending_matches) {
     // This is a way to account for partitionable slots offering 
     // multiple cpus, that makes it easy to use slots fungably and also
     // avoids the need to make pervasive changes to memory 
@@ -1583,12 +1633,32 @@ void duplicate_partitionable_res(ResList*& resources) {
             dup_res->Append(res);
             continue;
         }
-        MyString resname;
+        std::string resname;
         res->LookupString(ATTR_NAME, resname);
         int ncpus=0;
         res->LookupInteger(ATTR_CPUS, ncpus);
-        dprintf(D_FULLDEBUG, "Duplicate x%d partitionable res %s\n", ncpus, resname.Value());
-        for (int j = 0;  j < ncpus;  ++j) dup_res->Append(res);
+        int ntotalcpus=0;
+        res->LookupInteger(ATTR_TOTAL_SLOT_CPUS, ntotalcpus);
+        if (ntotalcpus < ncpus) ntotalcpus = ncpus;
+        // Increase ncpus by the number of matches associated to this
+        // dynamic slot that haven't appeared in the idle slot list yet.
+        // This will prevent a successful match to a set of partitionable
+        // slots to turn into an unsuccessful match that will prevent further
+        // partitionable slots to be requested from the dynamic slot
+        // leftovers.
+        int npend=0;
+        std::string pname;
+        std::map<std::string, match_rec*>::const_iterator mr;
+        std::map<std::string, match_rec*>::const_iterator mre = pending_matches.end();
+        for (mr = pending_matches.begin(); mr != mre; ++mr) {
+            mr->second->my_match_ad->LookupString( ATTR_NAME, pname );
+            if (pname == resname) npend++;
+        }
+        int ndupl = ncpus + npend;
+        if (ndupl > ntotalcpus) ndupl = ntotalcpus;
+
+        dprintf(D_FULLDEBUG, "Duplicate x%d (%d/%d) partitionable res %s\n", ndupl, ncpus, npend, resname.c_str());
+        for (int j = 0;  j < ndupl;  ++j) dup_res->Append(res);
     }
 
     delete resources;
@@ -1600,6 +1670,7 @@ void
 DedicatedScheduler::sortResources( void )
 {
 	idle_resources = new ResList;
+	serial_resources = new ResList;
 	unclaimed_resources = new ResList;
 	limbo_resources = new ResList;
 	busy_resources = new ResList;
@@ -1612,36 +1683,36 @@ DedicatedScheduler::sortResources( void )
 
         // new dynamic slots may also show up here, which need to have their
         // match_rec moved from the pending table into the all_matches table
+        std::string resname;
+        res->LookupString(ATTR_NAME, resname);
         if (is_dynamic(res)) {
-            MyString resname;
             match_rec* dmrec = NULL;
-            res->LookupString(ATTR_NAME, resname);
-            if (all_matches->lookup(HashKey(resname.Value()), dmrec) < 0) {
-                dprintf(D_FULLDEBUG, "New dynamic slot %s\n", resname.Value());
+            if (all_matches->lookup(resname, dmrec) < 0) {
+                dprintf(D_FULLDEBUG, "New dynamic slot %s\n", resname.c_str());
                 if (!(is_claimed(res) && is_idle(res))) {
 					// Not actually unexpected -- this is a claimed dynamic slot, claimed by a serial job
                     //dprintf(D_ALWAYS, "WARNING: unexpected claim/activity state for new dynamic slot %s -- ignoring this resource\n", resname.Value());
                     continue;
                 }
-                MyString pub_claim_id;
+                std::string pub_claim_id;
                 res->LookupString(ATTR_PUBLIC_CLAIM_ID, pub_claim_id);
-                std::map<std::string, std::string>::iterator f(pending_claims.find(pub_claim_id.Value()));
+                std::map<std::string, std::string>::iterator f(pending_claims.find(pub_claim_id));
                 if (f != pending_claims.end()) {
                     char const* claim_id = f->second.c_str();
                     std::map<std::string, match_rec*>::iterator c(pending_matches.find(claim_id));
                     if (c != pending_matches.end()) {
                         dmrec = c->second;
-                        all_matches->insert(HashKey(resname.Value()), dmrec);
-                        all_matches_by_id->insert(HashKey(claim_id), dmrec);
+                        ASSERT( all_matches->insert(resname, dmrec) == 0 );
+                        ASSERT( all_matches_by_id->insert(claim_id, dmrec) == 0 );
                         dmrec->setStatus(M_CLAIMED);
                         pending_matches.erase(c);
                     } else {
-                        dprintf(D_ALWAYS, "WARNING: match rec not found for new dynamic slot %s -- ignoring this resource\n", resname.Value());
+                        dprintf(D_ALWAYS, "WARNING: match rec not found for new dynamic slot %s -- ignoring this resource\n", resname.c_str());
                         continue;
                     }
                     pending_claims.erase(f);
                 } else {
-                    dprintf(D_ALWAYS, "WARNING: claim id not found for new dynamic slot %s -- ignoring this resource\n", resname.Value());
+                    dprintf(D_ALWAYS, "WARNING: claim id not found for new dynamic slot %s -- ignoring this resource\n", resname.c_str());
                     continue;
                 }
             }
@@ -1665,6 +1736,26 @@ DedicatedScheduler::sortResources( void )
 			// storing in the match_rec, since that's now got
 			// (probably) stale info, and we always want to use the
 			// most recent.
+
+		// Carry any negotiator match attrs over from the existing match ad. 
+		// Otherwise these will be lost and dollar-dollar expansion will fail.
+		size_t len = strlen(ATTR_NEGOTIATOR_MATCH_EXPR);
+		for ( auto itr = mrec->my_match_ad->begin(); itr != mrec->my_match_ad->end(); itr++ ) {
+			if( !strncmp(itr->first.c_str(),ATTR_NEGOTIATOR_MATCH_EXPR,len) ) {
+				ExprTree *oexpr = itr->second;
+				if( !oexpr ) {
+					continue;
+				}
+				ExprTree *nexpr = res->LookupExpr(itr->first);
+				if (!nexpr) {
+					const char *oexprStr = ExprTreeToString(oexpr);
+					res->AssignExpr(itr->first, oexprStr);
+
+					dprintf( D_FULLDEBUG, "%s: Negotiator match attribute %s==%s carried over from existing match record.\n", 
+					         resname.c_str(), itr->first.c_str(), oexprStr);
+				}
+			}
+		}
 		delete( mrec->my_match_ad );
 		mrec->my_match_ad = new ClassAd( *res );
 
@@ -1689,10 +1780,37 @@ DedicatedScheduler::sortResources( void )
 			unclaimed_resources->Append( res );
 			continue;
 		}
-		EXCEPT("DedicatedScheduler got unknown status for match %d\n", mrec->status);
+		EXCEPT("DedicatedScheduler got unknown status for match %d", mrec->status);
 	}
 
-    duplicate_partitionable_res(unclaimed_resources);
+    duplicate_partitionable_res(unclaimed_resources, pending_matches);
+
+	// If we are configured to steal claimed/idle matches from the serial
+	// scheduler, do so here
+
+	if (param_boolean("DEDICATED_SCHEDULER_USE_SERIAL_CLAIMS", false)) {
+		match_rec *mr = NULL;
+		std::string id;
+		scheduler.matches->startIterations();
+		while (scheduler.matches->iterate(id, mr) == 1) {
+			if (mr->status == M_CLAIMED) {
+				// this match rec is claimed/idle, steal it for the ded sched
+				mr->needs_release_claim = false;
+				scheduler.unlinkMrec(mr);
+				mr->is_dedicated = true; // it is now!
+				mr->cluster = -1; // dissociate from previous job
+				ClassAd *resource = new ClassAd(*mr->my_match_ad);
+				dPrintAd(D_ALWAYS, *resource);
+				
+				serial_resources->Append(resource);
+				char *slot_name = NULL;
+				resource->LookupString(ATTR_NAME, &slot_name);
+				ASSERT( all_matches->insert(slot_name, mr) == 0 );
+				ASSERT( all_matches_by_id->insert(mr->claimId(), mr) == 0 );
+				free(slot_name);
+			}
+		}
+	}
 
 	if( IsFulldebug(D_FULLDEBUG) ) {
 		dprintf(D_FULLDEBUG, "idle resource list\n");
@@ -1700,6 +1818,9 @@ DedicatedScheduler::sortResources( void )
 
 		dprintf(D_FULLDEBUG, "limbo resource list\n");
 		limbo_resources->display( D_FULLDEBUG );
+
+		dprintf(D_FULLDEBUG, "serial c/i resource list\n");
+		serial_resources->display( D_FULLDEBUG );
 
 		dprintf(D_FULLDEBUG, "unclaimed resource list\n");
 		unclaimed_resources->display( D_FULLDEBUG );
@@ -1724,6 +1845,23 @@ DedicatedScheduler::clearResources( void )
 		idle_resources = NULL;
 	}
 
+	if (serial_resources) {
+		serial_resources->Rewind();
+		ClassAd *serialMach = NULL;
+		while ((serialMach = serial_resources->Next())) {
+			char *slot_name = NULL;
+			serialMach->LookupString(ATTR_NAME, &slot_name);
+			match_rec *mr = NULL;
+			if (all_matches->lookup(slot_name, mr) != 0) {
+				mr->needs_release_claim = false;
+				DelMrec(mr);
+			}
+			free(slot_name);
+		}
+		delete serial_resources;
+		serial_resources = NULL;
+	}
+
 	if (limbo_resources) {
 		delete limbo_resources;
 		limbo_resources = NULL;
@@ -1743,6 +1881,7 @@ DedicatedScheduler::clearResources( void )
 		delete resources;
 		resources = NULL;
 	}
+	total_cores = 0;
 }
 
 
@@ -1831,6 +1970,7 @@ DedicatedScheduler::spawnJobs( void )
 			// need to skip following line if it is a reconnect job already
 		if (! allocation->is_reconnect) {
 			addReconnectAttributes( allocation);
+			scheduler.stats.JobsRestartReconnectsAttempting += 1;
 		}
 
 			/*
@@ -2030,6 +2170,9 @@ DedicatedScheduler::computeSchedule( void )
 	CandidateList *idle_candidates = NULL;
 	CAList *idle_candidates_jobs = NULL;
 
+	CandidateList *serial_candidates = NULL;
+	CAList *serial_candidates_jobs = NULL;
+
 	CandidateList *limbo_candidates = NULL;
 	CAList *limbo_candidates_jobs = NULL;
 
@@ -2122,7 +2265,7 @@ DedicatedScheduler::computeSchedule( void )
 			while (jobsToReconnect.Next(reconId)) {
 				if ((reconId.cluster == cluster) &&
 				    (reconId.proc    == proc_id)) {
-					dprintf(D_FULLDEBUG, "skipping %d.%d because it is waitingn to reconnect\n", cluster, proc_id);
+					dprintf(D_FULLDEBUG, "skipping %d.%d because it is waiting to reconnect\n", cluster, proc_id);
 					give_up = true;
 					break;
 				}
@@ -2131,6 +2274,12 @@ DedicatedScheduler::computeSchedule( void )
 					 "Trying to find %d resource(s) for dedicated job %d.%d\n",
 					 hosts, cluster, proc_id );
 
+			if (hosts > total_cores) {
+				dprintf(D_ALWAYS, "Skipping job %d.%d because it requests more nodes (%d) than exist in the pool (%d)\n", cluster, proc_id, hosts, total_cores);
+				nprocs++;
+				give_up = true;
+				continue;
+			}
 			for( int job_num = 0 ; job_num < hosts; job_num++) {
 				jobs->Append(job);
 			}
@@ -2157,6 +2306,19 @@ DedicatedScheduler::computeSchedule( void )
 			bool psgIsPreferred = false; 
 			psgIsPreferred = job->LookupBool(ATTR_PREFER_PARALLEL_SCHEDULING_GROUP, psgIsPreferred);
 
+			// if job had a previous match, set PSG to true, so it can now match any PSG
+			if (job->LookupExpr(ATTR_MATCHED_PSG)) {
+				std::string psgString;
+				if (!job->LookupString(ATTR_MATCHED_PSG, psgString)) {
+					// Make sure the Matched_PSG attribute is not a string, this was the
+					// old way of doing things, and we'll skip that case.
+
+					// Assume here it is an expression of the form ParallelSchedulingGroup == "somegroup"
+					// and set it to true now, to match any group
+					job->Assign(ATTR_MATCHED_PSG, true);
+				}
+			}
+
 			foundMatch = satisfyJobWithGroups(jobs, cluster, nprocs);
 			
 				// If we found a matching set of machines, or PSG is a hard requirement, we're
@@ -2178,7 +2340,7 @@ DedicatedScheduler::computeSchedule( void )
 		if( idle_resources->satisfyJobs(jobs, idle_candidates,
 										idle_candidates_jobs, true) )
 		{
-			printSatisfaction( cluster, idle_candidates, NULL, NULL, NULL );
+			printSatisfaction( cluster, idle_candidates, NULL, NULL, NULL, NULL );
 			createAllocations( idle_candidates, idle_candidates_jobs,
 							   cluster, nprocs, false );
 				
@@ -2191,6 +2353,41 @@ DedicatedScheduler::computeSchedule( void )
 			continue;				// Go onto the next job.
 
 		}
+
+			// Now, try to satisfy the remaining requirements of this cluster
+			// by going after machine resources "stolen" from the serial
+			// scheduler that are claimed/idle
+		if (serial_resources) {
+			serial_candidates = new CandidateList;
+			serial_candidates_jobs = new CAList;
+
+			if( serial_resources->satisfyJobs(jobs, serial_candidates,
+											serial_candidates_jobs, true) )
+			{
+				printSatisfaction( cluster, idle_candidates, serial_candidates, NULL, NULL , NULL);
+				createAllocations( serial_candidates, serial_candidates_jobs,
+								   cluster, nprocs, false );
+					
+					// we're done with these, safe to delete
+				delete idle_candidates;
+				idle_candidates = NULL;
+
+				delete idle_candidates_jobs;
+				idle_candidates_jobs = NULL;
+
+				delete serial_candidates;
+				serial_candidates = NULL;
+		
+				delete serial_candidates_jobs;
+				serial_candidates_jobs = NULL;
+				continue;				// Go onto the next job.
+
+			}
+		}
+
+
+			// if there are unclaimed resources, try to find
+			// candidates for them
 
 			// If we're here, we couldn't schedule the job right now.
 
@@ -2212,7 +2409,7 @@ DedicatedScheduler::computeSchedule( void )
 							limbo_candidates_jobs) )
 			{
 					// Could satisfy with idle and/or limbo
-				printSatisfaction( cluster, idle_candidates,
+				printSatisfaction( cluster, idle_candidates, serial_candidates,
 								   limbo_candidates, NULL, NULL );
 
 					// Mark any idle resources we are going to use as
@@ -2224,6 +2421,17 @@ DedicatedScheduler::computeSchedule( void )
 
 					delete idle_candidates_jobs;
 					idle_candidates_jobs = NULL;
+				}
+
+					// Mark any serial resources we are going to use as
+					// scheduled.
+				if( serial_candidates ) {
+					serial_candidates->markScheduled();
+					delete serial_candidates;
+					serial_candidates = NULL;
+
+					delete serial_candidates_jobs;
+					serial_candidates_jobs = NULL;
 				}
 
 				    // and the limbo resources too
@@ -2241,9 +2449,6 @@ DedicatedScheduler::computeSchedule( void )
 			}
 		}
 		
-
-			// if there are unclaimed resources, try to find
-			// candidates for them
 		if( unclaimed_resources) {
 			unclaimed_candidates = new CandidateList;
 			unclaimed_candidates_jobs = new CAList;
@@ -2259,7 +2464,7 @@ DedicatedScheduler::computeSchedule( void )
 					// resources requests for each one, remove them from
 					// the unclaimed_resources list, and go onto the next
 					// job.
-				printSatisfaction( cluster, idle_candidates,
+				printSatisfaction( cluster, idle_candidates, serial_candidates,
 								   limbo_candidates,
 								   unclaimed_candidates, NULL );
 
@@ -2279,6 +2484,18 @@ DedicatedScheduler::computeSchedule( void )
 					idle_candidates_jobs = NULL;
 				}
 			
+					// Mark any serial resources we are going to use as
+					// scheduled.
+				if( serial_candidates ) {
+					serial_candidates->markScheduled();
+					delete serial_candidates;
+					serial_candidates = NULL;
+
+					delete serial_candidates_jobs;
+					serial_candidates_jobs = NULL;
+				}
+
+
 				if( limbo_candidates ) {
 					limbo_candidates->markScheduled();
 					delete limbo_candidates;
@@ -2331,17 +2548,9 @@ DedicatedScheduler::computeSchedule( void )
 			int nodes;
 			int proc;
 
-#if defined(ADD_TARGET_SCOPING)
-			ExprTree *tmp_expr;
-			tmp_expr = AddTargetRefs( preemption_req, TargetJobAttrs );
-			delete preemption_req;
-			preemption_req = tmp_expr;
-
-			tmp_expr = AddTargetRefs( preemption_rank, TargetJobAttrs );
-			delete preemption_rank;
-			preemption_rank = tmp_expr;
-#endif
-
+			if (nodes_per_proc) {
+				delete [] nodes_per_proc;
+			}
 			nodes_per_proc = new int[nprocs];
 			for (int ni = 0; ni < nprocs; ni++) {
 				nodes_per_proc[ni] = 0;
@@ -2444,7 +2653,7 @@ DedicatedScheduler::computeSchedule( void )
 
 			if( jobs->Number() == 0) {
 					// We got every single thing we need
-				printSatisfaction( cluster, idle_candidates,
+				printSatisfaction( cluster, idle_candidates, serial_candidates,
 								   limbo_candidates, unclaimed_candidates,
 								   preempt_candidates );
 
@@ -2462,6 +2671,16 @@ DedicatedScheduler::computeSchedule( void )
 					idle_candidates_jobs = NULL;
 				}
 			
+				if( serial_candidates ) {
+					serial_candidates->markScheduled();
+					delete serial_candidates;
+					serial_candidates = NULL;
+
+					delete serial_candidates_jobs;
+					serial_candidates_jobs = NULL;
+				}
+
+
 				if( limbo_candidates ) {
 					limbo_candidates->markScheduled();
 					delete limbo_candidates;
@@ -2561,6 +2780,15 @@ DedicatedScheduler::computeSchedule( void )
 				limbo_candidates_jobs = NULL;
 			}
 				
+			if( serial_candidates ) {
+				delete serial_candidates;
+				serial_candidates = NULL;
+	
+				delete serial_candidates_jobs;
+				serial_candidates_jobs = NULL;
+			}
+
+			// and the limbo resources too
 			if( unclaimed_candidates ) {
 				delete unclaimed_candidates;
 				unclaimed_candidates = NULL;
@@ -2571,6 +2799,7 @@ DedicatedScheduler::computeSchedule( void )
 			delete jobs;
 			if( nodes_per_proc ) {
 					delete [] nodes_per_proc;
+					nodes_per_proc = NULL;
 			}
 			return true;
 		} else {
@@ -2587,6 +2816,15 @@ DedicatedScheduler::computeSchedule( void )
 				idle_candidates_jobs = NULL;
 			}
 			
+			if( serial_candidates ) {
+				delete serial_candidates;
+				serial_candidates = NULL;
+	
+				delete serial_candidates_jobs;
+				serial_candidates_jobs = NULL;
+			}
+
+			// and the limbo resources too
 			if( limbo_candidates ) {
 				limbo_candidates->appendResources(limbo_resources);
 				delete limbo_candidates;
@@ -2650,8 +2888,11 @@ DedicatedScheduler::createAllocations( CAList *idle_candidates,
 		job = idle_candidates_jobs->Next();
 
 		    // And the proc for the job
-		int proc;
+		int proc = -1;
 		job->LookupInteger(ATTR_PROC_ID, proc);
+		if (proc == -1) {
+			EXCEPT("illegal value for proc: %d in dedicated cluster id %d\n", proc, cluster);
+		}
 
 			// Get the match record
 		if( ! (mrec = getMrec(machine, buf)) ) {
@@ -2685,7 +2926,7 @@ DedicatedScheduler::createAllocations( CAList *idle_candidates,
 		node++;
 	}
 	
-	allocations->insert( cluster, alloc );
+	ASSERT( allocations->insert( cluster, alloc ) == 0 );
 
 		// Show world what we did
 	alloc->display();
@@ -2784,14 +3025,14 @@ DedicatedScheduler::satisfyJobWithGroups(CAList *jobs, int cluster, int nprocs) 
 
 		// For each of our scheduling groups...
 	while ((machineAd = exampleSchedulingGroup.Next())) {
-		MyString groupStr;
+		std::string groupStr;
 		machineAd->LookupString(ATTR_PARALLEL_SCHEDULING_GROUP, groupStr);
 
-		dprintf(D_ALWAYS, "Attempting to find enough idle machines in group %s to run job.\n", groupStr.Value());
+		dprintf(D_ALWAYS, "Attempting to find enough idle machines in group %s to run job.\n", groupStr.c_str());
 
 			// From all the idle machines, select just those machines that are in this group
 		ResList group; 
-		idle_resources->selectGroup(&group, groupStr.Value());
+		idle_resources->selectGroup(&group, groupStr.c_str());
 
 			// And try to match the jobs in the cluster to the machine just in this group
 		CandidateList candidate_machines;
@@ -2814,7 +3055,7 @@ DedicatedScheduler::satisfyJobWithGroups(CAList *jobs, int cluster, int nprocs) 
 			}
 			
 				// This group satisfies the request, so create the allocations
-			printSatisfaction( cluster, &candidate_machines, NULL, NULL, NULL );
+			printSatisfaction( cluster, &candidate_machines, NULL, NULL, NULL, NULL );
 			createAllocations( &candidate_machines, &candidate_jobs,
 							   cluster, nprocs, false );
 
@@ -2854,7 +3095,7 @@ DedicatedScheduler::satisfyJobWithGroups(CAList *jobs, int cluster, int nprocs) 
 
 			// This might match some, but not all jobs and machines,
 			// but fills in the candidate lists of the partial matches as a side effect
-		idle_group.satisfyJobs(&allJobs, &idle_candidate_machines, &idle_candidate_jobs);
+		(void) idle_group.satisfyJobs(&allJobs, &idle_candidate_machines, &idle_candidate_jobs);
 
 		if (unclaimed_group.satisfyJobs(&allJobs, &unclaimed_candidate_machines, &unclaimed_candidate_jobs)) {
 				// idle + unclaimed could satsify this request
@@ -2889,26 +3130,31 @@ DedicatedScheduler::satisfyJobWithGroups(CAList *jobs, int cluster, int nprocs) 
 					// Make sure it matches this PSG
 				ClassAd *aJob = unclaimed_candidate_jobs.Next();
 				
-				char *previousPSG = NULL;
-				aJob->LookupString(ATTR_MATCHED_PSG, &previousPSG);
+				ExprTree *previousPSG = NULL;
+				previousPSG = aJob->LookupExpr(ATTR_MATCHED_PSG);
 				
-				if (previousPSG) {
-					// We've already munged the Requirements, don't do it again
-					// just update the matched PSG attr
-					free(previousPSG);
-				} else {
+				if (!previousPSG) {
+					// We've haven't already munged the Requirements, do it just this once
 					ExprTree *requirements = aJob->LookupExpr(ATTR_REQUIREMENTS);
 					const char *rhs = ExprTreeToString(requirements);
-					std::string newRequirements = std::string("( ParallelSchedulingGroup =?= my.Matched_PSG) && ")  + rhs;
+					std::string newRequirements = std::string("(my.Matched_PSG) && ")  + rhs;
 					aJob->AssignExpr(ATTR_REQUIREMENTS, newRequirements.c_str());
 				}
-				aJob->Assign(ATTR_MATCHED_PSG, groupName);
+				std::string psgString;
+				if (!aJob->LookupString(ATTR_MATCHED_PSG, psgString)) {
+					string psgExpr;
+					formatstr(psgExpr, "ParallelSchedulingGroup =?= \"%s\"", groupName);
+					aJob->AssignExpr(ATTR_MATCHED_PSG, psgExpr.c_str());
+				} else {
+					// The old way, keep for backward compatibility of running jobs
+					aJob->Assign(ATTR_MATCHED_PSG, groupName);
+				}
 				generateRequest(aJob);
 			}
 				
 
 				// This group satisfies the request, so try to claim the unclaimed ones
-			printSatisfaction( cluster, &idle_candidate_machines, NULL, &unclaimed_candidate_machines, NULL );
+			printSatisfaction( cluster, &idle_candidate_machines, NULL, NULL, &unclaimed_candidate_machines, NULL );
 
 				// We successfully allocated machines, our work here is done
 			return true;
@@ -2943,17 +3189,66 @@ DedicatedScheduler::shutdownMpiJob( shadow_rec* srec , bool kill /* = false */)
 	for (int i=0; i<alloc->num_procs; i++ ) {
         MRecArray* matches = (*alloc->matches)[i];
         int n = matches->getlast();
-        vector<match_rec*> delmr;
+        std::vector<match_rec*> delmr;
         // Save match_rec pointers into a vector, because deactivation of claims 
         // alters the MRecArray object (*matches) destructively:
         for (int j = 0;  j <= n;  ++j) delmr.push_back((*matches)[j]);
-        for (vector<match_rec*>::iterator mr(delmr.begin());  mr != delmr.end();  ++mr) {
+        for (std::vector<match_rec*>::iterator mr(delmr.begin());  mr != delmr.end();  ++mr) {
             if (kill) {
                 dprintf( D_ALWAYS, "Dedicated job abnormally ended, releasing claim\n");
-                releaseClaim(*mr, true );
+                releaseClaim(*mr);
             } else {
                 deactivateClaim(*mr);
             }
+		}
+	}
+}
+
+static void update_negotiator_attrs_for_partitionable_slots(ClassAd* match_ad)
+{
+	typedef std::map<std::string, std::string> negotiator_attr_cache_entry_t;
+	typedef std::map<std::string, negotiator_attr_cache_entry_t> negotiator_attr_cache_t;
+	static negotiator_attr_cache_t negotiator_attr_cache;
+
+	std::string partitionable_slot_name;
+	match_ad->LookupString(ATTR_NAME, partitionable_slot_name);
+	if (partitionable_slot_name.length() == 0) return; 
+	bool negotiator_attr_found = false;
+	negotiator_attr_cache_t::iterator cit = negotiator_attr_cache.find(partitionable_slot_name);
+
+	size_t len = strlen(ATTR_NEGOTIATOR_MATCH_EXPR);
+	for ( auto itr = match_ad->begin(); itr != match_ad->end(); itr++ ) {
+		if( !strncmp(itr->first.c_str(),ATTR_NEGOTIATOR_MATCH_EXPR,len) ) {
+			ExprTree *expr = itr->second;
+			if( !expr ) {
+				continue;
+			}
+			if (!negotiator_attr_found) {
+				// New set of attributes. Reset cache for this partitionable slot.
+				if (cit != negotiator_attr_cache.end()) cit->second.clear();
+				negotiator_attr_found = true;
+			}
+			std::string exprs(ExprTreeToString(expr));
+			if (cit != negotiator_attr_cache.end()) {
+				cit->second[itr->first] = exprs;
+			} else {
+				negotiator_attr_cache_entry_t nmap;
+				nmap.insert(negotiator_attr_cache_entry_t::value_type(itr->first,exprs));
+				negotiator_attr_cache.insert(negotiator_attr_cache_t::value_type(partitionable_slot_name, nmap));
+			}
+		}
+	}
+	if (!negotiator_attr_found && (cit != negotiator_attr_cache.end())) {
+		// No negotiator attr found. Insert the cached ones, if any.
+		const negotiator_attr_cache_entry_t &atm=cit->second;
+		negotiator_attr_cache_entry_t::const_iterator mit;
+		negotiator_attr_cache_entry_t::const_iterator mend = atm.end();
+		for (mit = atm.begin(); mit!=mend; ++mit) {
+
+			match_ad->AssignExpr(mit->first, mit->second.c_str());
+			dprintf( D_FULLDEBUG, "%s: Negotiator match attribute %s==%s carried over from previous partitionable slot match record.\n", 
+				partitionable_slot_name.c_str(),
+				mit->first.c_str(), mit->second.c_str());
 		}
 	}
 }
@@ -2982,7 +3277,7 @@ DedicatedScheduler::AddMrec(
 									 match_ad,owner(),remote_pool,true);
 
 	match_rec *existing_mrec;
-	if( all_matches->lookup(HashKey(slot_name), existing_mrec) == 0) {
+	if( all_matches->lookup(slot_name, existing_mrec) == 0) {
 			// Already have this match
 		dprintf(D_ALWAYS, "DedicatedScheduler: negotiator sent match for %s, but we've already got it, deleting old one\n", slot_name);
 		DelMrec(existing_mrec);
@@ -2995,14 +3290,25 @@ DedicatedScheduler::AddMrec(
 
 	// Collapse the chained ad attributes into this copied ad,
 	// just in case the job is removed while the request is still pending.
-	pending_requests[claim_id]->ChainCollapse();
+	ChainCollapse(*pending_requests[claim_id]);
 
-    if (is_partitionable(match_ad)) {
+    // PartitionableSlot in match_ad can never be 'true' as match_ad was
+    // tweaked by ScheddNegotiate::fixupPartitionableSlot. If we want 
+    // not to store just one 'dynamic' slot per host into all_matches 
+    // and leave behind all extra created dynamic slots 
+    // we need to use/fill pending_matches. Try checking for
+    // SlotTypeID == PARTITIONABLE_SLOT, as this is left unchanged by
+    // ScheddNegotiate::fixupPartitionableSlot.
+    // if (is_partitionable(match_ad)) {
+    int slot_type_id = 0;
+    match_ad->LookupInteger(ATTR_SLOT_TYPE_ID, slot_type_id);
+    if (slot_type_id == 1) { // Cannot include Resource.h from here.
+        update_negotiator_attrs_for_partitionable_slots(mrec->my_match_ad);
         pending_matches[claim_id] = mrec;
         pending_claims[mrec->publicClaimId()] = claim_id;
     } else {
-        all_matches->insert(HashKey(slot_name), mrec);
-        all_matches_by_id->insert(HashKey(mrec->claimId()), mrec);
+        ASSERT( all_matches->insert(slot_name, mrec) == 0 );
+        ASSERT( all_matches_by_id->insert(mrec->claimId(), mrec) == 0 );
     }
 
 	removeRequest( job_id );
@@ -3057,8 +3363,7 @@ DedicatedScheduler::DelMrec( char const* id )
 		return true;
 	}
 		// First, delete it from our table hashed on ClaimId. 
-	HashKey key( id );
-	if( all_matches_by_id->lookup(key, rec) < 0 ) {
+	if( all_matches_by_id->lookup(id, rec) < 0 ) {
 		ClaimIdParser cid(id);
 		dprintf( D_FULLDEBUG, "mrec for \"%s\" not found -- " 
 				 "match not deleted (but perhaps it was deleted previously)\n", cid.publicClaimId() );
@@ -3067,7 +3372,7 @@ DedicatedScheduler::DelMrec( char const* id )
 
 	ASSERT( rec->is_dedicated );
 
-	if (all_matches_by_id->remove(key) < 0) {
+	if (all_matches_by_id->remove(id) < 0) {
 		dprintf(D_ALWAYS, "DelMrec::all_matches_by_id->remove < 0\n");	
 	}
 		// Now that we have the mrec again, we have to see if this
@@ -3133,8 +3438,7 @@ DedicatedScheduler::DelMrec( char const* id )
 
 		// Now, we can delete it from the main table hashed on name.
 	rec->my_match_ad->LookupString( ATTR_NAME, name_buf, sizeof(name_buf) );
-	HashKey key2( name_buf );
-	all_matches->remove(key2);
+	all_matches->remove(name_buf);
 
 		// If this match record is associated with a shadow record,
 		// clear out the match record from that shadow record to avoid
@@ -3184,7 +3488,7 @@ DedicatedScheduler::publishRequestAd( void )
 		// Finally, we need to tell it how many "jobs" we want to
 		// negotiate.  These are really how many resource requests
 		// we've got. 
-	ad.Assign( ATTR_IDLE_JOBS, resource_requests.size() ); 
+	ad.Assign( ATTR_IDLE_JOBS, (long long)resource_requests.size() );
 	
 		// TODO: Eventually, we could try to publish this info as
 		// well, so condor_status -sub and friends could tell people
@@ -3194,6 +3498,9 @@ DedicatedScheduler::publishRequestAd( void )
 	ad.Assign( ATTR_HELD_JOBS, 0 );
 
 	ad.Assign( ATTR_FLOCKED_JOBS, 0 );
+
+	dprintf(D_ALWAYS, "Adding submitter %s to the submitter map for default pool.\n", name());
+	scheduler.SubmitterMap.AddSubmitter("", name(), time(NULL));
 
 		// Now, we can actually send this off to the CM.
 	daemonCore->sendUpdates( UPDATE_SUBMITTOR_AD, &ad, NULL, true );
@@ -3224,6 +3531,7 @@ DedicatedScheduler::removeRequest( PROC_ID job_id )
 	{
 		if( *(id) == job_id ) {
 			resource_requests.erase( id );
+                        if (split_match_count > 0) split_match_count--;
 			break;
 		}
 	}
@@ -3272,11 +3580,11 @@ DedicatedScheduler::makeGenericAdFromJobAd(ClassAd *job)
 		// want to rank it, and require that the minimum claim time is
 		// >= the duration of the job...
 
-	MyString buf;
-	buf.formatstr( "%s = (Target.DedicatedScheduler == \"%s\") && "
+	std::string buf;
+	formatstr( buf, "(Target.DedicatedScheduler == \"%s\") && "
 				 "(Target.RemoteOwner =!= \"%s\") && (%s)", 
-				 ATTR_REQUIREMENTS, name(), name(), rhs );
-	req->Insert( buf.Value() );
+				 name(), name(), rhs );
+	req->AssignExpr( ATTR_REQUIREMENTS, buf.c_str() );
 
 	return req;
 }
@@ -3285,6 +3593,10 @@ DedicatedScheduler::makeGenericAdFromJobAd(ClassAd *job)
 void
 DedicatedScheduler::clearResourceRequests( void )
 {
+        // If a new set of resource requests is going to be generated
+        // make sure that scheduler_skipJob doesn'think that enough matches
+        // were found.
+        split_match_count = pending_matches.size();
 	resource_requests.clear();
 }
 
@@ -3340,7 +3652,7 @@ DedicatedScheduler::displayResourceRequests( void )
 
 
 void
-DedicatedScheduler::printSatisfaction( int cluster, CAList* idle, 
+DedicatedScheduler::printSatisfaction( int cluster, CAList* idle, CAList *serial, 
 									   CAList* limbo, CAList* unclaimed, 
 									   CAList* busy )
 {
@@ -3348,7 +3660,7 @@ DedicatedScheduler::printSatisfaction( int cluster, CAList* idle,
 	msg.formatstr( "Satisfied job %d with ", cluster );
 	bool had_one = false;
 	if( idle && idle->Length() ) {
-		msg += idle->Length();
+		msg += IntToStr( idle->Length() );
 		msg += " idle";
 		had_one = true;
 	}
@@ -3356,15 +3668,23 @@ DedicatedScheduler::printSatisfaction( int cluster, CAList* idle,
 		if( had_one ) {
 			msg += ", ";
 		}
-		msg += limbo->Length();
+		msg += IntToStr( limbo->Length() );
 		msg += " limbo";
+		had_one = true;
+	}
+	if( serial && serial->Length() ) {
+		if( had_one ) {
+			msg += ", ";
+		}
+		msg += IntToStr( serial->Length() );
+		msg += " serial";
 		had_one = true;
 	}
 	if( unclaimed && unclaimed->Length() ) {
 		if( had_one ) {
 			msg += ", ";
 		}
-		msg += unclaimed->Length();
+		msg += IntToStr( unclaimed->Length() );
 		msg += " unclaimed";
 		had_one = true;
 	}
@@ -3372,7 +3692,7 @@ DedicatedScheduler::printSatisfaction( int cluster, CAList* idle,
 		if( had_one ) {
 			msg += ", ";
 		}
-		msg += busy->Length();
+		msg += IntToStr( busy->Length() );
 		msg += " busy";
 		had_one = true;
 	}
@@ -3492,7 +3812,7 @@ DedicatedScheduler::checkSanity( void )
 int
 DedicatedScheduler::getUnusedTime( match_rec* mrec )
 {
-	if( mrec->scheduled || mrec->allocated ) {
+	if( mrec->allocated ) {
 			// We're either using this mrec now, or planning to in the
 			// near future, so say it's being used.
 		return 0;
@@ -3526,8 +3846,7 @@ DedicatedScheduler::getMrec( ClassAd* ad, std::string& buf )
 				 "No %s in ClassAd!\n", ATTR_NAME );
 		return NULL;
 	}
-	HashKey key(buf.c_str());
-	if( all_matches->lookup(key, mrec) < 0 ) {
+	if( all_matches->lookup(buf, mrec) < 0 ) {
 		return NULL;
 	}
 	return mrec;
@@ -3555,7 +3874,6 @@ DedicatedScheduler::isPossibleToSatisfy( CAList* jobs, int max_hosts )
 	}
 	candidate_resources.Rewind();
 
-
 	ClassAd *job;
 	jobs->Rewind();
 	int matchCount = 0;
@@ -3579,8 +3897,7 @@ DedicatedScheduler::isPossibleToSatisfy( CAList* jobs, int max_hosts )
 					names.rewind();
 					char* machineName;
 					while( (machineName = names.next()) ) {
-						HashKey key(machineName);
-						if( all_matches->lookup(key, mrec) >= 0 ) {
+						if( all_matches->lookup(machineName, mrec) >= 0 ) {
 							mrec->scheduled = true;
 						}
 					}
@@ -3842,7 +4159,7 @@ DedicatedScheduler::checkReconnectQueue( void ) {
 						"job %d.%d to %s, because claimid is missing: "
 						"(hosts=%s,claims=%s).\n",
 						id.cluster, id.proc,
-						host ? host : "(null host)",
+						host, 
 						remote_hosts ? remote_hosts : "(null)",
 						claims ? claims : "(null)");
 				dPrintAd(D_ALWAYS, *job);
@@ -3854,7 +4171,7 @@ DedicatedScheduler::checkReconnectQueue( void ) {
 			ClassAd *machineAd = NULL;
 			while ( (machineAd = machines.Next())) {
 					// Now lookup machine here...
-				char *mach_name;
+				char *mach_name=NULL;
 				machineAd->LookupString( ATTR_NAME, &mach_name);
 
 				dprintf( D_FULLDEBUG, "Trying to match %s to %s\n", mach_name, host);
@@ -3908,8 +4225,8 @@ DedicatedScheduler::checkReconnectQueue( void ) {
 
 			mrec->setStatus(M_CLAIMED);
 
-			all_matches->insert(HashKey(host), mrec);
-			all_matches_by_id->insert(HashKey(mrec->claimId()), mrec);
+			ASSERT( all_matches->insert(host, mrec) == 0 );
+			ASSERT( all_matches_by_id->insert(mrec->claimId(), mrec) == 0 );
 
 			jobsToAllocate.Append(job);
 
@@ -4130,8 +4447,8 @@ clusterSortByPrioAndDate( const void *ptr1, const void* ptr2 )
 	int cluster1 = *((const int*)ptr1);
 	int cluster2 = *((const int*)ptr2);
 	int c1_qdate, c2_qdate;	
-	int c1_prio, c1_preprio1, c1_preprio2, c1_postprio1, c1_postprio2=0;	
-	int c2_prio, c2_preprio1, c2_preprio2, c2_postprio1, c2_postprio2=0;
+	int c1_prio=0, c1_preprio1=0, c1_preprio2=0, c1_postprio1=0, c1_postprio2=0;
+	int c2_prio=0, c2_preprio1=0, c2_preprio2=0, c2_postprio1=0, c2_postprio2=0;
 
 	if ((GetAttributeInt(cluster1, 0, ATTR_Q_DATE, &c1_qdate) < 0) || 
 	        (GetAttributeInt(cluster2, 0, ATTR_Q_DATE, &c2_qdate) < 0) ||
@@ -4140,28 +4457,24 @@ clusterSortByPrioAndDate( const void *ptr1, const void* ptr2 )
 		
 		return -1;
 	}
-	
-        if (GetAttributeInt(cluster1, 0, ATTR_PRE_JOB_PRIO1, &c1_preprio1) > -1 &&
-	       GetAttributeInt(cluster2, 0, ATTR_PRE_JOB_PRIO1, &c2_preprio1) > -1 ){
-	     if (c1_preprio1 < c2_preprio1) {
-		return 1;
-	     }
 
-	     if (c1_preprio1 > c2_preprio1) {
-		return -1;
-	     }
-        }
-	
-	if (GetAttributeInt(cluster1, 0, ATTR_PRE_JOB_PRIO2, &c1_preprio2) > -1 &&
-	       GetAttributeInt(cluster2, 0, ATTR_PRE_JOB_PRIO2, &c2_preprio2) > -1 ) {
-	     if (c1_preprio2 < c2_preprio2) {
+	GetAttributeInt(cluster1, 0, ATTR_PRE_JOB_PRIO1, &c1_preprio1);
+	GetAttributeInt(cluster2, 0, ATTR_PRE_JOB_PRIO1, &c2_preprio1);
+	if (c1_preprio1 < c2_preprio1) {
 		return 1;
-	     }
-
-	     if (c1_preprio2 > c2_preprio2) {
+	}
+	if (c1_preprio1 > c2_preprio1) {
 		return -1;
-	     }
-        }
+	}
+
+	GetAttributeInt(cluster1, 0, ATTR_PRE_JOB_PRIO2, &c1_preprio2);
+	GetAttributeInt(cluster2, 0, ATTR_PRE_JOB_PRIO2, &c2_preprio2);
+	if (c1_preprio2 < c2_preprio2) {
+		return 1;
+	}
+	if (c1_preprio2 > c2_preprio2) {
+		return -1;
+	}
 	
 	if (c1_prio < c2_prio) {
 		return 1;
@@ -4170,28 +4483,24 @@ clusterSortByPrioAndDate( const void *ptr1, const void* ptr2 )
 	if (c1_prio > c2_prio) {
 		return -1;
 	}
-	
-        if (GetAttributeInt(cluster1, 0, ATTR_POST_JOB_PRIO1, &c1_postprio1) > -1 &&
-	       GetAttributeInt(cluster2, 0, ATTR_POST_JOB_PRIO1, &c2_postprio1) > -1 ) { 
-	     if (c1_postprio1 < c2_postprio1) {
-		return 1;
-	     }
 
-	     if (c1_postprio1 > c2_postprio1) {
-		return -1;
-	     }
-        }
-	
-	if (GetAttributeInt(cluster1, 0, ATTR_POST_JOB_PRIO2, &c1_postprio2) > -1 &&
-	       GetAttributeInt(cluster2, 0, ATTR_POST_JOB_PRIO2, &c2_postprio2) > -1 ) {
-	     if (c1_postprio2 < c2_postprio2) {
+	GetAttributeInt(cluster1, 0, ATTR_POST_JOB_PRIO1, &c1_postprio1);
+	GetAttributeInt(cluster2, 0, ATTR_POST_JOB_PRIO1, &c2_postprio1);
+	if (c1_postprio1 < c2_postprio1) {
 		return 1;
-	     }
-
-	     if (c1_postprio2 > c2_postprio2) {
+	}
+	if (c1_postprio1 > c2_postprio1) {
 		return -1;
-	     }
-        }
+	}
+
+	GetAttributeInt(cluster1, 0, ATTR_POST_JOB_PRIO2, &c1_postprio2);
+	GetAttributeInt(cluster2, 0, ATTR_POST_JOB_PRIO2, &c2_postprio2);
+	if (c1_postprio2 < c2_postprio2) {
+		return 1;
+	}
+	if (c1_postprio2 > c2_postprio2) {
+		return -1;
+	}
 	
 	return (c1_qdate - c2_qdate);
 }

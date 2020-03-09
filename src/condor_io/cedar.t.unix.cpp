@@ -20,10 +20,8 @@
 #include "condor_common.h"
 
 #include "condor_config.h"
-#include "condor_network.h"
 #include "condor_io.h"
 #include "condor_debug.h"
-#include "test.h"
 
 #include <stdio.h>
 #include <iostream>
@@ -31,6 +29,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
+
+#define SERVER_PORT 7678
 
 using namespace std;
 
@@ -40,7 +40,7 @@ int main()
 	int op, result;
 
 	char c, cont, *charString;
-	int integer, len;
+	int integer;
 	long lint;
 	short sint;
 	float f;
@@ -58,7 +58,7 @@ int main()
 
 	switch(op) {
 		case 1: // Server
-			result = mySock.bind(false, SERVER_PORT, false); // outbound, port, loopback
+			result = mySock.bind( CP_IPV4, false, SERVER_PORT, false ); // outbound, port, loopback
 			if(result != TRUE) {
 				cout << "Bind failed\n";
 				exit(-1);
@@ -101,11 +101,6 @@ int main()
 				cin >> cont;
 				mySock.code(charString);
 				cout << "str: " << charString << endl;
-
-				cout << "Type any key continue: ";
-				cin >> cont;
-				mySock.code(charString, len);
-				cout << "str[" << len << "] " << charString << endl;
 
 				mySock.end_of_message();
 			}
@@ -151,10 +146,6 @@ int main()
 				cout << "Type double: ";
 				cin >> d;
 				mySock.code(d);
-
-				cout << "Type string: ";
-				cin >> charString;
-				mySock.code(charString);
 
 				cout << "Type string: ";
 				cin >> charString;

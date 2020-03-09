@@ -34,7 +34,6 @@
 #include "condor_attributes.h"
 #include "condor_debug.h"
 #include "env.h"
-#include "condor_string.h"	// for strnewp and friends
 #include "condor_daemon_core.h"
 #include "basename.h"
 #include "spooled_job_files.h"
@@ -148,7 +147,7 @@ static const char *GMStateNames[] = {
 
 #define CHECK_PROXY \
 { \
-	if ( ((PROXY_NEAR_EXPIRED( jobProxy ) && condorState != REMOVED) || \
+	if ( jobProxy && ((PROXY_NEAR_EXPIRED( jobProxy ) && condorState != REMOVED) || \
 		  (PROXY_IS_EXPIRED( jobProxy ) && condorState == REMOVED)) \
 		 && gmState != GM_PROXY_EXPIRED ) { \
 		dprintf( D_ALWAYS, "(%d.%d) proxy is about to expire, changing state to GM_PROXY_EXPIRED\n", \
@@ -158,8 +157,6 @@ static const char *GMStateNames[] = {
 	} \
 }
 
-#define HASH_TABLE_SIZE			500
-
 struct OrphanCallback_t {
 	char *job_contact;
 	int state;
@@ -167,8 +164,7 @@ struct OrphanCallback_t {
 };
 
 
-HashTable <HashKey, GlobusJob *> JobsByContact( HASH_TABLE_SIZE,
-												hashFunction );
+HashTable <std::string, GlobusJob *> JobsByContact( hashFunction );
 
 static List<OrphanCallback_t> OrphanCallbackList;
 
@@ -208,7 +204,7 @@ orphanCallbackHandler()
 	OrphanCallbackList.DeleteCurrent();
 
 	// Find the right job object
-	rc = JobsByContact.lookup( HashKey( globusJobId(orphan->job_contact) ), this_job );
+	rc = JobsByContact.lookup( globusJobId(orphan->job_contact), this_job );
 	if ( rc == 0 && this_job != NULL ) {
 		dprintf( D_ALWAYS, "(%d.%d) gram callback: state %d, errorcode %d\n",
 				 this_job->procID.cluster, this_job->procID.proc,
@@ -251,7 +247,7 @@ gramCallbackHandler( void * /* user_arg */, char *job_contact, int state,
 	GlobusJob *this_job;
 
 	// Find the right job object
-	rc = JobsByContact.lookup( HashKey( globusJobId(job_contact) ), this_job );
+	rc = JobsByContact.lookup( globusJobId(job_contact), this_job );
 	if ( rc == 0 && this_job != NULL ) {
 		dprintf( D_ALWAYS, "(%d.%d) gram callback: state %d, errorcode %d\n",
 				 this_job->procID.cluster, this_job->procID.proc, state,
@@ -355,13 +351,8 @@ static bool write_classad_input_file( ClassAd *classad,
 
 	ClassAd tmpclassad(*classad);
 
-	std::string CmdExpr;
-	CmdExpr = ATTR_JOB_CMD;
-	CmdExpr += "=\"";
-	CmdExpr += condor_basename( executable_path.c_str() );
-	CmdExpr += '"';
 	// TODO: Store old Cmd as OrigCmd?
-	tmpclassad.Insert(CmdExpr.c_str());
+	tmpclassad.Assign(ATTR_JOB_CMD, condor_basename( executable_path.c_str() ));
 
 	PROC_ID procID;
 	if( ! tmpclassad.LookupInteger( ATTR_CLUSTER_ID, procID.cluster ) ) {
@@ -398,7 +389,7 @@ static bool write_classad_input_file( ClassAd *classad,
 
 		// Fix the universe, too, since the starter is going to expect
 		// "VANILLA", not "GLOBUS"...
-	tmpclassad.Insert( "JobUniverse = 5" );
+	tmpclassad.Assign( ATTR_JOB_UNIVERSE, 5 );
 
 	dprintf(D_FULLDEBUG,"(%d.%d) Writing ClassAd to file %s\n",
 		procID.cluster, procID.proc, out_filename.c_str());
@@ -586,7 +577,7 @@ static bool merge_file_into_classad(const char * filename, ClassAd * ad)
 					"Failed to parse \"%s\", ignoring.", line.Value());
 				continue;
 			}
-			MyString attr = line.Substr(0, n - 1);
+			MyString attr = line.substr(0, n);
 
 			dprintf( D_ALWAYS, "FILE: %s\n", line.Value() );
 			if( ! SAVE_ATTRS.contains_anycase(attr.Value()) ) {
@@ -613,7 +604,7 @@ int GlobusJob::outputWaitGrowthTimeout = 15;	// default value
 GlobusJob::GlobusJob( ClassAd *classad )
 	: BaseJob( classad )
 {
-	int bool_value;
+	bool bool_value;
 	int int_value;
 	std::string iwd;
 	std::string job_output;
@@ -676,8 +667,13 @@ GlobusJob::GlobusJob( ClassAd *classad )
 	mergedGridShellOutClassad = false;
 	jmShouldBeStoppingTime = 0;
 
+	outputWaitOutputSize = 0;
+	outputWaitErrorSize = 0;
+	useGridJobMonitor = true;
+	globusError = 0;
+
 	{
-		int use_gridshell;
+		bool use_gridshell;
 		if( classad->LookupBool(ATTR_USE_GRID_SHELL, use_gridshell) ) {
 			useGridShell = use_gridshell;
 		}
@@ -833,9 +829,9 @@ GlobusJob::GlobusJob( ClassAd *classad )
 			full_job_output += job_output;
 			localOutput = strdup( full_job_output.c_str() );
 
-			bool_value = 0;
+			bool_value = false;
 			jobAd->LookupBool( ATTR_STREAM_OUTPUT, bool_value );
-			streamOutput = (bool_value != 0);
+			streamOutput = bool_value;
 			stageOutput = !streamOutput;
 		}
 	}
@@ -854,9 +850,9 @@ GlobusJob::GlobusJob( ClassAd *classad )
 			full_job_error += job_error;
 			localError = strdup( full_job_error.c_str() );
 
-			bool_value = 0;
+			bool_value = false;
 			jobAd->LookupBool( ATTR_STREAM_ERROR, bool_value );
-			streamError = (bool_value != 0);
+			streamError = bool_value;
 			stageError = !streamError;
 		}
 	}
@@ -873,7 +869,7 @@ GlobusJob::GlobusJob( ClassAd *classad )
 	}
 	gmState = GM_HOLD;
 	if ( !error_string.empty() ) {
-		jobAd->Assign( ATTR_HOLD_REASON, error_string.c_str() );
+		jobAd->Assign( ATTR_HOLD_REASON, error_string );
 	}
 	return;
 }
@@ -890,7 +886,7 @@ GlobusJob::~GlobusJob()
 		free( resourceManagerString );
 	}
 	if ( jobContact ) {
-		JobsByContact.remove(HashKey(globusJobId(jobContact)));
+		JobsByContact.remove(globusJobId(jobContact));
 		free( jobContact );
 	}
 	if ( RSL ) {
@@ -923,14 +919,13 @@ void GlobusJob::Reconfig()
 	gahp->setTimeout( gahpCallTimeout );
 }
 
-int GlobusJob::ProxyCallback()
+void GlobusJob::ProxyCallback()
 {
 	if ( ( gmState == GM_JOBMANAGER_ASLEEP && !JmShouldSleep() ) ||
 		 ( gmState == GM_SUBMITTED && jmProxyExpireTime < jobProxy->expiration_time ) ||
 		 gmState == GM_PROXY_EXPIRED ) {
 		SetEvaluateState();
 	}
-	return 0;
 }
 
 void GlobusJob::doEvaluateState()
@@ -942,8 +937,6 @@ void GlobusJob::doEvaluateState()
 	bool reevaluate_state = true;
 	time_t now = time(NULL);
 
-	bool attr_exists;
-	bool attr_dirty;
 	int rc;
 	int status;
 	int error;
@@ -1300,7 +1293,7 @@ void GlobusJob::doEvaluateState()
 					// See if the user wants to rematch. We evaluate the
 					// expressions here because GM_CLEAR_REQUEST may
 					// decide to hold the job before it evaluates it.
-					jobAd->EvalBool(ATTR_REMATCH_CHECK,NULL,wantRematch);
+					jobAd->LookupBool(ATTR_REMATCH_CHECK,wantRematch);
 
 					gmState = GM_CLEAR_REQUEST;
 				}
@@ -1317,8 +1310,7 @@ void GlobusJob::doEvaluateState()
 			if ( condorState == REMOVED || condorState == HELD ) {
 				gmState = GM_CANCEL;
 			} else {
-				jobAd->GetDirtyFlag( ATTR_GRID_JOB_ID, &attr_exists, &attr_dirty );
-				if ( attr_exists && attr_dirty ) {
+				if ( jobAd->IsAttributeDirty( ATTR_GRID_JOB_ID ) ) {
 					requestScheddUpdate( this, true );
 					break;
 				}
@@ -1632,8 +1624,7 @@ void GlobusJob::doEvaluateState()
 
 			JobTerminated();
 			if ( condorState == COMPLETED ) {
-				jobAd->GetDirtyFlag( ATTR_JOB_STATUS, &attr_exists, &attr_dirty );
-				if ( attr_exists && attr_dirty ) {
+				if ( jobAd->IsAttributeDirty( ATTR_JOB_STATUS ) ) {
 					requestScheddUpdate( this, true );
 					break;
 				}
@@ -1883,8 +1874,7 @@ else{dprintf(D_FULLDEBUG,"(%d.%d) JEF: proceeding immediately with restart\n",pr
 			} break;
 		case GM_RESTART_SAVE: {
 			// Save the restarted jobmanager's contact string on the schedd.
-			jobAd->GetDirtyFlag( ATTR_GRID_JOB_ID, &attr_exists, &attr_dirty );
-			if ( attr_exists && attr_dirty ) {
+			if ( jobAd->IsAttributeDirty( ATTR_GRID_JOB_ID ) ) {
 				requestScheddUpdate( this, true );
 				break;
 			}
@@ -2132,18 +2122,18 @@ else{dprintf(D_FULLDEBUG,"(%d.%d) JEF: proceeding immediately with restart\n",pr
 			// expressed in the job ad.
 			if ( (jobContact != NULL || (globusState == GLOBUS_GRAM_PROTOCOL_JOB_STATE_FAILED && globusStateErrorCode != GLOBUS_GRAM_PROTOCOL_ERROR_JOB_UNSUBMITTED)) 
 				     // && condorState != REMOVED 
-					 && wantRematch == 0 
-					 && wantResubmit == 0 
+					 && wantRematch == false
+					 && wantResubmit == false 
 					 && doResubmit == 0 ) {
 				gmState = GM_HOLD;
 				break;
 			}
 			// Only allow a rematch *if* we are also going to perform a resubmit
 			if ( wantResubmit || doResubmit ) {
-				jobAd->EvalBool(ATTR_REMATCH_CHECK,NULL,wantRematch);
+				jobAd->LookupBool(ATTR_REMATCH_CHECK,wantRematch);
 			}
 			if ( wantResubmit ) {
-				wantResubmit = 0;
+				wantResubmit = false;
 				dprintf(D_ALWAYS,
 						"(%d.%d) Resubmitting to Globus because %s==TRUE\n",
 						procID.cluster, procID.proc, ATTR_GLOBUS_RESUBMIT_CHECK );
@@ -2199,7 +2189,7 @@ else{dprintf(D_FULLDEBUG,"(%d.%d) JEF: proceeding immediately with restart\n",pr
 						procID.cluster, procID.proc, ATTR_REMATCH_CHECK );
 
 				// Set ad attributes so the schedd finds a new match.
-				int dummy;
+				bool dummy;
 				if ( jobAd->LookupBool( ATTR_JOB_MATCHED, dummy ) != 0 ) {
 					jobAd->Assign( ATTR_JOB_MATCHED, false );
 					jobAd->Assign( ATTR_CURRENT_HOSTS, 0 );
@@ -2221,10 +2211,7 @@ else{dprintf(D_FULLDEBUG,"(%d.%d) JEF: proceeding immediately with restart\n",pr
 			// through. However, since we registered update events the
 			// first time, requestScheddUpdate won't return done until
 			// they've been committed to the schedd.
-			const char *name;
-			ExprTree *expr;
-			jobAd->ResetExpr();
-			if ( jobAd->NextDirtyExpr(name, expr) ) {
+			if ( jobAd->dirtyBegin() != jobAd->dirtyEnd() ) {
 				requestScheddUpdate( this, true );
 				break;
 			}
@@ -2845,10 +2832,10 @@ void GlobusJob::GlobusSetRemoteJobId( const char *job_id, bool is_gt5 )
 		// the current port (from the running jobmanager) or the original
 		// port (from the Grid Monitor).
 	if ( jobContact ) {
-		JobsByContact.remove(HashKey(globusJobId(jobContact)));
+		JobsByContact.remove(globusJobId(jobContact));
 	}
 	if ( job_id ) {
-		JobsByContact.insert(HashKey(globusJobId(job_id)), this);
+		ASSERT( JobsByContact.insert(globusJobId(job_id), this) == 0 );
 	}
 
 	free( jobContact );
@@ -2877,7 +2864,7 @@ bool GlobusJob::IsExitStatusValid()
 
 std::string *GlobusJob::buildSubmitRSL()
 {
-	int transfer;
+	bool transfer;
 	std::string *rsl = new std::string;
 	std::string iwd = "";
 	std::string riwd = "";
@@ -2930,10 +2917,10 @@ std::string *GlobusJob::buildSubmitRSL()
 	}
 	*rsl += "(executable=";
 
-	int transfer_executable = 0;
+	bool transfer_executable = false;
 		// TODO JEF this looks very fishy
 	if( ! jobAd->LookupBool( ATTR_TRANSFER_EXECUTABLE, transfer ) ) {
-		transfer_executable = 1;
+		transfer_executable = true;
 	}
 
 	std::string input_classad_filename;
@@ -3231,6 +3218,7 @@ std::string *GlobusJob::buildSubmitRSL()
 			formatstr(errorString, "Failed to read job environment: %s\n",
 					env_errors.Value());
 			delete rsl;
+			if (rsl_suffix) free(rsl_suffix);
 			return NULL;
 		}
 		char **env_vec = envobj.getStringArray();
@@ -3534,6 +3522,11 @@ GlobusJob::JmShouldSleep()
 	if ( probeNow == true ) {
 		return false;
 	}
+
+	if (!jobProxy) {
+		return false;
+	}
+
 	if ( jmProxyExpireTime < jobProxy->expiration_time ) {
 		// Don't forward the refreshed proxy if the remote proxy has more
 		// than GRIDMANAGER_PROXY_RENEW_LIMIT time left.

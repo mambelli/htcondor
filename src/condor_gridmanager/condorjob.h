@@ -25,7 +25,6 @@
 #include "condor_classad.h"
 #include "MyString.h"
 #include "globus_utils.h"
-#include "classad_hashtable.h"
 
 #include "basejob.h"
 #include "condorresource.h"
@@ -74,14 +73,15 @@ class CondorJob : public BaseJob
 	time_t lastSubmitAttempt;
 	time_t lastRemoveAttempt;
 	int numSubmitAttempts;
-	int submitFailureCode;
 	char *remoteScheddName;
 	char *remotePoolName;
 	PROC_ID remoteJobId;
 	char *submitterId;
 	int connectFailureCount;
+	bool m_remoteJobFinished;
 
 	Proxy *jobProxy;
+	std::string scitokenFile;
 	time_t delegatedProxyExpireTime; // 0 if not using short-lived delegation
 	time_t lastProxyExpireTime;      // expiration time of our proxy last time we updated remote side (not shortened to short-lived delegation lifetime)
 	time_t delegatedProxyRenewTime;  // when we should renew short-lived delegation

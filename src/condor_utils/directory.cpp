@@ -23,7 +23,6 @@
 #include "condor_constants.h"
 #include "condor_debug.h"
 #include "directory.h"
-#include "condor_string.h"
 #include "status_string.h"
 #include "condor_config.h"
 #include "stat_wrapper.h"
@@ -78,8 +77,8 @@ Directory::Directory( const char *name, priv_state priv )
 {
 	initialize( priv );
 
-	curr_dir = strnewp(name);
-	dprintf(D_FULLDEBUG, "Initializing Directory: curr_dir = %s\n",curr_dir?curr_dir:"NULL");
+	curr_dir = strdup(name);
+	//dprintf(D_FULLDEBUG, "Initializing Directory: curr_dir = %s\n",curr_dir?curr_dir:"NULL");
 	ASSERT(curr_dir);
 
 #ifndef WIN32
@@ -98,7 +97,7 @@ Directory::Directory( StatInfo* info, priv_state priv )
 	ASSERT(info);
 	initialize( priv );
 
-	curr_dir = strnewp( info->FullPath() );
+	curr_dir = strdup( info->FullPath() );
 	ASSERT(curr_dir);
 
 #ifndef WIN32
@@ -142,7 +141,7 @@ Directory::initialize( priv_state priv )
 
 Directory::~Directory()
 {
-	delete [] curr_dir;
+	free( curr_dir );
 	if( curr ) {
 		delete curr;
 	}
@@ -161,7 +160,7 @@ Directory::~Directory()
 }
 
 filesize_t
-Directory::GetDirectorySize()
+Directory::GetDirectorySize(size_t * number_of_entries /*=NULL*/)
 {
 	const char* thefile = NULL;
 	filesize_t dir_size = 0;
@@ -171,10 +170,13 @@ Directory::GetDirectorySize()
 	Rewind();
 
 	while ( (thefile=Next()) ) {
+		if (number_of_entries) {
+			(*number_of_entries)++;
+		}
 		if ( IsDirectory() && !IsSymlink() ) {
 			// recursively traverse down directory tree
 			Directory subdir( GetFullPath(), desired_priv_state );
-			dir_size += subdir.GetDirectorySize();
+			dir_size += subdir.GetDirectorySize(number_of_entries);
 		} else {
 			dir_size += GetFileSize();
 		}
@@ -285,6 +287,18 @@ Directory::do_remove_dir( const char* path )
 
 		// First, try it as whatever priv state we've been requested
 		// to use...
+
+
+		// skip lost+found directories, the file system needs these
+		// to be around for fsck emergencies.
+	const char *slash = strrchr(path, '/');
+	if (slash) {
+		if (strcmp(slash, "/lost+found") == 0) {
+			dprintf(D_FULLDEBUG, "Skipping removal of lost+found directory\n");
+			return true;
+		}
+	}
+
 	rmdirAttempt( path, desired_priv_state );
 	StatInfo si1( path );
 	if( si1.Error() == SINoFile ) {
@@ -395,9 +409,6 @@ Directory::do_remove_dir( const char* path )
 	return false;
 
 #endif /* UNIX vs. WIN32 */
-
-	EXCEPT( "Programmer error: Directory::do_remove_dir() didn't return" );
-	return false;
 }
 
 
@@ -596,7 +607,7 @@ Directory::rmdirAttempt( const char* path, priv_state priv )
 		MyString errmsg;
 		if( rval < 0 ) {
 			errmsg = "my_spawnl returned ";
-			errmsg += rval;
+			errmsg += IntToStr( rval );
 		} else {
 			errmsg = "/bin/rm ";
 			statusString( rval, errmsg );
@@ -854,10 +865,18 @@ Directory::Next()
 	// is not "." or ".." or until there are no more files.
 	do {
 		if ( dirp == -1 ) {
+#ifdef _M_X64
+			dirp = _findfirst64(path.Value(),&filedata);
+#else
 			dirp = _findfirst(path.Value(),&filedata);
+#endif
 			result = dirp;
 		} else {
+#ifdef _M_X64
+			result = _findnext64(dirp,&filedata);
+#else
 			result = _findnext(dirp,&filedata);
+#endif
 		}
 	} while ( (result != -1) && 
 		( strcmp(filedata.name,".") == MATCH ||
@@ -1250,7 +1269,7 @@ bool recursive_chown(const char * path,
 
 #endif /* ! defined(WIN32) */
 
-bool mkdir_and_parents_if_needed_cur_priv( const char *path, mode_t mode )
+bool mkdir_and_parents_if_needed_cur_priv( const char *path, mode_t mode, mode_t parent_mode )
 {
 	int tries = 0;
 
@@ -1284,7 +1303,7 @@ bool mkdir_and_parents_if_needed_cur_priv( const char *path, mode_t mode )
 
 		std::string parent,junk;
 		if( filename_split(path,parent,junk) ) {
-			if(!mkdir_and_parents_if_needed_cur_priv( parent.c_str(),mode)) {
+			if(!mkdir_and_parents_if_needed_cur_priv( parent.c_str(),parent_mode,parent_mode)) {
 				return false;
 			}
 		}
@@ -1297,6 +1316,11 @@ bool mkdir_and_parents_if_needed_cur_priv( const char *path, mode_t mode )
 
 bool mkdir_and_parents_if_needed( const char *path, mode_t mode, priv_state priv )
 {
+	return mkdir_and_parents_if_needed( path, mode, mode, priv );
+}
+
+bool mkdir_and_parents_if_needed( const char *path, mode_t mode, mode_t parent_mode, priv_state priv )
+{
 	bool retval;
 	priv_state saved_priv;
 
@@ -1304,7 +1328,7 @@ bool mkdir_and_parents_if_needed( const char *path, mode_t mode, priv_state priv
 		saved_priv = set_priv(priv);
 	}
 
-	retval = mkdir_and_parents_if_needed_cur_priv(path,mode);
+	retval = mkdir_and_parents_if_needed_cur_priv(path,mode,parent_mode);
 
 	if( priv != PRIV_UNKNOWN ) {
 		set_priv(saved_priv);

@@ -19,7 +19,7 @@
 
 
 #include "condor_common.h"
-#include "condor_string.h"
+#include "condor_config.h"
 #include "condor_debug.h"
 #include "condor_attributes.h"
 #include "condor_commands.h"
@@ -33,34 +33,43 @@ DCStartd::DCStartd( const char* tName, const char* tPool )
 	: Daemon( DT_STARTD, tName, tPool )
 {
 	claim_id = NULL;
+	extra_ids = NULL;
 }
 
 
 DCStartd::DCStartd( const char* tName, const char* tPool, const char* tAddr,
-					const char* tId )
+					const char* tId , const char *ids)
 	: Daemon( DT_STARTD, tName, tPool )
 {
 	if( tAddr ) {
-		New_addr( strnewp(tAddr) );
+		New_addr( strdup(tAddr) );
 	}
 		// claim_id isn't initialized by Daemon's constructor, so we
 		// have to treat it slightly differently 
 	claim_id = NULL;
 	if( tId ) {
-		claim_id = strnewp( tId );
+		claim_id = strdup( tId );
+	}
+
+	extra_ids = NULL;
+	if( ids && (strlen(ids) > 0)) {
+		extra_ids = strdup( ids );
 	}
 }
 
 DCStartd::DCStartd( const ClassAd *ad, const char *tPool )
 	: Daemon(ad,DT_STARTD,tPool),
-	  claim_id(NULL)
+	  claim_id(NULL), extra_ids(NULL)
 {
 }
 
 DCStartd::~DCStartd( void )
 {
 	if( claim_id ) {
-		delete [] claim_id;
+		free(claim_id);
+	}
+	if( extra_ids ) {
+		free(extra_ids);
 	}
 }
 
@@ -72,19 +81,22 @@ DCStartd::setClaimId( const char* id )
 		return false;
 	}
 	if( claim_id ) {
-		delete [] claim_id;
+		free(claim_id);
 		claim_id = NULL;
 	}
-	claim_id = strnewp( id );
+	claim_id = strdup( id );
 	return true;
 }
 
 
-ClaimStartdMsg::ClaimStartdMsg( char const *the_claim_id, ClassAd const *job_ad, char const *the_description, char const *scheduler_addr, int alive_interval ):
+ClaimStartdMsg::ClaimStartdMsg( char const *the_claim_id, char const *extra_claims, ClassAd const *job_ad, char const *the_description, char const *scheduler_addr, int alive_interval ):
  DCMsg(REQUEST_CLAIM)
 {
 
 	m_claim_id = the_claim_id;
+	if (extra_claims) {
+		m_extra_claims = extra_claims;
+	}
 	m_job_ad = *job_ad;
 	m_description = the_description;
 	m_scheduler_addr = scheduler_addr;
@@ -106,9 +118,6 @@ ClaimStartdMsg::writeMsg( DCMessenger * /*messenger*/, Sock *sock ) {
 	m_startd_fqu = sock->getFullyQualifiedUser();
 	m_startd_ip_addr = sock->peer_ip_str();
 
-	std::string scheduler_addr_to_send = m_scheduler_addr;
-	ConvertDefaultIPToSocketIP(ATTR_SCHEDD_IP_ADDR,scheduler_addr_to_send,*sock);
-
 		// Insert an attribute in the request ad to inform the
 		// startd that this schedd is capable of understanding 
 		// the newer protocol where the claim response may send
@@ -125,8 +134,9 @@ ClaimStartdMsg::writeMsg( DCMessenger * /*messenger*/, Sock *sock ) {
 
 	if( !sock->put_secret( m_claim_id.c_str() ) ||
 	    !putClassAd( sock, m_job_ad ) ||
-	    !sock->put( scheduler_addr_to_send.c_str() ) ||
-	    !sock->put( m_alive_interval ) )
+	    !sock->put( m_scheduler_addr.c_str() ) ||
+	    !sock->put( m_alive_interval ) ||
+		!this->putExtraClaims(sock))
 	{
 		dprintf(failureDebugLevel(),
 				"Couldn't encode request claim to startd %s\n",
@@ -135,6 +145,57 @@ ClaimStartdMsg::writeMsg( DCMessenger * /*messenger*/, Sock *sock ) {
 		return false;
 	}
 		// end_of_message() is done by caller
+	return true;
+}
+
+bool
+ClaimStartdMsg::putExtraClaims(Sock *sock) {
+
+	const CondorVersionInfo *cvi = sock->get_peer_version();
+
+		// Older versions of Condor don't know about extra claim ids.
+		// But with SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION=True,
+		// the schedd can't get the startd's version from the ReliSock.
+		// In that case, use the old protocol if there are no extra
+		// claim ids. Otherwise, assume the startd is new enough.
+		// If it isn't, the claim request will probably fail anyway,
+		// because the single claim won't have enough resources for
+		// the request.
+	if (!cvi && m_extra_claims.length() == 0) {
+		return true;
+	}
+
+	if (cvi && !cvi->built_since_version(8,2,3)) {
+		return true;
+	}
+
+	if (m_extra_claims.length() == 0) {
+		return sock->put(0);
+	}
+
+	size_t begin = 0;
+	size_t end = 0;
+	std::list<std::string> claims;
+
+	while ((end = m_extra_claims.find(' ', begin)) != std::string::npos) {
+		std::string claim = m_extra_claims.substr(begin, end - begin);
+		claims.push_back(claim);
+		begin = end + 1;
+	}
+	
+	int num_extra_claims = claims.size();
+	if (!sock->put(num_extra_claims)) {
+		return false;
+	}
+
+	while (num_extra_claims--) {
+		if (!sock->put_secret(claims.front().c_str())) {
+			return false;
+		}
+		
+		claims.pop_front();
+	}
+	
 	return true;
 }
 
@@ -227,7 +288,7 @@ DCStartd::asyncRequestOpportunisticClaim( ClassAd const *req_ad, char const *des
 	ASSERT( checkClaimId() );
 	ASSERT( checkAddr() );
 
-	classy_counted_ptr<ClaimStartdMsg> msg = new ClaimStartdMsg( claim_id, req_ad, description, scheduler_addr, alive_interval );
+	classy_counted_ptr<ClaimStartdMsg> msg = new ClaimStartdMsg( claim_id, extra_ids, req_ad, description, scheduler_addr, alive_interval );
 
 	ASSERT( msg.get() );
 	msg->setCallback(cb);
@@ -266,13 +327,18 @@ DCStartd::deactivateClaim( bool graceful, bool *claim_is_closing )
 	ClaimIdParser cidp(claim_id);
 	char const *sec_session = cidp.secSessionId();
 
+	if (IsDebugLevel(D_COMMAND)) {
+		int cmd = graceful ? DEACTIVATE_CLAIM : DEACTIVATE_CLAIM_FORCIBLY;
+		dprintf (D_COMMAND, "DCStartd::deactivateClaim(%s,...) making connection to %s\n", getCommandStringSafe(cmd), _addr ? _addr : "NULL");
+	}
+
 	bool  result;
 	ReliSock reli_sock;
 	reli_sock.timeout(20);   // years of research... :)
 	if( ! reli_sock.connect(_addr) ) {
 		std::string err = "DCStartd::deactivateClaim: ";
 		err += "Failed to connect to startd (";
-		err += _addr;
+		err += _addr ? _addr : "NULL";
 		err += ')';
 		newError( CA_CONNECT_FAILED, err.c_str() );
 		return false;
@@ -394,7 +460,7 @@ DCStartd::activateClaim( ClassAd* job_ad, int starter_version,
 	if( !tmp->code(reply) || !tmp->end_of_message()) {
 		std::string err = "DCStartd::activateClaim: ";
 		err += "Failed to receive reply from ";
-		err += _addr;
+		err += _addr ? _addr : "NULL";
 		newError( CA_COMMUNICATION_ERROR, err.c_str() );
 		delete tmp;
 		return CONDOR_ERROR;
@@ -536,17 +602,24 @@ DCStartd::requestClaim( ClaimType cType, const ClassAd* req_ad,
 	}
 
 	ClassAd req( *req_ad );
-	char buf[1024]; 
 
 		// Add our own attributes to the request ad we're sending
-	sprintf( buf, "%s = \"%s\"", ATTR_COMMAND,
-			 getCommandString(CA_REQUEST_CLAIM) );
-	req.Insert( buf );
+	req.Assign( ATTR_COMMAND, getCommandString(CA_REQUEST_CLAIM) );
 
-	sprintf( buf, "%s = \"%s\"", ATTR_CLAIM_TYPE, getClaimTypeString(cType) );
-	req.Insert( buf );
+	req.Assign( ATTR_CLAIM_TYPE, getClaimTypeString(cType) );
 
 	return sendCACmd( &req, reply, true, timeout );
+}
+
+
+bool
+DCStartd::updateMachineAd( const ClassAd * update, ClassAd * reply, int timeout ) {
+	setCmdStr( "updateMachineAd" );
+
+	ClassAd u( * update );
+	u.Assign( ATTR_COMMAND, getCommandString( CA_UPDATE_MACHINE_AD ) );
+
+	return sendCACmd( & u, reply, true, timeout );
 }
 
 
@@ -851,13 +924,18 @@ DCStartd::vacateClaim( const char* name_vacate )
 {
 	setCmdStr( "vacateClaim" );
 
+	if (IsDebugLevel(D_COMMAND)) {
+		int cmd = VACATE_CLAIM;
+		dprintf (D_COMMAND, "DCStartd::vacateClaim(%s,...) making connection to %s\n", getCommandStringSafe(cmd), _addr ? _addr : "NULL");
+	}
+
 	bool  result;
 	ReliSock reli_sock;
 	reli_sock.timeout(20);   // years of research... :)
 	if( ! reli_sock.connect(_addr) ) {
 		std::string err = "DCStartd::vacateClaim: ";
 		err += "Failed to connect to startd (";
-		err += _addr;
+		err += _addr ? _addr : "NULL";
 		err += ')';
 		newError( CA_CONNECT_FAILED, err.c_str() );
 		return false;
@@ -872,7 +950,7 @@ DCStartd::vacateClaim( const char* name_vacate )
 		return false;
 	}
 
-	if( ! reli_sock.code((unsigned char *)const_cast<char*>(name_vacate)) ) {
+	if( ! reli_sock.put(name_vacate) ) {
 		newError( CA_COMMUNICATION_ERROR,
 				  "DCStartd::vacateClaim: Failed to send Name to the startd" );
 		return false;
@@ -902,13 +980,18 @@ DCStartd::_suspendClaim( )
 	ClaimIdParser cidp(claim_id);
 	char const *sec_session = cidp.secSessionId();
 	
+	if (IsDebugLevel(D_COMMAND)) {
+		int cmd = SUSPEND_CLAIM;
+		dprintf (D_COMMAND, "DCStartd::_suspendClaim(%s,...) making connection to %s\n", getCommandStringSafe(cmd), _addr ? _addr : "NULL");
+	}
+
 	bool  result;
 	ReliSock reli_sock;
 	reli_sock.timeout(20);   // years of research... :)
 	if( ! reli_sock.connect(_addr) ) {
 		std::string err = "DCStartd::_suspendClaim: ";
 		err += "Failed to connect to startd (";
-		err += _addr;
+		err += _addr ? _addr : "NULL";
 		err += ')';
 		newError( CA_CONNECT_FAILED, err.c_str() );
 		return false;
@@ -955,13 +1038,18 @@ DCStartd::_continueClaim( )
 	ClaimIdParser cidp(claim_id);
 	char const *sec_session = cidp.secSessionId();
 	
+	if (IsDebugLevel(D_COMMAND)) {
+		int cmd = CONTINUE_CLAIM;
+		dprintf (D_COMMAND, "DCStartd::_continueClaim(%s,...) making connection to %s\n", getCommandStringSafe(cmd), _addr ? _addr : "NULL");
+	}
+
 	bool  result;
 	ReliSock reli_sock;
 	reli_sock.timeout(20);   // years of research... :)
 	if( ! reli_sock.connect(_addr) ) {
 		std::string err = "DCStartd::_continueClaim: ";
 		err += "Failed to connect to startd (";
-		err += _addr;
+		err += _addr ? _addr : "NULL";
 		err += ')';
 		newError( CA_CONNECT_FAILED, err.c_str() );
 		return false;
@@ -1001,13 +1089,18 @@ DCStartd::checkpointJob( const char* name_ckpt )
 
 	setCmdStr( "checkpointJob" );
 
+	if (IsDebugLevel(D_COMMAND)) {
+		int cmd = PCKPT_JOB;
+		dprintf (D_COMMAND, "DCStartd::checkpointJob(%s,...) making connection to %s\n", getCommandStringSafe(cmd), _addr ? _addr : "NULL");
+	}
+
 	bool  result;
 	ReliSock reli_sock;
 	reli_sock.timeout(20);   // years of research... :)
 	if( ! reli_sock.connect(_addr) ) {
 		std::string err = "DCStartd::checkpointJob: ";
 		err += "Failed to connect to startd (";
-		err += _addr;
+		err += _addr ? _addr : "NULL";
 		err += ')';
 		newError( CA_CONNECT_FAILED, err.c_str() );
 		return false;
@@ -1023,7 +1116,7 @@ DCStartd::checkpointJob( const char* name_ckpt )
 	}
 
 		// Now, send the name
-	if( ! reli_sock.code((unsigned char *)const_cast<char*>(name_ckpt)) ) {
+	if( ! reli_sock.put(name_ckpt) ) {
 		newError( CA_COMMUNICATION_ERROR,
 				  "DCStartd::checkpointJob: Failed to send Name to the startd" );
 		return false;
@@ -1047,7 +1140,7 @@ DCStartd::getAds( ClassAdList &adsList )
 	// fetch the query
 	QueryResult q;
 	CondorQuery* query;
-	char* ad_addr;
+	const char* ad_addr;
 
 	// instantiate query object
 	if (!(query = new CondorQuery (STARTD_AD))) {
@@ -1140,7 +1233,7 @@ bool DCClaimIdMsg::readMsg( DCMessenger *, Sock *sock )
 }
 
 bool
-DCStartd::drainJobs(int how_fast,bool resume_on_completion,char const *check_expr,std::string &request_id)
+DCStartd::drainJobs(int how_fast,bool resume_on_completion,char const *check_expr,char const *start_expr,std::string &request_id)
 {
 	std::string error_msg;
 	ClassAd request_ad;
@@ -1155,6 +1248,9 @@ DCStartd::drainJobs(int how_fast,bool resume_on_completion,char const *check_exp
 	request_ad.Assign(ATTR_RESUME_ON_COMPLETION,resume_on_completion);
 	if( check_expr ) {
 		request_ad.AssignExpr(ATTR_CHECK_EXPR,check_expr);
+	}
+	if( start_expr ) {
+		request_ad.AssignExpr(ATTR_START_EXPR,start_expr);
 	}
 
 	if( !putClassAd(sock, request_ad) || !sock->end_of_message() ) {

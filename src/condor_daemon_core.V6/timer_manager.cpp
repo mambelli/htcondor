@@ -23,20 +23,12 @@
 #include "condor_common.h"
 #include "condor_debug.h"
 #include "condor_daemon_core.h"
+#include "condor_config.h"
+#include <unordered_set>
 
 static const char* DEFAULT_INDENT = "DaemonCore--> ";
 
 static	TimerManager*	_t = NULL;
-
-	/*	MAX_FIRES_PER_TIMEOUT sets the maximum number of timer handlers
-		we will invoke per call to Timeout().  This limit prevents timers
-		from starving other kinds other DC handlers (i.e. it make certain
-		that we make it back to the Driver() loop occasionally.  The higher
-		the number, the more "timely" timer callbacks will be.  The lower
-		the number, the more responsive non-timer calls (like commands)
-		will be in the face of many timers coming due.
-	*/	
-const int MAX_FIRES_PER_TIMEOUT = 3;
 
 extern void **curr_dataptr;
 extern void **curr_regdataptr;
@@ -44,6 +36,15 @@ extern void **curr_regdataptr;
 // disable warning about memory leaks due to exception. all memory freed on exit anyway
 MSC_DISABLE_WARNING(6211)
 
+TimerManager &
+TimerManager::GetTimerManager()
+{
+	if (!_t)
+	{
+		_t = new TimerManager();
+	}
+	return *_t;
+}
 
 TimerManager::TimerManager()
 {
@@ -58,11 +59,20 @@ TimerManager::TimerManager()
 	_t = this; 
 	did_reset = false;
 	did_cancel = false;
+    max_timer_events_per_cycle = INT_MAX;
 }
 
 TimerManager::~TimerManager()
 {
 	CancelAllTimers();
+}
+
+void TimerManager::reconfig()
+{
+    max_timer_events_per_cycle = param_integer("MAX_TIMER_EVENTS_PER_CYCLE");
+    if (max_timer_events_per_cycle < 1) {
+        max_timer_events_per_cycle = INT_MAX;
+    }
 }
 
 int TimerManager::NewTimer(unsigned deltawhen, TimerHandler handler, 
@@ -86,6 +96,11 @@ int TimerManager::NewTimer(Service* s, unsigned deltawhen, TimerHandlercpp handl
 		return -1;
 	}
 	return( NewTimer(s,deltawhen,(TimerHandler)NULL,handler,(Release)NULL,(Releasecpp)NULL,event_descrip,period,NULL) );
+}
+
+int TimerManager::NewTimer (const Timeslice &timeslice,TimerHandler handler,const char * event_descrip)
+{
+	return NewTimer(NULL,0,handler,(TimerHandlercpp)NULL,(Release)NULL,(Releasecpp)NULL,event_descrip,0,&timeslice);
 }
 
 int TimerManager::NewTimer (Service* s,const Timeslice &timeslice,TimerHandlercpp handler,const char * event_descrip)
@@ -112,7 +127,7 @@ int TimerManager::NewTimer(Service* s, unsigned deltawhen,
 	}
 
     if (daemonCore) {
-       daemonCore->dc_stats.New("Timer", event_descrip, AS_COUNT | IS_RCT | IF_NONZERO | IF_VERBOSEPUB);
+       daemonCore->dc_stats.NewProbe("Timer", event_descrip, AS_COUNT | IS_RCT | IF_NONZERO | IF_VERBOSEPUB);
     }
 
     new_timer->handler = handler;
@@ -178,6 +193,13 @@ bool TimerManager::GetTimerTimeslice(int id, Timeslice &timeslice)
 	return true;
 }
 
+time_t TimerManager::GetNextRuntime(int id)
+{
+	Timer *timer_ptr = GetTimer( id, NULL );
+	if (!timer_ptr) { return false; }
+
+	return timer_ptr->when;
+}
 int TimerManager::ResetTimer(int id, unsigned when, unsigned period,
 							 bool recompute_when,
 							 Timeslice const *new_timeslice)
@@ -331,8 +353,8 @@ void TimerManager::CancelAllTimers()
 int
 TimerManager::Timeout(int * pNumFired /*= NULL*/, double * pruntime /*=NULL*/)
 {
-	int				result, timer_check_cntr;
-	time_t			now, time_sample;
+	int				result;
+	time_t			now;
 	int				num_fires = 0;	// num of handlers called in this timeout
 
     if (pNumFired) *pNumFired = 0;
@@ -357,9 +379,22 @@ TimerManager::Timeout(int * pNumFired /*= NULL*/, double * pruntime /*=NULL*/)
 	}
 
 	time(&now);
-	timer_check_cntr = 0;
 
 	DumpTimerList(D_DAEMONCORE | D_FULLDEBUG);
+
+    // if we are going to not limit the number of timer handlers we invoke,
+    // make a set now of all timers that are ready to go... below we will
+    // use this set in order to NOT invoke new timers that are inserted by
+    // timer handlers themselves.
+    std::unordered_set<int> readyTimerIds;
+    if (max_timer_events_per_cycle == INT_MAX) {
+        in_timeout = timer_list;
+        while ((in_timeout != NULL) && (in_timeout->when <= now)) {
+            readyTimerIds.insert(in_timeout->id);
+            in_timeout = in_timeout->next;
+        }
+        in_timeout = NULL;
+    }
 
 	// loop until all handlers that should have been called by now or before
 	// are invoked and renewed if periodic.  Remember that NewTimer and CancelTimer
@@ -369,37 +404,44 @@ TimerManager::Timeout(int * pNumFired /*= NULL*/, double * pruntime /*=NULL*/)
 	// we make certain we do not call more than "max_fires" handlers in a 
 	// single timeout --- this ensures that timers don't starve out the rest
 	// of daemonCore if a timer handler resets itself to 0.
-	while( (timer_list != NULL) && (timer_list->when <= now ) && 
-		   (num_fires++ < MAX_FIRES_PER_TIMEOUT)) 
+	while( (timer_list != NULL) && (timer_list->when <= now ) &&
+		   (num_fires < max_timer_events_per_cycle))
 	{
-		// DumpTimerList(D_DAEMONCORE | D_FULLDEBUG);
+        in_timeout = timer_list;
 
-		in_timeout = timer_list;
+        // In this code block, if there is no limit on how many timer handlers we will invoke,
+        // we want to skip over timers that got  added or reset by other timer handlers to make
+        // certain we aren't stuck here forever. So we will only call timer handlers that
+        // were ready to fire when we first entered Timeout().
+        if (max_timer_events_per_cycle == INT_MAX) {
+            std::unordered_set<int>::iterator it;
+            bool call_handler = false;
+            // Skip handlers already invoked or added
+            do {
+                it = readyTimerIds.find(in_timeout->id);
+                if (it == readyTimerIds.end()) {
+                    // this timer was not ready when we first looked, so it must have been
+                    // added or reset by another timer callback.  in this case, skip this timer
+                    // callback (we will deal with it next time through the daemoncore loop).
+                    dprintf(D_DAEMONCORE, "Timer %d not fired (SKIPPED) cause added\n", in_timeout->id);
+                    in_timeout = in_timeout->next;
+                }
+                else {
+                    // this timer was ready to fire when we first looked at the timer list, so
+                    // we are going to go ahead and call its handler.  Erase it from our readyTimerIds
+                    // list, and then break out of loop to go ahead and call the handler.
+                    call_handler = true;
+                    readyTimerIds.erase(it);
+                }
+            } while ((!call_handler) && (in_timeout != NULL) && (in_timeout->when <= now));
 
-		// In some cases, resuming from a suspend can cause the system
-		// clock to become temporarily skewed, causing crazy things to 
-		// happen with our timers (particularly for sending updates to
-		// the collector). So, to correct for such skews, we routinely
-		// check to make sure that 'now' is not in the future.
+            if (!call_handler) {
+                // no timers left that we want to fire at this time, break out of outer while loop
+                break;
+            }
+        }  // end of block if max_timer_events_per_cycle == INT_MAX
 
-		timer_check_cntr++; 
-
-			// since time() is somewhat expensive, we 
-			// only check every 10 times we loop 
-			
-		if ( timer_check_cntr > 10 ) {
-
-			timer_check_cntr = 0;
-
-			time(&time_sample);
-			if (now > time_sample) {
-				dprintf(D_ALWAYS, "DaemonCore: Clock skew detected "
-					"(time=%ld; now=%ld). Resetting TimerManager's "
-					"notion of 'now'\n", (long) time_sample, 
-					(long) now);
-				now = time_sample;
-			}
-		}
+        num_fires++;
 
 		// Update curr_dataptr for GetDataPtr()
 		curr_dataptr = &(in_timeout->data_ptr);
@@ -481,7 +523,11 @@ TimerManager::Timeout(int * pNumFired /*= NULL*/, double * pruntime /*=NULL*/)
 				if ( in_timeout->timeslice ) {
 					in_timeout->when += in_timeout->timeslice->getTimeToNextRun();
 				} else {
-					in_timeout->when += in_timeout->period;
+					if( in_timeout->period == TIMER_NEVER ) {
+						in_timeout->when = TIME_T_NEVER;
+					} else {
+						in_timeout->when += in_timeout->period;
+					}
 				}
 				InsertTimer( in_timeout );
 			} else {
@@ -541,34 +587,34 @@ void TimerManager::DumpTimerList(int flag, const char* indent)
 		else
 			ptmp = "NULL";
 
-		MyString slice_desc;
+		std::string slice_desc;
 		if( !timer_ptr->timeslice ) {
-			slice_desc.formatstr("period = %d, ", timer_ptr->period);
+			formatstr(slice_desc, "period = %d, ", timer_ptr->period);
 		}
 		else {
-			slice_desc.formatstr_cat("timeslice = %.3g, ",
+			formatstr_cat(slice_desc, "timeslice = %.3g, ",
 								   timer_ptr->timeslice->getTimeslice());
 			if( !IS_ZERO(timer_ptr->timeslice->getDefaultInterval()) ) {
-				slice_desc.formatstr_cat("period = %.1f, ",
+				formatstr_cat(slice_desc, "period = %.1f, ",
 								   timer_ptr->timeslice->getDefaultInterval());
 			}
 			if( !IS_ZERO(timer_ptr->timeslice->getInitialInterval()) ) {
-				slice_desc.formatstr_cat("initial period = %.1f, ",
+				formatstr_cat(slice_desc, "initial period = %.1f, ",
 								   timer_ptr->timeslice->getInitialInterval());
 			}
 			if( !IS_ZERO(timer_ptr->timeslice->getMinInterval()) ) {
-				slice_desc.formatstr_cat("min period = %.1f, ",
+				formatstr_cat(slice_desc, "min period = %.1f, ",
 								   timer_ptr->timeslice->getMinInterval());
 			}
 			if( !IS_ZERO(timer_ptr->timeslice->getMaxInterval()) ) {
-				slice_desc.formatstr_cat("max period = %.1f, ",
+				formatstr_cat(slice_desc, "max period = %.1f, ",
 								   timer_ptr->timeslice->getMaxInterval());
 			}
 		}
 		dprintf(flag, 
 				"%sid = %d, when = %ld, %shandler_descrip=<%s>\n", 
 				indent, timer_ptr->id, (long)timer_ptr->when, 
-				slice_desc.Value(),ptmp);
+				slice_desc.c_str(),ptmp);
 	}
 	dprintf(flag, "\n");
 }
@@ -606,7 +652,7 @@ void TimerManager::RemoveTimer( Timer *timer, Timer *prev )
 {
 	if ( timer == NULL || ( prev && prev->next != timer ) ||
 		 ( !prev && timer != timer_list ) ) {
-		EXCEPT( "Bad call to TimerManager::RemoveTimer()!\n" );
+		EXCEPT( "Bad call to TimerManager::RemoveTimer()!" );
 	}
 
 	if ( timer == timer_list ) {

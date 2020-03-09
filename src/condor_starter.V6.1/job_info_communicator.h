@@ -34,7 +34,7 @@
 
 /** 
 	This class is a base class for the various ways a starter can
-	recieve and send information about the underlying job.  For now,
+	receive and send information about the underlying job.  For now,
 	there are two main ways to do this: 1) to talk to a condor_shadow
 	and 2) the local filesystem, command line args, etc.
 */
@@ -248,7 +248,10 @@ public:
 		/** Someone is attempting to reconnect to this job.
 		 */
 	virtual int reconnect( ReliSock* s, ClassAd* ad ) = 0;
-	
+
+		/** Someone is attempting to disconnect from this job.
+		 */
+	virtual void disconnect() = 0;	
 
 		// // // // // // // // // // // //
 		// Notfication to our controller
@@ -276,6 +279,16 @@ public:
 	bool writeOutputAdFile( ClassAd* ad );
 	void initOutputAdFile( void );
 
+	void setUpdateAdFile( const char* path );
+	const char* getUpdateAdFile( void ) { return m_job_update_ad_file.c_str(); };
+	bool writeUpdateAdFile( ClassAd* ad );
+
+	void setCredPath( const char* path );
+	const char* getCredPath( void ) { return job_CredPath; };
+
+	void setKrb5CCName( const char* path );
+	const char* getKrb5CCName( void ) { return job_Krb5CCName; };
+
 		/**
 		   Send a periodic update ClassAd to our controller.  The
 		   "insure_update" just controls if we make sure the update
@@ -300,11 +313,8 @@ public:
 		   function to register for the periodic 
 		   updates, and this ensures that we use the UDP version of
 		   UpdateShadow().
-
-		   This returns an int just to keep DaemonCore happy about the types.
-		   @return TRUE on success, FALSE on failure
 		*/
-	int periodicJobUpdateTimerHandler( void );
+	void periodicJobUpdateTimerHandler( void );
 
 		// // // // // // // // // // // //
 		// Misc utilities
@@ -355,7 +365,9 @@ public:
 
 		/* Upload files in a job working directory */
 	virtual bool uploadWorkingFiles(void) { return false; }
-	
+
+	virtual bool uploadCheckpointFiles(void) { return false; }
+
 		/* Update Job ClassAd with checkpoint info and log it */
 	virtual void updateCkptInfo(void) {};
 
@@ -472,6 +484,11 @@ protected:
 
 	char* job_output_ad_file;
 	bool job_output_ad_is_stdout;
+
+	std::string m_job_update_ad_file;
+
+	char* job_CredPath;
+	char* job_Krb5CCName;
 	
 		/// The ClassAd for our job.  We control the memory for this.
 	ClassAd* job_ad;

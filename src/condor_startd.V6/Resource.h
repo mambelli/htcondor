@@ -26,7 +26,6 @@
 #include "claim.h"
 #include "Reqexp.h"
 #include "LoadQueue.h"
-#include "AvailStats.h"
 #include "cod_mgr.h"
 #include "IdDispenser.h"
 
@@ -47,7 +46,7 @@ public:
 	static long long type_param_long(CpuAttributes* p_attr, const char * name, long long def_value);
 	static char * param(CpuAttributes* p_attr, const char * name);
 	static const char * param(std::string& out, CpuAttributes* p_attr, const char * name);
-	static void init_types(int max_type_id);
+	static void init_types(int max_type_id, bool first_init);
 
 private:
 	std::string shares; // share info from SLOT_TYPE_n attribute
@@ -104,6 +103,7 @@ public:
 		// Remove the given claim from this Resource
 	void	removeClaim( Claim* );
 	void	remove_pre( void );	// If r_pre is set, refuse and delete it.
+	void	invalidateAllClaimIDs();
 
 		// Shutdown methods that deal w/ opportunistic *and* COD claims
 		// reversible: if true, claim may unretire
@@ -111,7 +111,14 @@ public:
 	void	releaseAllClaims( void );
 	void	releaseAllClaimsReversibly( void );
 	void	killAllClaims( void );
-	void    setBadputCausedByDraining();
+
+	void	dropAdInLogFile( void );
+
+        void	setBadputCausedByDraining();
+        bool	getBadputCausedByDraining() { return r_cur->getBadputCausedByDraining();}
+
+        void	setBadputCausedByPreemption() { if( r_cur ) r_cur->setBadputCausedByPreemption();}
+        bool	getBadputCausedByPreemption() { return r_cur->getBadputCausedByPreemption();}
 
         // Enable/Disable claims for hibernation
     void    disable ();
@@ -149,7 +156,7 @@ public:
 
 		// Load Average related methods
 	float	condor_load( void ) {return r_attr->condor_load();};
-	float	compute_condor_load( void );
+	float	compute_condor_usage( void );
 	float	owner_load( void ) {return r_attr->owner_load();};
 	void	set_owner_load( float val ) {r_attr->set_owner_load(val);};
 	void	compute_cpu_busy( void );
@@ -192,7 +199,7 @@ public:
 	bool	acceptClaimRequest();
 
 		// Called when the starter of one of our claims exits
-	void	starterExited( Claim* cur_claim );	
+	void	starterExited( Claim* cur_claim );
 
 		// Since the preempting state is so weird, and when we want to
 		// leave it, we need to decide where we want to go, and we
@@ -207,6 +214,7 @@ public:
 	void	refresh_classad( amask_t mask );	
 	void	reconfig( void );
 	void	publish_slot_config_overrides(ClassAd * cad);
+	void	init_total_disk(const Resource * pslot);
 
 	void	update( void );		// Schedule to update the central manager.
 	void		do_update( void );			// Actually update the CM
@@ -258,7 +266,7 @@ public:
 #endif /* HAVE_JOB_HOOKS */
 
 #if HAVE_HIBERNATION
-	bool	evaluateHibernate( MyString &state ) const;
+	bool	evaluateHibernate( std::string &state ) const;
 #endif /* HAVE_HIBERNATION */
 
 	int     evalMaxVacateTime();
@@ -297,7 +305,6 @@ public:
 	int				r_sub_id;	// Sub id of this resource (int form)
 	char*			r_id_str;	// CPU id of this resource (string form)
 	char*			r_pair_name; // Name of the resource paired with this one, NULL is no pair (the default), may contain "#type" during the slot building process
-	AvailStats		r_avail_stats; // computes resource availability stats
 	int             prevLHF;
 	bool 			m_bUserSuspended;
 	bool			r_no_collector_updates;
@@ -330,13 +337,16 @@ public:
 	static bool swap_claims(Resource* ripa, Resource* ripb);
 
 	std::list<int> *get_affinity_set() { return &m_affinity_mask;}
+
+	bool wasAcceptedWhileDraining() const { return m_acceptedWhileDraining; }
+	void setAcceptedWhileDraining() { m_acceptedWhileDraining = isDraining(); }
 private:
 	ResourceFeature m_resource_feature;
 
 	Resource*	m_parent;
 
 	// Only partitionable slots have children
-	
+
     struct ResourceLess {
         bool operator()(Resource *lhs, Resource *rhs) const {
             return strcmp(lhs->r_name, rhs->r_name) < 0;
@@ -378,6 +388,8 @@ private:
 #endif /* HAVE_JOB_HOOKS */
 
 	std::list<int> m_affinity_mask;
+
+	bool	m_acceptedWhileDraining;
 };
 
 
@@ -397,7 +409,7 @@ Return
 
 Returns the Resource the job will actually be running on.  It does not need to
 be deleted.  The returned Resource might be different than the Resource passed
-in!  In particular, if the passed in Resource is a partitionable slow, we will
+in!  In particular, if the passed in Resource is a partitionable slot, we will
 carve out a new dynamic slot for his job.
 
 The job may be rejected, in which case the returned Resource will be null.

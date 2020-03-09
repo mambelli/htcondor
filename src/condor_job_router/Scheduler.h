@@ -22,6 +22,28 @@
 
 #include "condor_common.h"
 
+#if 1
+
+class JobLogMirror;
+class NewClassAdJobLogConsumer;
+class Scheduler {
+public:
+	Scheduler(char const *_alt_spool_param=NULL, int id=0);
+	~Scheduler();
+	classad::ClassAdCollection *GetClassAds();
+	void init();
+	void config();
+	void stop();
+	void poll();
+	int id();
+
+private:
+
+	NewClassAdJobLogConsumer * m_consumer;
+	JobLogMirror * m_mirror;
+	int m_id; // id of this instance
+};
+#else
 #include "JobLogMirror.h"
 #include "NewClassAdJobLogConsumer.h"
 
@@ -40,5 +62,6 @@ public:
 private:
 	NewClassAdJobLogConsumer *m_consumer;
 };
+#endif
 
 #endif

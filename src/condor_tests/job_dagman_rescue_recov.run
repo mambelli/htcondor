@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -54,12 +55,8 @@ foreach $name (@logfiles) {
 	}
 }
 
-# Get rid of the rescue DAGs we should have at the end.
-foreach $name (@rescuedags) {
-	if (-e $name) {
-		runcmd("rm -f $name");
-	}
-}
+# Get rid of all related rescue DAGs.
+runcmd("rm -f job_dagman_rescue_recov*rescue???");
 
 $abnormal = sub 
 {

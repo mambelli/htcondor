@@ -80,7 +80,7 @@ const char* rrStateToString( ResourceState s );
 	<pre>
 	Parameter  Member   Results
 	---------  ------   ----------
-	  NULL     exists    string strnewp'ed and returned
+	  NULL     exists    string strdup'ed and returned
 	  NULL      NULL     NULL returned
 	 !NULL     exists    strcpy occurs
 	 !NULL      NULL     "" into parameter
@@ -268,8 +268,8 @@ class RemoteResource : public Service {
 	void initFileTransfer();
 
 	virtual void resourceExit( int reason_for_exit, int exit_status );
-
 	virtual void updateFromStarter( ClassAd* update_ad );
+	virtual void incrementJobCompletionCount();
 
 	int64_t getImageSize( int64_t & memory_usage_out, int64_t & rss, int64_t & pss  ) { 
 		memory_usage_out = memory_usage_mb;
@@ -277,7 +277,7 @@ class RemoteResource : public Service {
 		pss = proportional_set_size_kb;
 		return image_size_kb; 
 	};
-	int getDiskUsage( void ) { return disk_usage; };
+	int64_t getDiskUsage( void ) { return disk_usage; };
 	struct rusage getRUsage( void ) { return remote_rusage; };
 
 		/** Return the state that this resource is in. */
@@ -327,13 +327,18 @@ class RemoteResource : public Service {
     bool wasClaimDeactivated( void ) {
        return already_killed_graceful || already_killed_fast; };
 
+		/** Return true if we received a job_exit syscall from the
+			starter, false if not.
+		*/
+	bool gotJobExit() { return m_got_job_exit; };
+
 		/** If the job on this resource exited with a signal, return
 			the signal.  If not, return -1. */
-	int exitSignal( void );
+	int64_t exitSignal( void );
 
 		/** If the job on this resource exited normally, return the
 			exit code.  If it was killed by a signal, return -1. */ 
-	int exitCode( void );
+	int64_t exitCode( void );
 
 		/** This method is called when the job at the remote resource
 			has finally started to execute.  We use this to log the
@@ -403,7 +408,7 @@ class RemoteResource : public Service {
 	ReliSock *claim_sock;
 	int exit_reason;
 	bool claim_is_closing;
-	int exit_value;
+	int64_t exit_value;
 	bool exited_by_signal;
 
 	bool m_want_chirp;
@@ -411,6 +416,7 @@ class RemoteResource : public Service {
 	bool m_want_streaming_io;
 	bool m_want_delayed;
 	StringList m_delayed_update_prefix;
+	classad::References m_unsettable_attrs;
 
 		// If we specially create a security session for file transfer,
 		// this records all the information we need to know about it.
@@ -443,7 +449,8 @@ class RemoteResource : public Service {
 	int64_t			image_size_kb;
 	int64_t			memory_usage_mb;
 	int64_t			proportional_set_size_kb;
-	int 			disk_usage;
+	int64_t			disk_usage;
+	int64_t			scratch_dir_file_count;
 
 	DCStartd* dc_startd;
 
@@ -471,7 +478,7 @@ private:
 	int next_reconnect_tid;
 	int proxy_check_tid;
 
-	MyString proxy_path;
+	std::string proxy_path;
 	time_t last_proxy_timestamp;
 
 	time_t m_remote_proxy_expiration;
@@ -498,13 +505,14 @@ private:
 
 	bool already_killed_graceful;
 	bool already_killed_fast;
+	bool m_got_job_exit;
 
 	void logRemoteAccessCheck(bool allow,char const *op,char const *name);
 
 	void setRemoteProxyRenewTime(time_t expiration_time);
 	void setRemoteProxyRenewTime();
 	void startCheckingProxy();
-	int attemptShutdownTimeout();
+	void attemptShutdownTimeout();
 	void attemptShutdown();
 	void abortFileTransfer();
 	int transferStatusUpdateCallback(FileTransfer *transobject);

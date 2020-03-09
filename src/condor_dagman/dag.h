@@ -35,14 +35,10 @@
 #include "prioritysimplelist.h"
 #include "throttle_by_category.h"
 #include "MyString.h"
-#include "dagman_recursive_submit.h"
+#include "../condor_utils/dagman_utils.h"
 #include "jobstate_log.h"
 
-// NOTE: must be kept in sync with Job::job_type_t
-enum Log_source{
-  CONDORLOG = Job::TYPE_CONDOR,
-  DAPLOG = Job::TYPE_STORK
-};
+#include <queue>
 
 // Which layer of splices do we want to lift?
 enum SpliceLayer {
@@ -53,6 +49,7 @@ enum SpliceLayer {
 class Dagman;
 class MyString;
 class DagmanMetrics;
+class CondorID;
 
 // used for RelinquishNodeOwnership and AssumeOwnershipofNodes
 // This class owns the containers with which it was constructed, but
@@ -97,7 +94,7 @@ class Dag {
   
     /** Create a DAG
 		@param dagFile the DAG file name
-        @param maxJobsSubmitted the maximum number of jobs to submit to Condor
+        @param maxJobsSubmitted the maximum number of jobs to submit to HTCondor
                at one time
         @param maxPreScripts the maximum number of PRE scripts to spawn at
 		       one time
@@ -113,15 +110,13 @@ class Dag {
 		       job, to put the node at the head of the ready queue
 		@param retryNodeFirst whether, when a node fails and has retries,
 			   to put the node at the head of the ready queue
-		@param condorRmExe executable to remove Condor jobs
-		@param storkRmExe executable to remove Stork jobs
-		@param DAGManJobId Condor ID of this DAGMan process
+		@param condorRmExe executable to remove HTCondor jobs
+		@param DAGManJobId HTCondor ID of this DAGMan process
 		@param prohibitMultiJobs whether submit files queueing multiple
 			   job procs are prohibited
 		@param submitDepthFirst whether ready nodes should be submitted
 			   in depth-first (as opposed to breadth-first) order
-		@param The user log file to be used for nodes whose submit files do
-				not specify a log file.
+		@param defaultNodeLog The user log file to be used for node jobs.
 		@param isSplice is a boolean which lets the dag object know whether
 				of not it is a splicing dag, or the toplevel dag. We don't
 				wan't to allocate some regulated resources we won't need
@@ -135,10 +130,9 @@ class Dag {
     Dag( /* const */ StringList &dagFiles,
 		 const int maxJobsSubmitted,
 		 const int maxPreScripts, const int maxPostScripts, 
-		 bool allowLogError,
 		 bool useDagDir, int maxIdleJobProcs, bool retrySubmitFirst,
 		 bool retryNodeFirst, const char *condorRmExe,
-		 const char *storkRmExe, const CondorID *DAGManJobId,
+		 const CondorID *DAGManJobId,
 		 bool prohibitMultiJobs, bool submitDepthFirst,
 		 const char *defaultNodeLog, bool generateSubdagSubmits,
 		 SubmitDagDeepOptions *submitDagDeepOpts,
@@ -176,35 +170,36 @@ class Dag {
 
     /// Add a job to the collection of jobs managed by this Dag.
     bool Add( Job& job );
+
+#ifdef DEAD_CODE
     /** Specify a dependency between two jobs. The child job will only
         run after the parent job has finished.
         @param parent The parent job
         @param child The child job (depends on the parent)
         @return true: successful, false: failure
     */
-    bool AddDependency (Job * parent, Job * child);
-  
-    /** Blocks until the Condor Log file grows.
-        @return true: log file grew, false: timeout or shrinkage
-    */
+    static bool AddDependency (Job * parent, Job * child);
+#endif
 
-    
-    bool DetectCondorLogGrowth();
-    bool DetectDaPLogGrowth();            //<--DAP
+	/** Run waiting/deferred scripts that are ready to run.  Note: scripts
+	    are also limited by halt status and maxpre/maxpost.
+	*/
+	void RunWaitingScripts();
+  
+    // Get the current status of the condor log file
+	ReadUserLog::FileStatus	GetCondorLogStatus();
 
     /** Force the Dag to process all new events in the condor log file.
         This may cause the state of some jobs to change.
 
-		@param logsource The type of log from which events should be read.
         @param recover Process Log in Recover Mode, from beginning to end
         @return true on success, false on failure
     */
-    bool ProcessLogEvents (int logsource, bool recovery = false); //<--DAP
+    bool ProcessLogEvents (bool recovery = false);
 
 	/** Process a single event.  Note that this is called every time
 			we attempt to read the user log, so we may or may not have
 			a valid event here.
-		@param The type of log which is the source of the event.
 		@param The outcome from the attempt to read the user log.
 	    @param The event.
 		@param Whether we're in recovery mode.
@@ -212,7 +207,7 @@ class Dag {
 			function).
 		@return True if the DAG should continue, false if we should abort.
 	*/
-	bool ProcessOneEvent (int logsource, ULogEventOutcome outcome, const ULogEvent *event,
+	bool ProcessOneEvent (ULogEventOutcome outcome, const ULogEvent *event,
 			bool recovery, bool &done);
 
 	/** Process an abort or executable error event.
@@ -265,7 +260,7 @@ class Dag {
 		a different method.
 		@param The job corresponding to this event.
 	*/
-	void ProcessIsIdleEvent(Job *job);
+	void ProcessIsIdleEvent( Job *job, int proc );
 
 	/** Process an event that indicates that a job is NOT in an idle state.
 	    Note that this method only does processing relating to keeping
@@ -273,7 +268,7 @@ class Dag {
 		a different method.
 		@param The job corresponding to this event.
 	*/
-	void ProcessNotIdleEvent(Job *job);
+	void ProcessNotIdleEvent( Job *job, int proc );
 
 	/** Process a held event for a job.
 		@param The job corresponding to this event.
@@ -284,6 +279,18 @@ class Dag {
 		@param The job corresponding to this event.
 	*/
 	void ProcessReleasedEvent(Job *job, const ULogEvent *event);
+
+	/** Process a cluster submit event.
+	    @param The job corresponding to this event.
+		@param Whether we're in recovery mode.
+	*/
+	void ProcessClusterSubmitEvent(Job *job);
+
+		/** Process a cluster remove event.
+	    @param The job corresponding to this event.
+		@param Whether we're in recovery mode.
+	*/
+	void ProcessClusterRemoveEvent(Job *job, bool recovery);
 
     /** Get pointer to job with id jobID
         @param the handle of the job in the DAG
@@ -297,12 +304,30 @@ class Dag {
     */
     Job * FindNodeByName (const char * jobName) const;
 
-    /** Get pointer to job with condor or stork ID condorID
-		@param logsource The type of log from which events should be read.
-        @param condorID the CondorID of the job in the DAG
+    /** Get pointer to job with condor ID condorID
+        @param condorID the HTCondorID of the job in the DAG
         @return address of Job object, or NULL if not found
     */
-    Job * FindNodeByEventID (int logsource, const CondorID condorID ) const;
+    Job * FindNodeByEventID ( const CondorID condorID ) const;
+
+	/** Find all nodes by name -- either a specific node or all
+	 	nodes in the DAG.  To find all nodes in the DAG, pass
+		"ALL_NODES" as the node name on the first call; then NULL
+		in subsequent calls
+		@param nodeName the name of the node to find, or "ALL_NODES",
+			or NULL
+		@param finalSkipMsg the message to print when skipping final
+			nodes, in a form like this: "In parse_script(): skipping node
+			%s because final nodes must have SCRIPT set explicitly
+			(%s: %d)\n"
+		@param file the name of the DAG file that is being parsed
+		@param line the line in the DAG file that is being parsed
+	 	@return a pointer to a Job (node) object, or NULL if there are
+	 		no more node to be found
+	*/
+	Job * FindAllNodesByName( const char* nodeName,
+				const char *finalSkipMsg,
+				const char *file, int line) const;
 
     /** Ask whether a node name exists in the DAG
         @param nodeName the name of the node in the DAG
@@ -455,15 +480,25 @@ class Dag {
     /** Remove all jobs (using condor_rm) that are currently running.
         All jobs currently marked Job::STATUS_SUBMITTED will be fed
         as arguments to condor_rm via popen.  This function is called
-        when the Dagman Condor job itself is removed by the user via
+        when the Dagman HTCondor job itself is removed by the user via
         condor_rm.  This function <b>is not</b> called when the schedd
         kills Dagman.
+		@param dmJobId: the HTCondor ID of this DAGMan job.
+		@param removeCondorJobs: iff true we, remove our HTCondor node jobs.
+			This is set to false when DAGMan itself is condor_rm'ed,
+			because in that case the schedd removes the node jobs.
+		@param bForce: iff true, we run the command to remove HTCondor
+			node jobs even if we don't think we have any -- I think this
+			is in case we have a failure in recovery mode before we've
+			read the logs.  Setting bForce to true automatically
+			implies removeCondorJobs.
     */
-    void RemoveRunningJobs ( const Dagman &, bool bForce=false) const;
+    void RemoveRunningJobs ( const CondorID &dmJobId, bool removeCondorJobs,
+				bool bForce ) const;
 
     /** Remove all pre- and post-scripts that are currently running.
 	All currently running scripts will be killed via daemoncore.
-	This function is called when the Dagman Condor job itself is
+	This function is called when the Dagman HTCondor job itself is
 	removed by the user via condor_rm.  This function <b>is not</b>
 	called when the schedd kills Dagman.
     */
@@ -500,18 +535,21 @@ class Dag {
 				const char * dagFile, bool parseFailed = false,
 				bool isPartial = false) /* const */;
 
-	int PreScriptReaper( const char* nodeName, int status );
-	int PostScriptReaper( const char* nodeName, int status );
-	int PostScriptSubReaper( Job *job, int status );
+	int PreScriptReaper( Job *job, int status );
+	int PostScriptReaper( Job *job, int status );
 
 	void PrintReadyQ( debug_level_t level ) const;
+
+	bool _removeJobsAfterLimitChange = false;
 
 #if 0
 	bool RemoveNode( const char *name, MyString &whynot );
 #endif
 
+#ifdef DEAD_CODE
 	bool RemoveDependency( Job *parent, Job *child );
 	bool RemoveDependency( Job *parent, Job *child, MyString &whynot );
+#endif
 	
     /* Detects cycle within dag submitted by user
 	   @return true if there is cycle
@@ -519,8 +557,8 @@ class Dag {
 	bool isCycle();
 
 	// max number of PRE & POST scripts to run at once (0 means no limit)
-    const int _maxPreScripts;
-    const int _maxPostScripts;
+    int _maxPreScripts;
+    int _maxPostScripts;
 
 	void SetDotFileName(const char *dot_file_name);
 	void SetDotIncludeFileName(const char *include_file_name);
@@ -530,7 +568,7 @@ class Dag {
 	void DumpDotFile(void);
 
 	void SetNodeStatusFileName( const char *statusFileName,
-				int minUpdateTime );
+				int minUpdateTime, bool alwaysUpdate = false );
 	void DumpNodeStatus( bool held, bool removed );
 
 		/** Set the reject flag to true for this DAG; if it hasn't been
@@ -552,15 +590,17 @@ class Dag {
 
 	void CheckAllJobs();
 
+#ifdef DEAD_CODE
 		/** Returns a delimited string listing the node names of all
-			of the given node's parents.
+			of the given node's parents if the number of parents is less than or equal to max_parents
 			@return delimited string of parent node names
 		*/
-	const MyString ParentListString( Job *node, const char delim = ',' ) const;
+	const MyString ParentListString( Job *node, size_t max_parents=256, const char delim = ',' ) const;
+#endif
 
 	int NumIdleJobProcs() const { return _numIdleJobProcs; }
 
-	int NumHeldJobProcs() const { return _numHeldJobProcs; }
+	int NumHeldJobProcs();
 
 		/** Print the number of deferrals during the run (caused
 		    by MaxJobs, MaxIdle, MaxPre, or MaxPost).
@@ -614,13 +654,16 @@ class Dag {
 
 	int MaxJobsSubmitted(void) { return _maxJobsSubmitted; }
 
-	bool AllowLogError(void) { return _allowLogError; }
-
 	bool UseDagDir(void) { return _useDagDir; }
 
 	int MaxIdleJobProcs(void) { return _maxIdleJobProcs; }
 	int MaxPreScripts(void) { return _maxPreScripts; }
 	int MaxPostScripts(void) { return _maxPostScripts; }
+
+	void SetMaxIdleJobProcs(int maxIdle) { _maxIdleJobProcs = maxIdle; };
+	void SetMaxJobsSubmitted(int newMax);
+	void SetMaxPreScripts(int maxPreScripts) { _maxPreScripts = maxPreScripts; };
+	void SetMaxPostScripts(int maxPostScripts) { _maxPostScripts = maxPostScripts; };
 
 	bool RetrySubmitFirst(void) { return m_retrySubmitFirst; }
 
@@ -628,9 +671,6 @@ class Dag {
 
 	// do not free this pointer
 	const char* CondorRmExe(void) { return _condorRmExe; }
-
-	// do not free this pointer
-	const char* StorkRmExe(void) { return _storkRmExe; }
 
 	const CondorID* DAGManJobId(void) { return _DAGManJobId; }
 
@@ -642,17 +682,17 @@ class Dag {
 
 	StringList& DagFiles(void) { return _dagFiles; }
 
-	/** Determine whether a job is a NOOP job based on the Condor ID.
-		@param the Condor ID of the job
+	/** Determine whether a job is a NOOP job based on the HTCondor ID.
+		@param the HTCondor ID of the job
 		@return true iff the job is a NOOP
 	*/
 	static bool JobIsNoop( const CondorID &id ) {
 		return (id._cluster == 0) && (id._proc == Job::NOOP_NODE_PROCID);
 	}
 
-	/** Get the part of the CondorID that we're indexing by (cluster ID
+	/** Get the part of the HTCondorID that we're indexing by (cluster ID
 		for "normal" jobs, subproc ID for NOOP jobs).
-		@param the Condor ID of the job
+		@param the HTCondor ID of the job
 		@return the part of the ID to index by
 	*/
 	static int GetIndexID( const CondorID &id ) {
@@ -678,9 +718,9 @@ class Dag {
 	ExtArray<Job*>* FinalRecordedNodes(void);
 
 	// called just after a parse of a dag, this will keep track of the
-	// original intial and final nodes of a dag (after all parent and
+	// original intial and terminal nodes of a dag (after all parent and
 	// child dependencies have been added or course).
-	void RecordInitialAndFinalNodes(void);
+	void RecordInitialAndTerminalNodes(void);
 
 	// Recursively lift all splices into each other and then me
 	OwnedMaterials* LiftSplices(SpliceLayer layer);
@@ -694,10 +734,12 @@ class Dag {
 	void AssumeOwnershipofNodes(const MyString &spliceName,
 				OwnedMaterials *om);
 
+#ifdef DEAD_CODE // we now do this at submit time.
 	// This must be called after the toplevel dag has been parsed and
 	// the splices lifted. It will resolve the use of $(JOB) in the value
 	// of the VARS attribute.
 	void ResolveVarsInterpolations(void);
+#endif
 
 	// When parsing a splice (which is itself a dag), there must always be a
 	// DIR concept associated with it. If DIR is left off, then it is ".",
@@ -708,7 +750,26 @@ class Dag {
 	// After the nodes in the dag have been made, we take our DIR setting,
 	// and if it isn't ".", we prefix it to the directory setting for each
 	// node, unless it is an absolute path, in which case we ignore it.
-	void PropogateDirectoryToAllNodes(void);
+	void PropagateDirectoryToAllNodes(void);
+
+	// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	// Splice connections.
+
+	/** Set a pin in or pin out connection for this DAG.
+		@param isPinIn: true if this is for a pin in, false for pin out
+		@param nodeName: the name of the node we're connecting
+		@param pinNum: the number of the pin we're connecting
+		@return: true on success, false otherwise
+	*/
+	bool SetPinInOut( bool isPinIn, const char *nodeName, int pinNum );
+
+	/** Connect two splices via pin outs/pin ins
+		@param parentSplice: the splice connected via its pin outs
+		@param childSplice: the splice connected via its pin ins
+		@return: true on success, false otherwise
+	*/
+	static bool ConnectSplices( Dag *parentSplice, Dag *childSplice );
+	// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 	/** Set the maximum number of job holds before a node is declared
 		a failure.
@@ -719,9 +780,23 @@ class Dag {
 	JobstateLog &GetJobstateLog() { return _jobstateLog; }
 	bool GetPostRun() const { return _alwaysRunPost; }
 	void SetPostRun(bool postRun) { _alwaysRunPost = postRun; }	
-	void SetDefaultPriorities();
-	void SetDefaultPriority(const int prio) { _defaultPriority = prio; }
-	int GetDefaultPriority() const { return _defaultPriority; }
+
+	int GetDryRun() const { return _dry_run; }
+	void SetDryRun(int dry) { _dry_run = dry; }
+
+		// Set the overall priority for this DAG (set on command
+		// line (could be from higher-level DAG) or via config).
+	void SetDagPriority(const int prio) { _dagPriority = prio; }
+
+		// Get this DAG's overall priority.
+	int GetDagPriority() const { return _dagPriority; }
+		
+		// Set priorities for the individual nodes within this DAG.
+	void SetNodePriorities();
+
+		// make a pass through the dag removing duplicate edges
+		// and setting the waiting edges. not all edge strategies need this
+	void AdjustEdges();
 
 	/** Determine whether the DAG is currently halted (waiting for
 		existing jobs to finish but not submitting any new ones).
@@ -741,6 +816,14 @@ class Dag {
 
 	dag_status _dagStatus;
 
+	// WARNING!  dag_status and dag_status_names just be kept in sync!
+	static const char *_dag_status_names[];
+
+	const char *GetStatusName() const {
+				return _dag_status_names[_dagStatus]; }
+
+	static const char *ALL_NODES;
+
 	/** Determine whether this DAG has a final node.
 		@return true iff the DAG has a final node.
 	*/
@@ -757,7 +840,6 @@ class Dag {
 	*/
 	inline bool Recovery() const { return _recovery; }
 
-	inline void UseDefaultNodeLog(bool useit) { _use_default_node_log = useit; }
   private:
 
 	// If this DAG is a splice, then this is what the DIR was set to, it 
@@ -772,14 +854,17 @@ class Dag {
 	// dag as a parent or a child, we can always reference the correct nodes
 	// even in the face of AddDependency().
 	ExtArray<Job*> _splice_initial_nodes;
-	ExtArray<Job*> _splice_final_nodes;
+	ExtArray<Job*> _splice_terminal_nodes;
 
   	// A hash table with key of a splice name and value of the dag parse 
 	// associated with the splice.
 	HashTable<MyString, Dag*> _splices;
 
 	// A reference to something the dagman passes into the constructor
-  	StringList& _dagFiles;
+	StringList& _dagFiles;
+
+	// Internal instance of a DagmanUtils object
+	DagmanUtils _dagmanUtils;
 
 	/** Print a numbered list of the DAG files.
 	    @param The list of DAG files being run.
@@ -814,40 +899,40 @@ class Dag {
 		SUBMIT_RESULT_NO_SUBMIT,
 	} submit_result_t;
 
-	/** Submit the Condor or Stork job for a node, including doing
+	/** Submit the HTCondor job for a node, including doing
 		some higher-level work such as sleeping before the actual submit
 		if necessary.
 		@param the appropriate Dagman object
 		@param the node for which to submit a job
-		@param reference to hold the Condor ID the job is assigned
+		@param reference to hold the HTCondor ID the job is assigned
 		@return submit_result_t (see above)
 	*/
 	submit_result_t SubmitNodeJob( const Dagman &dm, Job *node,
 				CondorID &condorID );
 
-	/** Do the post-processing of a successful submit of a Condor or
-		Stork job.
+	/** Do the post-processing of a successful submit of a HTCondor job.
 		@param the node for which the job was just submitted
-		@param the Condor ID of the associated job
+		@param the HTCondor ID of the associated job
 	*/	
 	void ProcessSuccessfulSubmit( Job *node, const CondorID &condorID );
 
-	/** Do the post-processing of a failed submit of a Condor or
-		Stork job.
+	/** Do the post-processing of a failed submit of a HTCondor job.
 		@param the node for which the job was just submitted
 		@param the maximum number of submit attempts allowed for a job.
 	*/
 	void ProcessFailedSubmit( Job *node, int max_submit_attempts );
 
-	/** Decrement the job counts for this node.
+	/** Decrement the proc count for this node (and also the overall
+	    	job count if appropriate).
 		@param The node for which to decrement the job counts.
 	*/
-	void DecrementJobCounts( Job *node );
+	void DecrementProcCount( Job *node );
 
 	// Note: there's no IncrementJobCounts method because the code isn't
 	// exactly duplicated when incrementing.
 
-	/** Update the job counts for the given node.
+	/** Update the overall submitted job count (and the appropriate
+			category count, if the node belongs to a category).
 		@param The amount by which to change the job counts.
 	*/
 	void UpdateJobCounts( Job *node, int change );
@@ -870,7 +955,7 @@ class Dag {
 	void RestartNode( Job *node, bool recovery );
 
 	/* DFS number the jobs in the DAG in order to detect cycle*/
-	void DFSVisit (Job * job);
+	void DFSVisit (Job * job, int depth);
 
 		/** Check whether we got an exit value that should abort the DAG.
 			@param The job associated with either the PRE script, POST
@@ -883,12 +968,12 @@ class Dag {
 	bool CheckForDagAbort(Job *job, const char *type);
 
 		// takes a userlog event and returns the corresponding node
-	Job* LogEventNodeLookup( int logsource, const ULogEvent* event,
+	Job* LogEventNodeLookup( const ULogEvent* event,
 				bool &submitEventIsSane );
 
 		// check whether a userlog event is sane, or "impossible"
 
-	bool EventSanityCheck( int logsource, const ULogEvent* event,
+	bool EventSanityCheck( const ULogEvent* event,
 						const Job* node, bool* result );
 
 		// compares a submit event's job ID with the one that appeared
@@ -897,24 +982,17 @@ class Dag {
 
 	bool SanityCheckSubmitEvent( const CondorID condorID, const Job* node );
 
-		/** Get the appropriate hash table for event ID->node mapping,
-			according to whether this is a Condor or Stork node.
+		/** Get the appropriate hash table for event ID->node mapping.
 			@param whether the node is a NOOP node
-			@param the node type/logsource (Condor or Stork) (see
-				Log_source and Job::job_type_t)
 			@return a pointer to the appropriate hash table
 		*/
-	HashTable<int, Job *> *		GetEventIDHash(bool isNoop, int jobType);
+	HashTable<int, Job *> *		GetEventIDHash(bool isNoop);
 
-		/** Get the appropriate hash table for event ID->node mapping,
-			according to whether this is a Condor or Stork node.
+		/** Get the appropriate hash table for event ID->node mapping.
 			@param whether the node is a NOOP node
-			@param the node type/logsource (Condor or Stork) (see
-				Log_source and Job::job_type_t)
 			@return a pointer to the appropriate hash table
 		*/
-	const HashTable<int, Job *> *		GetEventIDHash(bool isNoop,
-				int jobType) const;
+	const HashTable<int, Job *> *		GetEventIDHash(bool isNoop) const;
 
 	// run DAGs in directories from DAG file paths if true
 	bool _useDagDir;
@@ -922,19 +1000,13 @@ class Dag {
     // Documentation on ReadUserLog is present in condor_utils
 	ReadMultipleUserLogs _condorLogRdr;
 
-		// Object to read events from Stork logs.
-	ReadMultipleUserLogs	_storkLogRdr;
-
 		/** Get the total number of node job user log files we'll be
 			accessing.
 			@return The total number of log files.
 		*/
-	int TotalLogFileCount() { return CondorLogFileCount() +
-				StorkLogFileCount(); }
-
+	int TotalLogFileCount() { return CondorLogFileCount(); }
+				
 	int CondorLogFileCount() { return _condorLogRdr.totalLogFileCount(); }
-
-	int StorkLogFileCount() { return _storkLogRdr.totalLogFileCount(); }
 
 		/** Write information for the given node to a rescue DAG.
 			@param fp: file pointer to the rescue DAG file
@@ -947,6 +1019,12 @@ class Dag {
 		*/
 	void WriteNodeToRescue( FILE *fp, Job *node,
 				bool reset_retries_upon_rescue, bool isPartial );
+
+		/** Write a script specification to a rescue DAG.
+			@param fp: file pointer to the rescue DAG file
+		    @param script: the script to write
+		*/
+	static void WriteScriptToRescue( FILE *fp, Script *script );
 
 		// True iff the final node is ready to be run, is running,
 		// or has been run (including PRE and POST scripts, if any).
@@ -961,8 +1039,18 @@ class Dag {
 	*/
 	const char *EscapeClassadString( const char* strIn );
 
+	/** Monitor the workflow log file for this DAG.
+		@return:  true if successful, false otherwise
+	*/
+	bool MonitorLogFile();
+
+	/** Unmonitor the workflow log file for this DAG.
+		@return:  true if successful, false otherwise
+	*/
+	bool UnmonitorLogFile();
+
 protected:
-    /// List of Job objects
+    // List of Job objects
     List<Job>     _jobs;
 
 private:
@@ -974,13 +1062,9 @@ private:
 
 	HashTable<JobID_t, Job *>		_nodeIDHash;
 
-	// Hash by CondorID (really just by the cluster ID because all
+	// Hash by HTCondorID (really just by the cluster ID because all
 	// procs in the same cluster map to the same node).
 	HashTable<int, Job *>			_condorIDHash;
-
-	// Hash by StorkID (really just by the cluster ID because all
-	// procs in the same cluster map to the same node).
-	HashTable<int, Job *>			_storkIDHash;
 
 	// NOOP nodes are indexed by subprocID.
 	HashTable<int, Job *>			_noopIDHash;
@@ -997,7 +1081,7 @@ private:
     /*  Maximum number of jobs to submit at once.  Non-negative.  Zero means
         unlimited
     */
-    const int _maxJobsSubmitted;
+    int _maxJobsSubmitted;
 
 		// Number of DAG job procs currently idle.
 	int _numIdleJobProcs;
@@ -1005,14 +1089,10 @@ private:
     	// Maximum number of idle job procs to allow (stop submitting if the
 		// number of idle job procs hits this limit).  Non-negative.  Zero
 		// means unlimited.
-    const int _maxIdleJobProcs;
+    int _maxIdleJobProcs;
 
-		// The number of DAG job procs currently held.
-	int _numHeldJobProcs;
-
-		// Whether to allow the DAG to run even if we have an error
-		// determining the job log files.
-	bool		_allowLogError;
+		// Policy for how we respond to DAG edits.
+	std::string _editPolicy;
 
 		// If this is true, nodes for which the job submit fails are retried
 		// before any other ready nodes; otherwise a submit failure puts
@@ -1025,21 +1105,18 @@ private:
 		// queue.  (Default is false.)
 	bool		m_retryNodeFirst;
 
-		// Executable to remove Condor jobs.
+		// Executable to remove HTCondor jobs.
 	const char *	_condorRmExe;
 
-		// Executable to remove Stork jobs.
-	const char *	_storkRmExe;
-
-		// Condor ID of this DAGMan process.
+		// HTCondor ID of this DAGMan process.
 	const CondorID *	_DAGManJobId;
 
-	// queue of jobs ready to be submitted to Condor
+	// queue of jobs ready to be submitted to HTCondor
 	PrioritySimpleList<Job*>* _readyQ;
 
 	// queue of submitted jobs not yet matched with submit events in
-	// the Condor job log
-    Queue<Job*>* _submitQ;
+	// the HTCondor job log
+	std::queue<Job*>* _submitQ;
 
 	ScriptQ* _preScriptQ;
 	ScriptQ* _postScriptQ;
@@ -1050,7 +1127,10 @@ private:
 		// Number of nodes currently in status Job::STATUS_POSTRUN.
 	int		_postRunNodeCount;
 	
-	int DFS_ORDER; 
+	int DFS_ORDER;
+	int _graph_width;
+	int _graph_height;
+	std::vector<int> _graph_widths;
 
 	// Information for producing dot files, which can be used to visualize
 	// DAG files. Dot is part of the graphviz package, which is available from
@@ -1077,13 +1157,14 @@ private:
 		// write the file too often, e.g., for large DAGs).
 	int _minStatusUpdateTime;
 
+		// If this is true, we update the node status file even if
+		// nothing has changed (defaults to false).
+	bool _alwaysUpdateStatus;
+
 		// Last time the status file was written.
 	time_t _lastStatusUpdateTimestamp;
 
-		// Separate event checkers for Condor and Stork here because
-		// IDs could collide.
 	CheckEvents	_checkCondorEvents;
-	CheckEvents	_checkStorkEvents;
 
 		// Total count of jobs deferred because of MaxJobs limit (note
 		// that a single job getting deferred multiple times is counted
@@ -1138,16 +1219,11 @@ private:
 		// The last time we printed a pending node report.
 	time_t		_lastPendingNodePrintTime;
 
-		// Default Condor ID to use in reseting a node's Condor ID on
+		// Default HTCondor ID to use in reseting a node's HTCondor ID on
 		// retry.
 	static const CondorID	_defaultCondorId;
 
-		// Whether having node job log files on NFS is an error (vs.
-		// just a warning).
-	bool	_nfsLogIsError;
-
-		// The user log file to be used for nodes whose submit files do
-		// not specify a log file.
+		// The user log file to be used for nodes jobs.
 	const char *_defaultNodeLog;
 
 		// Whether to generate the .condor.sub files for sub-DAGs
@@ -1195,8 +1271,12 @@ private:
 	// Defaults to true
 	bool _alwaysRunPost;
 
-		// The default priority for nodes in this DAG. (defaults to 0)
-	int _defaultPriority;
+	// If true, don't dry-run the dag. pretending that all jobs terminated successfully
+	// upon submission
+	int _dry_run;
+
+		// The priority for this DAG. (defaults to 0)
+	int _dagPriority;
 
 		// Whether the DAG is currently halted.
 	bool _dagIsHalted;
@@ -1210,14 +1290,63 @@ private:
 		// The name of the halt file (we halt the DAG if that file exists).
 	MyString _haltFile;
 	
-		// Whether to use the default node log as *the* log
-		// for writing and reading events.  If false, use the user log
-		// This must be false if dagman is communicating with a pre-7.9.0
-		// schedd/shadow or submit.
-	bool _use_default_node_log;
-
 		// Object to deal with reporting DAGMan metrics (to Pegasus).
 	DagmanMetrics *_metrics;
+
+	// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	// Splice connections.
+
+		// This is the list of nodes connected to a given pin (in or out).
+	typedef std::vector<Job *> PinNodes;
+
+		// This is a list of pin ins or pin outs.
+	typedef std::vector<PinNodes *> PinList;
+
+		// The pin ins for this DAG.
+	PinList _pinIns;
+
+		// The pin outs for this DAG.
+	PinList _pinOuts;
+
+	/** Get the list of nodes connected to a pin in or pin out
+		@param isPinIn: true if this is for a pin in, false for pin out
+		@param pinNum: the number of the pin for which we're getting
+			nodes
+		@return: a list of nodes connected to this pin
+	*/
+	const PinNodes *GetPinInOut( bool isPinIn, int pinNum ) const;
+
+	/** Get the number of pin ins or pin outs we have in this DAG
+		@param isPinIn: true if this is for pin ins, false for pin outs
+		@return: the number of pin ins or pin outs
+	*/
+	int GetPinCount( bool isPinIn );
+
+	/** Set a pin in or pin out connection for this DAG.
+		@param pinList: the pin list to update
+		@param node: the node to connect
+		@param pinNum: the number of the pin we're connecting
+		@return: true on success, false otherwise
+	*/
+	bool SetPinInOut( PinList &pinList, Job *node, int pinNum );
+
+	/** Get the list of nodes connected to a pin in or pin out
+		@param pinList: the pin list to access
+		@param inOutStr: "in" or "out" as appropriate
+		@param pinNum: the number of the pin for which we're getting
+			nodes
+		@return: a list of nodes connected to this pin
+	*/
+	const static PinNodes *GetPinInOut( const PinList &pinList,
+				const char *inOutStr, int pinNum );
+
+	/** Delete memory allocated as part of this pin list
+		@param pinList: the pin list to delete
+	*/
+	static void DeletePinList( PinList &pinList );
+	// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+		// Iterator for ALL_NODES implementation.
+	mutable ListIterator<Job> *_allNodesIt;
 };
 
 #endif /* #ifndef DAG_H */

@@ -25,17 +25,18 @@
 #include "condor_daemon_core.h"
 #include "gahp_common.h"
 
-#include "classad_hashtable.h"
+#include "HashTable.h"
 #include "globus_utils.h"
 #include "proxymanager.h"
 #include "condor_arglist.h"
 #include <map>
-#include <queue>
+#include <deque>
 #include <list>
 #include <vector>
 #include <string>
 #include <utility>
 
+#define NULLSTRING "NULL"
 
 struct GahpProxyInfo
 {
@@ -64,20 +65,21 @@ static const int GAHPCLIENT_COMMAND_TIMED_OUT = -103;
 
 void GahpReconfig();
 
-class GahpClient;
+class GenericGahpClient;
 
 class GahpServer : public Service {
  public:
 	static GahpServer *FindOrCreateGahpServer(const char *id,
 											  const char *path,
 											  const ArgList *args = NULL);
-	static HashTable <HashKey, GahpServer *> GahpServersById;
+	static HashTable <std::string, GahpServer *> GahpServersById;
 
 	GahpServer(const char *id, const char *path, const ArgList *args = NULL);
 	~GahpServer();
 
 	bool Startup();
 	bool Initialize(Proxy * proxy);
+	bool UpdateToken(const std::string &token_file);
 	bool CreateSecuritySession();
 
 	void DeleteMe();
@@ -95,7 +97,31 @@ class GahpServer : public Service {
 
 	static int m_reaperid;
 
-	static void Reaper(Service *,int pid,int status);
+	static int Reaper(int pid,int status);
+
+	class GahpStatistics {
+	public:
+		GahpStatistics();
+
+		void Publish( ClassAd & ad ) const;
+		void Unpublish( ClassAd & ad ) const;
+
+		static void Tick();
+
+		static int RecentWindowMax;
+		static int RecentWindowQuantum;
+		static int Tick_tid;
+
+		stats_entry_recent<int> CommandsIssued;
+		stats_entry_recent<int> CommandsTimedOut;
+		stats_entry_abs<int> CommandsInFlight;
+		stats_entry_abs<int> CommandsQueued;
+		stats_entry_recent<Probe> CommandRuntime;
+
+		StatisticsPool Pool;
+	};
+
+	GahpStatistics m_stats;
 
 	void read_argv(Gahp_Args &g_args);
 	void read_argv(Gahp_Args *g_args) { read_argv(*g_args); }
@@ -107,7 +133,7 @@ class GahpServer : public Service {
 	void AddGahpClient();
 	void RemoveGahpClient();
 
-	int ProxyCallback();
+	void ProxyCallback();
 	void doProxyCheck();
 	GahpProxyInfo *RegisterProxy( Proxy *proxy );
 	void UnregisterProxy( Proxy *proxy );
@@ -157,6 +183,7 @@ class GahpServer : public Service {
 	bool command_version();
 	bool command_initialize_from_file(const char *proxy_path,
 									  const char *command=NULL);
+	bool command_update_token_from_file(const std::string &token);
 	bool command_commands();
 	bool command_async_mode_on();
 	bool command_response_prefix(const char *prefix);
@@ -168,15 +195,17 @@ class GahpServer : public Service {
 	bool rotated_reqids;
 
 	unsigned int m_reference_count;
-	HashTable<int,GahpClient*> *requestTable;
-	std::queue<int> waitingHighPrio;
-	std::queue<int> waitingMediumPrio;
-	std::queue<int> waitingLowPrio;
+	HashTable<int,GenericGahpClient*> *requestTable;
+	std::deque<int> waitingHighPrio;
+	std::deque<int> waitingMediumPrio;
+	std::deque<int> waitingLowPrio;
 
 	int m_gahp_pid;
 	int m_gahp_readfd;
 	int m_gahp_writefd;
 	int m_gahp_errorfd;
+	int m_gahp_real_readfd;
+	int m_gahp_real_errorfd;
 	std::string m_gahp_error_buffer;
 	std::list<std::string> m_gahp_error_list;
 	bool m_gahp_startup_failed;
@@ -214,13 +243,109 @@ class GahpServer : public Service {
 	int proxy_check_tid;
 	bool is_initialized;
 	bool can_cache_proxies;
-	HashTable<HashKey,GahpProxyInfo*> *ProxiesByFilename;
+	HashTable<std::string,GahpProxyInfo*> *ProxiesByFilename;
 }; // end of class GahpServer
-	
-///
-class GahpClient : public Service {
-	
+
+class GenericGahpClient : public Service {
 	friend class GahpServer;
+
+	public:
+		GenericGahpClient(	const char * id = GAHPCLIENT_DEFAULT_SERVER_ID,
+							const char * path = GAHPCLIENT_DEFAULT_SERVER_PATH,
+							const ArgList * args = NULL );
+		virtual ~GenericGahpClient();
+
+		bool Startup();
+		bool Initialize( Proxy * proxy );
+		bool UpdateToken(const std::string &token_file);
+		bool CreateSecuritySession();
+
+		void purgePendingRequests() { clear_pending(); }
+		bool pendingRequestIssued() { return pending_submitted_to_gahp || pending_result; }
+
+		enum mode {
+				/** */ normal,
+				/** */ results_only,
+				/** */ blocking
+		};
+
+		void setMode( mode m ) { m_mode = m; }
+		mode getMode() { return m_mode; }
+
+		void setTimeout( int t ) { m_timeout = t; }
+		unsigned int getTimeout() { return m_timeout; }
+
+		void setNotificationTimerId( int tid ) { user_timerid = tid; }
+		int getNotificationTimerId() { return user_timerid; }
+
+		void PublishStats( ClassAd * ad );
+
+		void setNormalProxy( Proxy * proxy );
+		void setDelegProxy( Proxy * proxy );
+		Proxy * getMasterProxy();
+
+		bool isStarted() { return server->m_gahp_pid != -1 && !server->m_gahp_startup_failed; }
+		bool isInitialized() { return server->is_initialized; }
+
+		StringList *getCommands() { return server->m_commands_supported; }
+
+	    void setErrorString( const std::string & newErrorString );
+		const char * getErrorString();
+
+		const char * getGahpStderr();
+		const char * getVersion();
+		const char * getCondorVersion();
+
+		enum PrioLevel {
+			low_prio,
+			medium_prio,
+			high_prio
+		};
+
+		// The caller must delete 'result' if it isn't NULL.
+		int callGahpFunction(
+			const char * command,
+			const std::vector< YourString > & arguments,
+			Gahp_Args * & result,
+			PrioLevel priority = medium_prio );
+
+	protected:
+		void clear_pending();
+		bool is_pending( const char *command, const char *buf );
+		void now_pending (const char *command,const char *buf,
+						 GahpProxyInfo *proxy = NULL,
+						 PrioLevel prio_level = medium_prio );
+		Gahp_Args * get_pending_result( const char *, const char * );
+		bool check_pending_timeout( const char *, const char * );
+		int reset_user_timer( int tid );
+		void reset_user_timer_alarm();
+
+		unsigned int m_timeout;
+		mode m_mode;
+		char * pending_command;
+		char * pending_args;
+		int pending_reqid;
+		Gahp_Args * pending_result;
+		time_t pending_timeout;
+		int pending_timeout_tid;
+		time_t pending_submitted_to_gahp;
+		int user_timerid;
+		GahpProxyInfo * normal_proxy;
+		GahpProxyInfo * deleg_proxy;
+		GahpProxyInfo * pending_proxy;
+		std::string error_string;
+
+		// Used in now_pending(), not worth rewriting to get rid of for now.
+		BoincResource *m_boincResource;
+
+		GahpServer * server;
+};
+
+
+class GahpClient : public GenericGahpClient {
+	// Hopefully not necessary.
+	// friend class GahpServer;
+
 	public:
 		
 		/** @name Instantiation. 
@@ -236,106 +361,7 @@ class GahpClient : public Service {
 		
 		//@}
 
-		///
-		bool Startup();
-
-		///
-		bool Initialize(Proxy *proxy);
-
-		bool CreateSecuritySession();
-
-		///
-		void purgePendingRequests() { clear_pending(); }
-
-		// Return true if this GahpClient has a pending request that has
-		// been issued to the GAHP server (and possibly a result returned
-		// waiting to be collected).
-		bool pendingRequestIssued() { return pending_submitted_to_gahp || pending_result; }
-
-		/** @name Mode methods.
-		 * Methods to set/get the mode.
-		 */
-		//@{
-	
-		/// Enum used by setMode() method
-		enum mode {
-				/** */ normal,
-				/** */ results_only,
-				/** */ blocking
-		};
-
-		/**
-		*/
-		void setMode( mode m ) { m_mode = m; }
-
-		/**
-		*/
-		mode getMode() { return m_mode; }
-	
-		//@}
-
-		/** @name Timeout methods.
-		 * Methods to set/get the timeout on pending async commands.
-		 */
-		//@{
-	
-		/** Set the timeout.
-			@param t timeout in seconds, or zero to disable timeouts.
-			@see getTimeout
-		*/
-		void setTimeout(int t) { m_timeout = t; }
-
-		/** Get the currently timeout value.
-			@return timeout in seconds, or zero if no timeout set.
-			@see setTimeout
-		*/
-		unsigned int getTimeout() { return m_timeout; }
-	
-		//@}
-
-		/** @name Async results methods.
-		   Methods to control how to fetch and/or be notified about
-		   pending asynchronous results.
-		 */
-		//@{
-		
-		/** Reset the specified timer to go off immediately when a
-			pending command has completed.
-			@param tid The timer id to reset via DaemonCore's Reset_Timer 
-			method, or a -1 to disable.
-			@see Reset_Timer
-			@see getNotificationTimerId
-		*/
-		void setNotificationTimerId(int tid) { user_timerid = tid; }
-
-		/** Return the timer id previously set with method 
-			setNotificationTimerId.
-			@param tid The timer id which will be reset via DaemonCore's 
-			Reset_Timer method, or a -1 if deactivated.
-			@see setNotificationTimerId
-			@see Reset_Timer
-		*/
-		int getNotificationTimerId() { return user_timerid; }
-
-		//@}
-
-		void setNormalProxy( Proxy *proxy );
-
-		void setDelegProxy( Proxy *proxy );
-
 		void setBoincResource( BoincResource *server );
-
-		Proxy *getMasterProxy();
-
-		bool isStarted() { return server->m_gahp_pid != -1 && !server->m_gahp_startup_failed; }
-		bool isInitialized() { return server->is_initialized; }
-
-		const char *getErrorString();
-		const char *getGahpStderr();
-
-		const char *getVersion();
-
-		const char *getCondorVersion();
 
 		int getSshForwardPort() { return server->m_ssh_forward_port; }
 
@@ -483,7 +509,13 @@ class GahpClient : public Service {
 		blah_upload_sandbox(const char *sandbox_id, const ClassAd *job_ad);
 
 		int
+		blah_download_proxy(const char *sandbox_id, const ClassAd *job_ad);
+
+		int
 		blah_destroy_sandbox(const char *sandbox_id, const ClassAd *job_ad);
+
+		bool
+		blah_get_sandbox_path(const char *sandbox_id, std::string &sandbox_path);
 
 		int
 		nordugrid_submit(const char *hostname, const char *rsl, char *&job_id);
@@ -582,153 +614,15 @@ class GahpClient : public Service {
 		
 		int cream_set_lease(const char *service, const char *lease_id, time_t &lease_expiry);
 
-		int ec2_vm_start( std::string service_url,
-						  std::string publickeyfile,
-						  std::string privatekeyfile,
-						  std::string ami_id,
-						  std::string keypair,
-						  std::string user_data,
-						  std::string user_data_file,
-						  std::string instance_type,
-						  std::string availability_zone,
-						  std::string vpc_subnet,
-						  std::string vpc_ip,
-						  std::string client_token,
-						  StringList & groupnames,
-						  std::string & instance_id,
-						  std::string & error_code );
-
-		int ec2_vm_stop( std::string service_url,
-						 std::string publickeyfile,
-						 std::string privatekeyfile,
-						 std::string instance_id,
-						 std::string & error_code );
-
-		int ec2_vm_status( std::string service_url,
-							  std::string publickeyfile,
-							  std::string privatekeyfile,
-							  std::string instance_id,
-							  StringList & returnStatus,
-							  std::string & error_code );
-
-		int ec2_vm_status_all( std::string service_url,
-							   std::string publickeyfile,
-							   std::string privatekeyfile,
-							   StringList & returnStatus,
-							   std::string & error_code );
-
-		int ec2_ping( std::string service_url,
-					  std::string publickeyfile,
-					  std::string privatekeyfile,
-					  std::string & error_code );
-
-		int ec2_vm_server_type( std::string service_url,
-								std::string publickeyfile,
-								std::string privatekeyfile,
-								std::string & server_type,
-								std::string & error_code );
-
-		int ec2_vm_create_keypair( std::string service_url,
-								   std::string publickeyfile,
-								   std::string privatekeyfile,
-								   std::string keyname,
-								   std::string outputfile,
-								   std::string & error_code );
-
-		int ec2_vm_destroy_keypair( std::string service_url,
-									std::string publickeyfile,
-									std::string privatekeyfile,
-									std::string keyname,
-									std::string & error_code );
-
-        /**
-         * Used to associate an elastic ip with a running instance
-         */
-        int ec2_associate_address(std::string service_url,
-                                  std::string publickeyfile,
-                                  std::string privatekeyfile,
-                                  std::string instance_id, 
-                                  std::string elastic_ip,
-                                  StringList & returnStatus,
-                                  std::string & error_code );
-
-		// Used to associate a tag with an resource, like a running instance
-        int ec2_create_tags(std::string service_url,
-							std::string publickeyfile,
-							std::string privatekeyfile,
-							std::string instance_id, 
-							StringList & tags,
-							StringList & returnStatus,
-							std::string & error_code );
-		
-        /**
-         * Used to release an elastic ip from an instance
-         * leaving around in case we ever need this. 
-         * shutdown causes automatic disassociation
-        int ec2_disassociate_address( const char * service_url,
-                                      const char * publickeyfile,
-                                      const char * privatekeyfile,
-                                      const char * elastic_ip,
-                                      StringList & returnStatus,
-                                      std::string & error_code ); */
-
-		/**
-		 * Used to attach to an ecs volume(s).
-		 */
-		int ec2_attach_volume(std::string service_url,
-                              std::string publickeyfile,
-                              std::string privatekeyfile,
-                              std::string volume_id,
-							  std::string instance_id, 
-                              std::string device_id,
-                              StringList & returnStatus,
-                              std::string & error_code );
-
-        // Is there a particular reason these aren't const references?
-        int ec2_spot_start( std::string service_url,
-                            std::string publickeyfile,
-                            std::string privatekeyfile,
-                            std::string ami_id,
-                            std::string spot_price,
-                            std::string keypair,
-                            std::string user_data,
-                            std::string user_data_file,
-                            std::string instance_type,
-                            std::string availability_zone,
-                            std::string vpc_subnet,
-                            std::string vpc_ip,
-                            std::string client_token,
-                            StringList & groupnames,
-                            std::string & request_id,
-                            std::string & error_code
-                          );
-        int ec2_spot_stop(  std::string service_url,
-                            std::string publickeyfile,
-                            std::string privatekeyfile,
-                            std::string request_id,
-                            std::string & error_code
-                         );
-        int ec2_spot_status(    std::string service_url,
-                                std::string publickeyfile,
-                                std::string privatekeyfile,
-                                std::string request_id,
-                                StringList & returnStatus,
-                                std::string & error_code
-                           );
-        int ec2_spot_status_all(    std::string service_url,
-                                    std::string publickeyfile,
-                                    std::string privatekeyfile,
-                                    StringList & returnStatus,
-                                    std::string & error_code
-                               );
-
 		int gce_ping( const std::string &service_url,
 					  const std::string &auth_file,
+					  const std::string &account,
 					  const std::string &project,
 					  const std::string &zone );
 
 		int gce_instance_insert( const std::string &service_url,
 								 const std::string &auth_file,
+								 const std::string &account,
 								 const std::string &project,
 								 const std::string &zone,
 								 const std::string &instance_name,
@@ -736,16 +630,21 @@ class GahpClient : public Service {
 								 const std::string &image,
 								 const std::string &metadata,
 								 const std::string &metadata_file,
+								 bool preemptible,
+								 const std::string &json_file,
+								 const std::vector< std::pair< std::string, std::string > > & labels,
 								 std::string &instance_id );
 
 		int gce_instance_delete( std::string service_url,
 								 const std::string &auth_file,
+								 const std::string &account,
 								 const std::string &project,
 								 const std::string &zone,
 								 const std::string &instance_name );
 
 		int gce_instance_list( const std::string &service_url,
 							   const std::string &auth_file,
+							   const std::string &account,
 							   const std::string &project,
 							   const std::string &zone,
 							   StringList &instance_ids,
@@ -753,61 +652,22 @@ class GahpClient : public Service {
 							   StringList &statuses,
 							   StringList &status_msgs );
 
-		int
-		dcloud_submit( const char *service_url,
-					   const char *username,
-					   const char *password,
-					   const char *image_id,
-					   const char *instance_name,
-					   const char *realm_id,
-					   const char *hwp_id,
-					   const char *hwp_memory,
-					   const char *hwp_cpu,
-					   const char *hwp_storage,
-					   const char *keyname,
-					   const char *userdata,
-					   StringList &attrs );
+		int azure_ping( const std::string &auth_file,
+		                const std::string &subscription );
 
-		int
-		dcloud_status_all( const char *service_url,
-						   const char *username,
-						   const char *password,
-						   StringList &instance_ids,
-						   StringList &statuses );
+		int azure_vm_create( const std::string &auth_file,
+		                     const std::string &subscription,
+		                     StringList &vm_params, std::string &vm_id,
+		                     std::string &ip_address );
 
-		int
-		dcloud_action( const char *service_url,
-					   const char *username,
-					   const char *password,
-					   const char *instance_id,
-					   const char *action );
+		int azure_vm_delete( const std::string &auth_file,
+		                     const std::string &subscription,
+		                     const std::string &vm_name );
 
-		int
-		dcloud_info( const char *service_url,
-					 const char *username,
-					 const char *password,
-					 const char *instance_id,
-					 StringList &attrs );
-
-		int
-		dcloud_find( const char *service_url,
-					 const char *username,
-					 const char *password,
-					 const char *instance_name,
-					 char **instance_id );
-
-
-		int
-		dcloud_get_max_name_length( const char *service_url,
-									const char *username,
-									const char *password,
-									int *max_length );
-
-		int
-		dcloud_start_auto( const char *service_url,
-						   const char *username,
-						   const char *password,
-						   bool *autostart );
+		int azure_vm_list( const std::string &auth_file,
+		                   const std::string &subscription,
+		                   StringList &vm_names,
+		                   StringList &vm_statuses );
 
 		int boinc_ping();
 
@@ -852,51 +712,330 @@ class GahpClient : public Service {
 
 		//@}
 
-    void setErrorString( const std::string & newErrorString );
-
 	private:
-
-	/// Enum used by now_pending for the waiting queues
-	enum PrioLevel {
-		/** */ low_prio,
-		/** */ medium_prio,
-		/** */ high_prio
-	};
-
-			// Various Private Methods
-		void clear_pending();
-		bool is_pending(const char *command, const char *buf);
-		void now_pending(const char *command,const char *buf,
-						 GahpProxyInfo *proxy = NULL,
-						 PrioLevel prio_level = medium_prio);
-		Gahp_Args* get_pending_result(const char *,const char *);
-		bool check_pending_timeout(const char *,const char *);
-		int reset_user_timer(int tid);
-		void reset_user_timer_alarm();
-
-			// Private Data Members
-		unsigned int m_timeout;
-		mode m_mode;
-		char *pending_command;
-		char *pending_args;
-		int pending_reqid;
-		Gahp_Args* pending_result;
-		time_t pending_timeout;
-		int pending_timeout_tid;
-		bool pending_submitted_to_gahp;
-		int user_timerid;
-		GahpProxyInfo *normal_proxy;
-		GahpProxyInfo *deleg_proxy;
-		GahpProxyInfo *pending_proxy;
-		BoincResource *m_boincResource;
-		std::string error_string;
-
-			// These data members all deal with the GAHP
-			// server.  Since there is only one instance of the GAHP
-			// server, all the below data members are static.
-		GahpServer *server;
 
 };	// end of class GahpClient
 
+class EC2GahpClient : public GahpClient {
+	public:
+
+		EC2GahpClient(	const char * id, const char * path, const ArgList * args );
+		~EC2GahpClient();
+
+		int describe_stacks(	const std::string & service_url,
+								const std::string & publickeyfile,
+								const std::string & privatekeyfile,
+
+								const std::string & stackName,
+
+								std::string & stackStatus,
+								std::map< std::string, std::string > & outputs,
+								std::string & errorCode );
+
+		int create_stack(	const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & stackName,
+							const std::string & templateURL,
+							const std::string & capability,
+							const std::map< std::string, std::string > & parameters,
+
+							std::string & stackID,
+							std::string & errorCode );
+
+		int get_function(	const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & functionARN,
+
+							std::string & functionHash,
+							std::string & errorCode );
+
+		int call_function(	const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & functionARN,
+							const std::string & argumentBlob,
+
+							std::string & returnBlob,
+							std::string & errorCode );
+
+		int put_targets(	const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & ruleName,
+							const std::string & id,
+							const std::string & arn,
+							const std::string & input,
+
+							std::string & errorCode );
+
+		int remove_targets(	const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & ruleName,
+							const std::string & id,
+
+							std::string & errorCode );
+
+		int put_rule(		const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & ruleName,
+							const std::string & scheduleExpression,
+							const std::string & state,
+
+							std::string & ruleARN,
+							std::string & error_code );
+
+		int delete_rule(	const std::string & service_url,
+							const std::string & publickeyfile,
+							const std::string & privatekeyfile,
+
+							const std::string & ruleName,
+
+							std::string & error_code );
+
+		struct LaunchConfiguration {
+			YourString ami_id;
+			YourString spot_price;
+			YourString keypair;
+			YourString user_data;
+			YourString instance_type;
+			YourString availability_zone;
+			YourString vpc_subnet;
+			YourString block_device_mapping;
+			YourString iam_profile_arn;
+			YourString iam_profile_name;
+			StringList * groupnames;
+			StringList * groupids;
+
+			YourString weighted_capacity;
+
+			LaunchConfiguration() : groupnames( NULL ), groupids( NULL ) { }
+			LaunchConfiguration(	YourString a, YourString b, YourString c,
+									YourString d, YourString f,
+									YourString g, YourString h,
+									YourString j, YourString k,
+									YourString l,
+									StringList * m, StringList * n,
+									YourString o ) :
+					ami_id( a ), spot_price( b ), keypair( c ),
+					user_data( d ), instance_type( f ),
+					availability_zone( g ), vpc_subnet( h ),
+					block_device_mapping( j ), iam_profile_arn( k ),
+					iam_profile_name( l ),
+					groupnames( m ), groupids( n ),
+					weighted_capacity( o ) { }
+
+			void convertToJSON( std::string & s ) const;
+		};
+
+		int s3_upload(	const std::string & service_url,
+						const std::string & publickeyfile,
+						const std::string & privatekeyfile,
+
+						const std::string & bucketName,
+						const std::string & fileName,
+						const std::string & path,
+
+						std::string & error_code );
+
+		int bulk_start(	const std::string & service_url,
+						const std::string & publickeyfile,
+						const std::string & privatekeyfile,
+
+						const std::string & client_token,
+						const std::string & spot_price,
+						const std::string & target_capacity,
+						const std::string & iam_fleet_role,
+						const std::string & allocation_strategy,
+						const std::string & valid_until,
+
+						const std::vector< LaunchConfiguration > & launch_configurations,
+
+						std::string & bulkRequestID,
+						std::string & error_code );
+
+		int bulk_start(	const std::string & service_url,
+						const std::string & publickeyfile,
+						const std::string & privatekeyfile,
+
+						const std::string & client_token,
+						const std::string & spot_price,
+						const std::string & target_capacity,
+						const std::string & iam_fleet_role,
+						const std::string & allocation_strategy,
+						const std::string & valid_until,
+
+						const std::vector< std::string > & launch_configurations,
+
+						std::string & bulkRequestID,
+						std::string & error_code );
+
+		int bulk_stop(	const std::string & service_url,
+						const std::string & publickeyfile,
+						const std::string & privatekeyfile,
+
+						const std::string & bulkRequestID,
+
+						std::string & error_code );
+
+		int bulk_query(	const std::string & service_url,
+						const std::string & publickeyfile,
+						const std::string & privatekeyfile,
+
+						StringList & returnStatus,
+						std::string & error_code );
+
+		int ec2_vm_start( const std::string & service_url,
+						  const std::string & publickeyfile,
+						  const std::string & privatekeyfile,
+						  const std::string & ami_id,
+						  const std::string & keypair,
+						  const std::string & user_data,
+						  const std::string & user_data_file,
+						  const std::string & instance_type,
+						  const std::string & availability_zone,
+						  const std::string & vpc_subnet,
+						  const std::string & vpc_ip,
+						  const std::string & client_token,
+						  const std::string & block_device_mapping,
+						  const std::string & iam_profile_arn,
+						  const std::string & iam_profile_name,
+						  unsigned int maxCount,
+						  StringList & groupnames,
+						  StringList & groupids,
+						  StringList & parametersAndValues,
+						  std::vector< std::string > & instance_ids,
+						  std::string & error_code );
+
+		int ec2_vm_stop( const std::string & service_url,
+						 const std::string & publickeyfile,
+						 const std::string & privatekeyfile,
+						 const std::string & instance_id,
+						 std::string & error_code );
+
+		int ec2_vm_stop( const std::string & service_url,
+						 const std::string & publickeyfile,
+						 const std::string & privatekeyfile,
+						 const std::vector< std::string > & instance_ids,
+						 std::string & error_code );
+
+		int ec2_vm_status_all( const std::string & service_url,
+							   const std::string & publickeyfile,
+							   const std::string & privatekeyfile,
+							   StringList & returnStatus,
+							   std::string & error_code );
+
+		int ec2_vm_status_all( const std::string & service_url,
+							   const std::string & publickeyfile,
+							   const std::string & privatekeyfile,
+							   const std::string & filterName,
+							   const std::string & filterValue,
+							   StringList & returnStatus,
+							   std::string & error_code );
+
+		int ec2_gahp_statistics( StringList & returnStatistics );
+
+		int ec2_ping( const std::string & service_url,
+					  const std::string & publickeyfile,
+					  const std::string & privatekeyfile,
+					  std::string & error_code );
+
+		int ec2_vm_server_type( const std::string & service_url,
+								const std::string & publickeyfile,
+								const std::string & privatekeyfile,
+								std::string & server_type,
+								std::string & error_code );
+
+		int ec2_vm_create_keypair( const std::string & service_url,
+								   const std::string & publickeyfile,
+								   const std::string & privatekeyfile,
+								   const std::string & keyname,
+								   const std::string & outputfile,
+								   std::string & error_code );
+
+		int ec2_vm_destroy_keypair( const std::string & service_url,
+									const std::string & publickeyfile,
+									const std::string & privatekeyfile,
+									const std::string & keyname,
+									std::string & error_code );
+
+        /**
+         * Used to associate an elastic ip with a running instance
+         */
+        int ec2_associate_address( const std::string & service_url,
+                                   const std::string & publickeyfile,
+                                   const std::string & privatekeyfile,
+                                   const std::string & instance_id,
+                                   const std::string & elastic_ip,
+                                   StringList & returnStatus,
+                                   std::string & error_code );
+
+		// Used to associate a tag with an resource, like a running instance
+        int ec2_create_tags( const std::string & service_url,
+							 const std::string & publickeyfile,
+							 const std::string & privatekeyfile,
+							 const std::string & instance_id,
+							 StringList & tags,
+							 StringList & returnStatus,
+							 std::string & error_code );
+
+		/**
+		 * Used to attach to an EBS volume(s).
+		 */
+		int ec2_attach_volume( const std::string & service_url,
+                               const std::string & publickeyfile,
+                               const std::string & privatekeyfile,
+                               const std::string & volume_id,
+							   const std::string & instance_id,
+                               const std::string & device_id,
+                               StringList & returnStatus,
+                               std::string & error_code );
+
+        // Is there a particular reason these aren't const references?
+        int ec2_spot_start( const std::string & service_url,
+                            const std::string & publickeyfile,
+                            const std::string & privatekeyfile,
+                            const std::string & ami_id,
+                            const std::string & spot_price,
+                            const std::string & keypair,
+                            const std::string & user_data,
+                            const std::string & user_data_file,
+                            const std::string & instance_type,
+                            const std::string & availability_zone,
+                            const std::string & vpc_subnet,
+                            const std::string & vpc_ip,
+                            const std::string & client_token,
+                            const std::string & iam_profile_arn,
+                            const std::string & iam_profile_name,
+                            StringList & groupnames,
+                            StringList & groupids,
+                            std::string & request_id,
+                            std::string & error_code );
+
+        int ec2_spot_stop( const std::string & service_url,
+                           const std::string & publickeyfile,
+                           const std::string & privatekeyfile,
+                           const std::string & request_id,
+                           std::string & error_code );
+
+        int ec2_spot_status_all( const std::string & service_url,
+                                 const std::string & publickeyfile,
+                                 const std::string & privatekeyfile,
+                                 StringList & returnStatus,
+                                 std::string & error_code );
+};
+
+// Utility functions used all over the GAHP client code.
+const char * escapeGahpString( const char * input );
+const char * escapeGahpString( const std::string & input );
 
 #endif /* ifndef CONDOR_GAHP_CLIENT_H */

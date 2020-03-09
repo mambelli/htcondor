@@ -78,7 +78,7 @@ void SystemInfoUtils::LPCWSTR2MyString( LPCWSTR strW, MyString& str )
 	if ( actChar == '\0' )
 		return;
 
-	ULONG len = wcslen(strW) + 1;
+	size_t len = wcslen(strW) + 1;
 	TCHAR* pBuffer = new TCHAR[ len ];
 	TCHAR* pNewStr = pBuffer;
 
@@ -302,7 +302,7 @@ BOOL INtDll::Init()
 //
 //////////////////////////////////////////////////////////////////////////////////////
 
-unsigned int hashFunction ( const DWORD &key ) {
+size_t hashFunction ( const DWORD &key ) {
 	// just use the process id
 	return key;
 }
@@ -515,6 +515,7 @@ BOOL SystemHandleInformation::Refresh()
 				pSysHandleInformation->Handles[i].HandleType = (WORD)(pSysHandleInformation->Handles[i].HandleType % 256);
 				
 				SYSTEM_HANDLE* ptmp = (SYSTEM_HANDLE*)VirtualAlloc ( NULL, sizeof ( SYSTEM_HANDLE ), MEM_COMMIT, PAGE_READWRITE );
+				ASSERT(ptmp);
 				memcpy ( ptmp, &pSysHandleInformation->Handles[i], sizeof ( SYSTEM_HANDLE ) );
 				m_HandleInfos.Append ( ptmp );
 

@@ -29,6 +29,8 @@
 //#include "ReplicationCommands.h"
 #include "FilesOperations.h"
 
+#include "ipv6_hostname.h"
+
 // multiplicative factor, determining how long the active HAD, that does not 
 // send the messages to the replication daemon, is considered alive
 #define HAD_ALIVE_TOLERANCE_FACTOR      (2)
@@ -103,9 +105,9 @@ ReplicatorStateMachine::finalizeDelta( )
 
     SetMyTypeName( invalidate_ad, QUERY_ADTYPE );
     SetTargetTypeName( invalidate_ad, "Replication" );
-    line.formatstr( "TARGET.%s == \"%s\"", ATTR_NAME, m_name.Value( ) );
+    line.formatstr( "%s == \"%s\"", ATTR_NAME, m_name.c_str( ) );
     invalidate_ad.AssignExpr( ATTR_REQUIREMENTS, line.Value( ) );
-	invalidate_ad.Assign( ATTR_NAME, m_name.Value() );
+	invalidate_ad.Assign( ATTR_NAME, m_name );
     daemonCore->sendUpdates( INVALIDATE_ADS_GENERIC, &invalidate_ad, NULL, false );
 }
 void
@@ -121,6 +123,7 @@ ReplicatorStateMachine::initialize( )
     registerCommand(HAD_IN_LEADER_STATE);
     registerCommand(REPLICATION_LEADER_VERSION);
     registerCommand(REPLICATION_TRANSFER_FILE);
+    registerCommand(REPLICATION_TRANSFER_FILE_NEW);
     registerCommand(REPLICATION_NEWLY_JOINED_VERSION);
     registerCommand(REPLICATION_GIVING_UP_VERSION);
     registerCommand(REPLICATION_SOLICIT_VERSION);
@@ -194,13 +197,13 @@ ReplicatorStateMachine::reinitialize()
     if( m_downloadReaperId == -1 ) {
 		m_downloadReaperId = daemonCore->Register_Reaper(
         	"downloadReplicaTransfererReaper",
-        (ReaperHandler)&ReplicatorStateMachine::downloadReplicaTransfererReaper,
+        (ReaperHandlercpp)&ReplicatorStateMachine::downloadReplicaTransfererReaper,
         	"downloadReplicaTransfererReaper", this );
 	}
     if( m_uploadReaperId == -1 ) {
 		m_uploadReaperId = daemonCore->Register_Reaper(
         	"uploadReplicaTransfererReaper",
-        (ReaperHandler) &ReplicatorStateMachine::uploadReplicaTransfererReaper,
+        (ReaperHandlercpp) &ReplicatorStateMachine::uploadReplicaTransfererReaper,
         	"uploadReplicaTransfererReaper", this );
     }
 	// for debugging purposes only
@@ -222,21 +225,21 @@ ReplicatorStateMachine::initializeClassAd()
     SetMyTypeName(*m_classAd, "Replication");
     SetTargetTypeName(*m_classAd, "");
 
-    m_name.formatstr( "replication@%s -p %d", my_full_hostname( ),
+    formatstr( m_name, "replication@%s -p %d", get_local_fqdn().Value(),
 				  daemonCore->InfoCommandPort( ) );
-    m_classAd->Assign( ATTR_NAME, m_name.Value( ) );
+    m_classAd->Assign( ATTR_NAME, m_name );
     m_classAd->Assign( ATTR_MY_ADDRESS,
 					   daemonCore->InfoCommandSinfulString( ) );
 
     // publish list of replication nodes
     char* buffer = param( "REPLICATION_LIST" );
 	if ( NULL == buffer ) {
-		EXCEPT( "ReplicatorStateMachine: No replication list!!\n" );
+		EXCEPT( "ReplicatorStateMachine: No replication list!!" );
 	}
     char* replAddress = NULL;
     StringList replList;
-    MyString attrReplList;
-    MyString comma;
+    std::string attrReplList;
+    std::string comma;
 
     replList.initializeFromString( buffer );
     replList.rewind( );
@@ -246,7 +249,7 @@ ReplicatorStateMachine::initializeClassAd()
         attrReplList += replAddress;
         comma = ",";
     }
-    m_classAd->Assign( ATTR_REPLICATION_LIST, attrReplList.Value( ) );
+    m_classAd->Assign( ATTR_REPLICATION_LIST, attrReplList );
 
     // publish DC attributes
     daemonCore->publish(m_classAd);
@@ -517,7 +520,11 @@ ReplicatorStateMachine::onLeaderVersion( Stream* stream )
         dprintf( D_FULLDEBUG, "ReplicatorStateMachine::onLeaderVersion "
 				"downloading from %s\n", 
 				newVersion->getSinfulString( ).Value( ) );
-        download( newVersion->getSinfulString( ).Value( ) );
+		if ( newVersion->knowsNewTransferProtocol() ) {
+			downloadNew( newVersion->getSinfulString( ).Value( ) );
+		} else {
+			download( newVersion->getSinfulString( ).Value( ) );
+		}
     }
     // replication leader must not send a version which hasn't been updated
     //assert(downloadNeeded);
@@ -539,6 +546,15 @@ ReplicatorStateMachine::onTransferFile( char* daemonSinfulString )
         upload( daemonSinfulString );
     }
 }
+void
+ReplicatorStateMachine::onTransferFileNew( Stream *stream )
+{
+	dprintf( D_ALWAYS, "ReplicatorStateMachine::onTransferFileNew started\n" );
+	if( m_state == REPLICATION_LEADER ) {
+		uploadNew( stream );
+	}
+}
+
 /* Function   : onSolicitVersion
  * Arguments  : daemonSinfulString - the address of remote replication daemon,
  *              which sent the REPLICATION_SOLICIT_VERSION command 
@@ -609,13 +625,12 @@ ReplicatorStateMachine::onGivingUpVersion( Stream* /*stream*/ )
 
 int
 ReplicatorStateMachine::downloadReplicaTransfererReaper(
-	Service* service, int pid, int exitStatus)
+	int pid, int exitStatus)
 {
     ReplicatorStateMachine* replicatorStateMachine =
-    	static_cast<ReplicatorStateMachine*>( service );
+    	static_cast<ReplicatorStateMachine*>( this );
     int returnValue = AbstractReplicatorStateMachine::
-						downloadReplicaTransfererReaper(service, 
-														pid, 
+						downloadReplicaTransfererReaper(pid, 
 														exitStatus);
     if( returnValue == TRANSFERER_TRUE && 
 		replicatorStateMachine->m_state == VERSION_DOWNLOADING ) {
@@ -629,7 +644,7 @@ ReplicatorStateMachine::downloadReplicaTransfererReaper(
 						  arrived
  * Description: handles various commands sent to this replication daemon
  */
-void
+int
 ReplicatorStateMachine::commandHandler( int command, Stream* stream )
 {
     char* daemonSinfulString = 0;
@@ -641,15 +656,15 @@ ReplicatorStateMachine::commandHandler( int command, Stream* stream )
 	{
         dprintf( D_NETWORK, "ReplicatorStateMachine::commandHandler "
                             "cannot read remote daemon sinful string for %s\n",
-                 utilToString( command ) );
+                 getCommandStringSafe( command ) );
 	    free( daemonSinfulString );
 
-		return;
+		return FALSE;
     }
 
     dprintf( /*D_COMMAND*/
              D_FULLDEBUG, "ReplicatorStateMachine::commandHandler received "
-			"command %s from %s\n", utilToString(command), daemonSinfulString );
+			"command %s from %s\n", getCommandStringSafe(command), daemonSinfulString );
     switch( command ) {
         case REPLICATION_LEADER_VERSION:
             onLeaderVersion( stream );
@@ -658,6 +673,9 @@ ReplicatorStateMachine::commandHandler( int command, Stream* stream )
         case REPLICATION_TRANSFER_FILE:
             onTransferFile( daemonSinfulString );
             
+            break;
+        case REPLICATION_TRANSFER_FILE_NEW:
+            onTransferFileNew( stream );
             break;
         case REPLICATION_SOLICIT_VERSION:
             onSolicitVersion( daemonSinfulString );
@@ -698,6 +716,7 @@ ReplicatorStateMachine::commandHandler( int command, Stream* stream )
         dprintf( D_NETWORK, "ReplicatorStateMachine::commandHandler "
                             "cannot read the end of the message\n" );
     }
+    return FALSE;
 }
 /* Function   : registerCommand 
  * Arguments  : command - id to register
@@ -707,7 +726,7 @@ void
 ReplicatorStateMachine::registerCommand(int command)
 {
     daemonCore->Register_Command(
-        command, const_cast<char*>( utilToString( command ) ),
+        command, getCommandStringSafe( command ),
         (CommandHandlercpp) &ReplicatorStateMachine::commandHandler,
         "commandHandler", this, DAEMON );
 }
@@ -742,11 +761,11 @@ ReplicatorStateMachine::killStuckDownloadingTransferer( time_t currentTime )
 		// when the process is killed, it could have not yet erased its
 		// temporary files, this is why we ensure it by erasing it in killer
 		// function
-		MyString extension( m_downloadTransfererMetadata.m_pid );
+		MyString extension;
         // the .down ending is needed in order not to confuse between upload and
         // download processes temporary files
-        extension += ".";
-        extension += DOWNLOADING_TEMPORARY_FILES_EXTENSION;
+		formatstr( extension, "%d.%s", m_downloadTransfererMetadata.m_pid,
+		           DOWNLOADING_TEMPORARY_FILES_EXTENSION );
 
         FilesOperations::safeUnlinkFile( m_versionFilePath.Value( ),
                                          extension.Value( ) );
@@ -787,11 +806,11 @@ ReplicatorStateMachine::killStuckUploadingTransferers( time_t currentTime )
 			// when the process is killed, it could have not yet erased its
         	// temporary files, this is why we ensure it by erasing it in killer
         	// function	
-			MyString extension( uploadTransfererMetadata->m_pid );
+			MyString extension;
             // the .up ending is needed in order not to confuse between
             // upload and download processes temporary files
-            extension += ".";
-            extension += UPLOADING_TEMPORARY_FILES_EXTENSION;
+			formatstr( extension, "%d.%s", uploadTransfererMetadata->m_pid,
+			           UPLOADING_TEMPORARY_FILES_EXTENSION );
 
             FilesOperations::safeUnlinkFile( m_versionFilePath.Value( ),
                                              extension.Value( ) );
@@ -884,7 +903,11 @@ ReplicatorStateMachine::versionRequestingTimer( )
     Version updatedVersion;
 
     if( replicaSelectionHandler( updatedVersion ) ) {
-        download( updatedVersion.getSinfulString( ).Value( ) );
+		if ( updatedVersion.knowsNewTransferProtocol() ) {
+			downloadNew( updatedVersion.getSinfulString( ).Value( ) );
+		} else {
+			download( updatedVersion.getSinfulString( ).Value( ) );
+		}
         dprintf( D_FULLDEBUG, "ReplicatorStateMachine::versionRequestingTimer "
 				"registering version downloading timer\n" );
         m_versionDownloadingTimerId = daemonCore->Register_Timer( 

@@ -36,7 +36,9 @@
 #include "jic_local_file.h"
 #include "jic_local_schedd.h"
 #include "vm_proc.h"
+#include "docker_proc.h"
 #include "condor_getcwd.h"
+#include "singularity.h"
 
 
 extern "C" int exception_cleanup(int,int,const char*);	/* Our function called by EXCEPT */
@@ -59,6 +61,7 @@ static int starter_stdin_fd = -1;
 static int starter_stdout_fd = -1;
 static int starter_stderr_fd = -1;
 
+[[noreturn]]
 static void PREFAST_NORETURN
 usage()
 {
@@ -84,11 +87,14 @@ printClassAd( void )
 	printf( "%s = \"%s\"\n", ATTR_VERSION, CondorVersion() );
 	printf( "%s = True\n", ATTR_IS_DAEMON_CORE );
 	printf( "%s = True\n", ATTR_HAS_FILE_TRANSFER );
+	printf( "%s = True\n", ATTR_HAS_JOB_TRANSFER_PLUGINS );	 // job supplied transfer plugins
 	printf( "%s = True\n", ATTR_HAS_PER_FILE_ENCRYPTION );
 	printf( "%s = True\n", ATTR_HAS_RECONNECT );
 	printf( "%s = True\n", ATTR_HAS_MPI );
 	printf( "%s = True\n", ATTR_HAS_TDP );
 	printf( "%s = True\n", ATTR_HAS_JOB_DEFERRAL );
+    printf( "%s = True\n", ATTR_HAS_TRANSFER_INPUT_REMAPS );
+    printf( "%s = True\n", ATTR_HAS_SELF_CHECKPOINT_TRANSFERS );
 
 		/*
 		  Attributes describing what kinds of Job Info Communicators
@@ -137,11 +143,37 @@ printClassAd( void )
 	if( VMProc::vm_univ_detect() ) {
 		// This doesn't mean that vm universe is really available.
 		// This just means that starter has codes for vm universe.
-		// Actual testing for vm universe will be 
+		// Actual testing for vm universe will be
 		//  done by vmuniverse manager in startd.
 		// ATTR_HAS_VM may be overwritten by vmuniverse manager in startd
-		printf( "%s = True\n",ATTR_HAS_VM);		
+		printf( "%s = True\n",ATTR_HAS_VM );
 	}
+
+	// Docker "universe."
+	if( DockerProc::Detect() ) {
+		printf( "%s = True\n", ATTR_HAS_DOCKER );
+
+		std::string dockerVersion;
+		if( DockerProc::Version( dockerVersion ) ) {
+			printf( "%s = \"%s\"\n", ATTR_DOCKER_VERSION, dockerVersion.c_str() );
+		}
+	}
+
+	// Singularity support
+	if (htcondor::Singularity::enabled()) {
+		printf("%s = True\n", ATTR_HAS_SINGULARITY);
+		printf("%s = \"%s\"\n", ATTR_SINGULARITY_VERSION, htcondor::Singularity::version());
+	}
+
+	// Detect ability to encrypt execute directory
+#ifdef LINUX
+	if ( FilesystemRemap::EncryptedMappingDetect() ) {
+		printf( "%s = True\n", ATTR_HAS_ENCRYPT_EXECUTE_DIRECTORY );
+	}
+#endif
+#ifdef WIN32
+	printf( "%s = True\n", ATTR_HAS_ENCRYPT_EXECUTE_DIRECTORY );
+#endif
 
 	// Advertise which file transfer plugins are supported
 	FileTransfer ft;
@@ -319,7 +351,8 @@ parseArgs( int argc, char* argv [] )
 {
 	JobInfoCommunicator* jic = NULL;
 	char* job_input_ad = NULL; 
-	char* job_output_ad = NULL; 
+	char* job_output_ad = NULL;
+	char* job_update_ad = NULL;
 	char* job_keyword = NULL; 
 	int job_cluster = -1;
 	int job_proc = -1;
@@ -333,6 +366,7 @@ parseArgs( int argc, char* argv [] )
 	bool warn_multi_keyword = false;
 	bool warn_multi_input_ad = false;
 	bool warn_multi_output_ad = false;
+	bool warn_multi_update_ad = false;
 	bool warn_multi_cluster = false;
 	bool warn_multi_proc = false;
 	bool warn_multi_subproc = false;
@@ -345,6 +379,7 @@ parseArgs( int argc, char* argv [] )
 
 	char _jobinputad[] = "-job-input-ad";
 	char _joboutputad[] = "-job-output-ad";
+	char _jobupdatead[] = "-job-update-ad";
 	char _jobkeyword[] = "-job-keyword";
 	char _jobcluster[] = "-job-cluster";
 	char _jobproc[] = "-job-proc";
@@ -377,6 +412,9 @@ parseArgs( int argc, char* argv [] )
 		if( ! strncmp(opt, _header, opt_len) ) { 
 			if( ! arg ) {
 				another( _header );
+			}
+			if (dprintf_header) {
+				free(dprintf_header);
 			}
 			dprintf_header = strdup( arg );
 			DebugId = display_dprintf_header;
@@ -447,6 +485,13 @@ parseArgs( int argc, char* argv [] )
 			target = _joboutputad;
 			break;
 
+		case 'u':
+			if( strncmp(_jobupdatead, opt, opt_len) ) {
+				invalid( opt );
+			}
+			target = _jobupdatead;
+			break;
+
 		case 'p':
 			if( strncmp(_jobproc, opt, opt_len) ) {
 				invalid( opt );
@@ -504,6 +549,12 @@ parseArgs( int argc, char* argv [] )
 				free( job_output_ad );
 			}
 			job_output_ad = strdup( arg );
+		} else if( target == _jobupdatead ) {
+			if( job_update_ad ) {
+				warn_multi_update_ad = true;
+				free( job_update_ad );
+			}
+			job_update_ad = strdup( arg );
 		} else if( target == _jobstdin ) {
 			if( job_stdin ) {
 				warn_multi_stdin = true;
@@ -595,6 +646,11 @@ parseArgs( int argc, char* argv [] )
 				 "multiple '%s' options given, using \"%s\"\n",
 				 _joboutputad, job_output_ad );
 	}
+	if( warn_multi_update_ad ) {
+		dprintf( D_ALWAYS, "WARNING: "
+				 "multiple '%s' options given, using \"%s\"\n",
+				 _jobupdatead, job_update_ad );
+	}
 	if( warn_multi_stdin ) {
 		dprintf( D_ALWAYS, "WARNING: "
 				 "multiple '%s' options given, using \"%s\"\n",
@@ -642,9 +698,11 @@ parseArgs( int argc, char* argv [] )
 		shadow_host = NULL;
 		free( schedd_addr );
 		free( job_output_ad );
+		free( job_update_ad );
 		free( job_stdin );
 		free( job_stdout );
 		free( job_stderr );
+		if (job_keyword) { free(job_keyword); }
 		return jic;
 	}
 
@@ -688,6 +746,10 @@ parseArgs( int argc, char* argv [] )
         jic->setOutputAdFile( job_output_ad );		
 		free( job_output_ad );
 	}
+	if( job_update_ad ) {
+		jic->setUpdateAdFile( job_update_ad );
+		free( job_update_ad );
+	}
 	if( job_stdin ) {
         jic->setStdin( job_stdin );		
 		free( job_stdin );
@@ -720,7 +782,7 @@ main_shutdown_fast()
 	if ( Starter->RemoteShutdownFast(0) ) {
 		// ShutdownFast says it is already finished, because there are
 		// no jobs to shutdown.  No need to stick around.
-		Starter->StarterExit(0);
+		Starter->StarterExit(Starter->GetShutdownExitCode());
 	}
 }
 
@@ -731,7 +793,7 @@ main_shutdown_graceful()
 	if ( Starter->RemoteShutdownGraceful(0) ) {
 		// ShutdownGraceful says it is already finished, because
 		// there are no jobs to shutdown.  No need to stick around.
-		Starter->StarterExit(0);
+		Starter->StarterExit(Starter->GetShutdownExitCode());
 	}
 }
 

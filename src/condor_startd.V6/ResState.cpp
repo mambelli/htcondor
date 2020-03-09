@@ -149,9 +149,6 @@ ResState::change( State new_state, Activity new_act )
 		return;
 	}
 
-		// Update resource availability statistics on state changes
-	rip->r_avail_stats.update( r_state, r_act );
-	
 		// Note our current state and activity in the classad
 	this->publish( rip->r_classad, A_ALL );
 
@@ -251,8 +248,20 @@ ResState::eval( void )
 					// change to the preempting state.
 				if( rip->isDraining() ) {
 					rip->setBadputCausedByDraining();
+				} else {
+					rip->setBadputCausedByPreemption();
 				}
+
+				// Before entering the preempting state, check to see if we
+				// would have preempted during the preceding polling interval.
+				// This allows startd policies to put jobs on hold during
+				// draining.
+				if( 1 == rip->eval_preempt() ) {
+					rip->preemptIsTrue();
+				}
+
 				dprintf( D_ALWAYS, "State change: claim retirement ended/expired\n" );
+				// TLM: STATE TRANSITION #17
 				// STATE TRANSITION #18
 				change( preempting_state );
 				return TRUE; // XXX: change TRUE
@@ -273,27 +282,32 @@ ResState::eval( void )
 			if( 1 == rip->eval_preempt() ) {
 				dprintf( D_ALWAYS, "State change: PREEMPT is TRUE\n" );
 				// irreversible retirement
-				// STATE TRANSITION #12 or #16
+				// TLM: STATE TRANSITION #12
+				// TLM: STATE TRANSITION #16
 				rip->preemptIsTrue();
+				rip->setBadputCausedByPreemption();
 				return rip->retire_claim();
 			}
 		}
 		if( r_act == retiring_act ) {
 			if( rip->mayUnretire() ) {
 				dprintf( D_ALWAYS, "State change: unretiring because no preempting claim exists\n" );
-				// STATE TRANSITION #13
+				// TLM: STATE TRANSITION #19
 				change( busy_act );
 				return TRUE; // XXX: change TRUE
 			}
 			if( rip->retirementExpired() ) {
 				dprintf( D_ALWAYS, "State change: retirement ended/expired\n" );
+				rip->setBadputCausedByPreemption();
+				// TLM: STATE TRANSITION #18
 				change( preempting_state );
 				return TRUE; // XXX: change TRUE
 			}
 		}
 		if( (r_act == busy_act || r_act == retiring_act) && want_suspend ) {
 			if( 1 == rip->eval_suspend() ) {
-				// STATE TRANSITION #14 or #17
+				// TLM: STATE TRANSITION #14
+				// TLM: STATE TRANSITION #20
 				dprintf( D_ALWAYS, "State change: SUSPEND is TRUE\n" );
 				change( suspended_act );
 				return TRUE; // XXX: change TRUE
@@ -301,9 +315,9 @@ ResState::eval( void )
 		}
 		if( r_act == suspended_act ) {
 			if( 1 == rip->eval_continue() ) {
-				// STATE TRANSITION #15
 				dprintf( D_ALWAYS, "State change: CONTINUE is TRUE\n" );
 				if( !rip->inRetirement() ) {
+					// STATE TRANSITION #15
 					change( busy_act );
 					return TRUE; // XXX: change TRUE
 				}
@@ -317,12 +331,13 @@ ResState::eval( void )
 		if( (r_act == busy_act) && rip->hasPreemptingClaim() ) {
 			dprintf( D_ALWAYS, "State change: retiring due to preempting claim\n" );
 			// reversible retirement (e.g. if preempting claim goes away)
-			// STATE TRANSITION #12
+			// TLM: STATE TRANSITION #13
 			change( retiring_act );
 			return TRUE; // XXX: change TRUE
 		}
 		if( (r_act == idle_act) && rip->hasPreemptingClaim() ) {
 			dprintf( D_ALWAYS, "State change: preempting idle claim\n" );
+			// TLM: STATE TRANSITION #10
 			change( preempting_state );
 			return TRUE; // XXX: change TRUE
 		}
@@ -334,16 +349,20 @@ ResState::eval( void )
 				// we're in the claimed state, so we'll have a job ad
 				// to evaluate against.
 			dprintf( D_ALWAYS, "State change: START is false\n" );
-			change( preempting_state ); 
+			// TLM: STATE TRANSITION #10
+			change( preempting_state );
 			return TRUE; // XXX: change TRUE
 		}
 		if( (r_act == idle_act) && rip->claimWorklifeExpired() ) {
 			dprintf( D_ALWAYS, "State change: idle claim shutting down due to CLAIM_WORKLIFE\n" );
+			// TLM: STATE TRANSITION #10
 			change( preempting_state );
 			return TRUE; // XXX: change TRUE
 		}
-		if( (r_act == idle_act) && rip->isDraining() ) {
+		if( (r_act == idle_act) && rip->isDraining() &&
+				! rip->r_cur->waitingForActivation() ) {
 			dprintf( D_ALWAYS, "State change: idle claim shutting down due to draining of this slot\n" );
+			// TLM: STATE TRANSITION #10
 			change( preempting_state );
 			return TRUE;
 		}
@@ -366,16 +385,19 @@ ResState::eval( void )
 		}
 		break;   // case claimed_state:
 
+
 	case preempting_state:
 		if( r_act == vacating_act ) {
 			if( 1 == rip->eval_kill() ) {
 				dprintf( D_ALWAYS, "State change: KILL is TRUE\n" );
-					// STATE TRANSITION #19
+				// TLM: STATE TRANSITION #21
+				rip->setBadputCausedByPreemption();
 				change( killing_act );
 				return TRUE; // XXX: change TRUE
 			}
 		}
 		break;	// case preempting_state:
+
 
 	case unclaimed_state:
 		if( Resource::DYNAMIC_SLOT == rip->get_feature() ) {
@@ -388,12 +410,15 @@ ResState::eval( void )
 				break;
 			}
 #endif
+			// TLM: Undocumented, hopefully on purpose.
 			change( delete_state );
 			return TRUE; // XXX: change TRUE
 		}
 
 		if( rip->isDraining() ) {
 			dprintf( D_ALWAYS, "State change: entering Drained state\n" );
+			// TLM: STATE TRANSITION #37
+			// TLM: Also unnumbered transition from Unclaimed/Benchmarking.
 			change( drained_state, retiring_act );
 			return TRUE;
 		}
@@ -401,6 +426,7 @@ ResState::eval( void )
 		// See if we should be owner or unclaimed
 		if( rip->eval_is_owner() ) {
 			dprintf( D_ALWAYS, "State change: IS_OWNER is TRUE\n" );
+			// TLM: STATE TRANSITION #2
 			change( owner_state );
 			return TRUE; // XXX: change TRUE
 		}
@@ -424,6 +450,8 @@ ResState::eval( void )
 			// instantiated, and b) START_BACKFILL evals to TRUE
 		if( resmgr->m_backfill_mgr && rip->eval_start_backfill() > 0 ) {
 			dprintf( D_ALWAYS, "State change: START_BACKFILL is TRUE\n" );
+			// TLM: STATE TRANSITION #7
+			// TLM: Also unnumbered transition from Unclaimed/Benchmarking.
 			change( backfill_state, idle_act );
 			return TRUE; // XXX: change TRUE
 		}
@@ -434,7 +462,8 @@ ResState::eval( void )
 			rip->update();
 		}
 
-		break;	
+		break; // case unclaimed_state
+
 
 	case owner_state:
 			// If the dynamic slot is allocated in the owner state
@@ -458,12 +487,14 @@ ResState::eval( void )
 
 		if( rip->isDraining() ) {
 			dprintf( D_ALWAYS, "State change: entering Drained state\n" );
+			// TLM: STATE TRANSITION #36
 			change( drained_state, retiring_act );
 			return TRUE;
 		}
 
 		if( ! rip->eval_is_owner() ) {
 			dprintf( D_ALWAYS, "State change: IS_OWNER is false\n" );
+			// TLM: STATE TRANSITION #1
 			change( unclaimed_state );
 			return TRUE; // change() can delete rip
 		}
@@ -476,8 +507,9 @@ ResState::eval( void )
 		rip->tryFetchWork();
 #endif /* HAVE_JOB_HOOKS */
 
-		break;	
-		
+		break; // case owner_state
+
+
 	case matched_state:
 			// Nothing to do here.  If we're matched, we only want to
 			// leave if the match timer goes off, or if someone with
@@ -487,12 +519,13 @@ ResState::eval( void )
 			// (IS_OWNER might be true, while the START expression
 			// might allow some jobs in, and if you get matched with
 			// one of those, you want to stay matched until they try
-			// to claim us).  
+			// to claim us).
 		break;
+
 
 #if HAVE_BACKFILL
 	case backfill_state:
-		if( ! resmgr->m_backfill_mgr ) { 
+		if( ! resmgr->m_backfill_mgr ) {
 			EXCEPT( "in Backfill state but m_backfill_mgr is NULL!" );
 		}
 		if( r_act == killing_act ) {
@@ -503,12 +536,13 @@ ResState::eval( void )
 			return 0;
 		}
 			// see if we should leave the Backfill state
-		kill_rval = rip->eval_evict_backfill(); 
+		kill_rval = rip->eval_evict_backfill();
 		if( kill_rval > 0 ) {
 			dprintf( D_ALWAYS, "State change: EVICT_BACKFILL is TRUE\n" );
 			if( r_act == idle_act ) {
 					// no sense going to killing if we're already
 					// idle, go to owner immediately.
+				// TLM: STATE TRANSITION #30
 				change( owner_state );
 				return TRUE; // XXX: change TRUE
 			}
@@ -516,6 +550,7 @@ ResState::eval( void )
 				// destination, since set_dest() won't take any
 				// additional action if we're already in killing_act
 			ASSERT( r_act == busy_act );
+			// TLM: STATE TRANSITION #28
 			change( backfill_state, killing_act );
 			set_destination( owner_state );
 			return TRUE;
@@ -536,18 +571,22 @@ ResState::eval( void )
 			rip->start_backfill();
 		}
 
-		break;
+		break; // case backfill_state
 #endif /* HAVE_BACKFILL */
+
 
 	case drained_state:
 		if( !rip->isDraining() ) {
 			dprintf(D_ALWAYS,"State change: slot is no longer draining.\n");
+			// TLM: STATE TRANSITION #34
 			change( owner_state );
 			return TRUE;
 		}
 		if( r_act == retiring_act ) {
 			if( resmgr->drainingIsComplete( rip ) ) {
+				resmgr->resetMaxJobRetirementTime();
 				dprintf(D_ALWAYS,"State change: draining is complete.\n");
+				// TLM: STATE TRANSITION #33
 				change( drained_state, idle_act );
 				return TRUE;
 			}
@@ -602,7 +641,7 @@ ResState::leave_action( State cur_s, Activity cur_a, State new_s,
 
 				// In fact, we should just delete the whole ClassAd
 				// and rebuild it, since we might be leaving around
-				// attributes from STARTD_JOB_EXPRS, etc.
+				// attributes from STARTD_JOB_ATTRS, etc.
 			rip->init_classad();
 		}
 		break;
@@ -659,10 +698,11 @@ ResState::leave_action( State cur_s, Activity cur_a, State new_s,
 	return FALSE;
 }
 
+extern ExprTree * globalDrainingStartExpr;
 
 int
 ResState::enter_action( State s, Activity a,
-						bool statechange, bool ) 
+						bool statechange, bool )
 {
 #ifdef WIN32
 	if (a == busy_act)
@@ -719,11 +759,18 @@ ResState::enter_action( State s, Activity a,
 		else if (a == busy_act) {
 			resmgr->start_poll_timer();
 
-			if( rip->inRetirement() ) {
+			if( rip->inRetirement() && !rip->wasAcceptedWhileDraining() ) {
 
 				// We have returned to a busy state (e.g. from
 				// suspension) and there is a preempting claim or we
 				// are in irreversible retirement, so retire.
+
+				// inRetirement() is actually hasPreemptingClaim() || !mayUnretire(),
+				// where we can't unretire if we're draining.  Otherwise,
+				// the drain command would start us retiring and we'd
+				// immediately unretire.  However, if this job was accepted
+				// while we were draining, we don't want to start retiring
+				// it until the last of the "original" jobs has finished.
 
 				change( retiring_act );
 				return TRUE; // XXX: change TRUE
@@ -866,9 +913,10 @@ ResState::enter_action( State s, Activity a,
 		break;
 
 	case drained_state:
-		rip->r_reqexp->unavail();
+		rip->r_reqexp->unavail( globalDrainingStartExpr );
 		break;
-	default: 
+
+	default:
 		EXCEPT("Unknown state in ResState::enter_action");
 	}
 	return FALSE;

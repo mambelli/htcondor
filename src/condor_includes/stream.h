@@ -28,6 +28,7 @@
 #include "CryptKey.h"                 // KeyInfo
 #include "condor_ver_info.h"
 #include "classy_counted_ptr.h"
+#include "cedar_enums.h"
 
 enum CONDOR_MD_MODE {
     MD_OFF        = 0,         // off
@@ -42,9 +43,6 @@ const int ENCRYPTION_IS_ON = 2;
 const condor_mode_t NULL_FILE_PERMISSIONS = (condor_mode_t)0;
 
 #include "proc.h"
-#include "condor_old_shadow_types.h"
-
-#include "startup.h"
 
 /** @name Special Types
     We need to define a special code() method for certain integer arguments.
@@ -65,8 +63,6 @@ const condor_mode_t NULL_FILE_PERMISSIONS = (condor_mode_t)0;
 
     The condor stream library consists of (for now)<br>
     <ul>
-	  <li> File streams (file.h)
-	  <li> InCore streams (incore.h)
 	  <li> Network socket streams (socks.h)
       <ul>
 	    <li> Reliable network streams (on top of tcp)
@@ -74,15 +70,6 @@ const condor_mode_t NULL_FILE_PERMISSIONS = (condor_mode_t)0;
       </ul>
     </ul>
 
-
-	<h3> DATA REPRESENTATION </h3>
-
-	Streams can be in 3 modes:
-    <ul>
-	  <li> Internal binary representation
-	  <li> External binary representation
-	  <li> Ascii representation	(not implemented)
-    </ul>
 
 	<h3> CODING/DECODING </h3>
 
@@ -173,19 +160,6 @@ public:
         /** */ reli_sock
     };
 
-    ///
-	enum stream_code {
-        /** */ internal,
-        /** */ external,
-        /** */ ascii
-    };
-
-    ///
-	inline stream_code representation() const { return _code; }
-    ///
-	inline void set_representation(stream_code c) { _code = c; }
-
-    ///
 	inline void encode() { _coding = stream_encode; }
     ///
 	inline void decode() { _coding = stream_decode; }
@@ -239,8 +213,13 @@ public:
 	int code(MyString &);
     ///
 	int code(std::string &);
-    ///
-	int code(char *&, int &);
+	///
+	// DO NOT USE THIS FUNCTION!
+	// Works like code(char *&), but the receiver will get a NULL
+	// pointer if the sender provides one.
+	// Used by the standard universe and the CONFIG_VAL command.
+	// This is legacy code that should not be used anywhere else.
+	int code_nullstr(char *&);
     ///
 	int code_bytes(void *, int);
     ///
@@ -253,12 +232,6 @@ public:
     //@{
     ///
 	int code(PROC_ID &);
-    ///
-	int code(STARTUP_INFO &);
-    ///
-	int code(PORTS &);
-    ///
-	int code(StartdRec &);
     //@}
 
 	/** @name UNIX Types
@@ -268,40 +241,10 @@ public:
     ///
 	int code(open_flags_t &);
     ///
-	int code(struct stat &);
-    ///
 	int code(condor_errno_t &);
 
-#if !defined(WIN32)
-    ///
-	int code(condor_signal_t &);
-    ///
-	int code(fcntl_cmd_t &);
-    ///
-	int code(struct rusage &);
-    ///
-	int code(struct statfs &);
-    ///
-	int code(struct timezone &);
-    ///
-	int code(struct timeval &);
-    ///
-	int code(struct utimbuf &);
-    ///
-	int code(struct rlimit &);
-    ///
-	int code_array(gid_t *&array, int &len);
-    ///
-#endif // !defined(WIN32)
 	///
 	int code(condor_mode_t &);
-
-#if HAS_64BIT_STRUCTS
-    ///
-	int code(struct stat64 &);
-    ///
-	int code(struct rlimit64 &);
-#endif
     //@}
 
 	/** @name Pointer Types.
@@ -329,45 +272,12 @@ public:
 	int code(double *x) 			{ return code(*x); }
     ///
 	int code(PROC_ID *x)			{ return code(*x); }
-    ///
-	int code(STARTUP_INFO *x)		{ return code(*x); }
-    ///
-	int code(PORTS *x)				{ return code(*x); }
-    ///
-	int code(StartdRec *x)			{ return code(*x); }
 
-    ///
-	int code(struct stat *x)		{ return code(*x); }
     ///
 	int code(open_flags_t *x)		{ return code(*x); }
     ///
 	int code(condor_errno_t *x)		{ return code(*x); }
 
-#if !defined(WIN32)
-    ///
-	int code(condor_signal_t *x)			{ return code(*x); }
-    ///
-	int code(fcntl_cmd_t *x) 		{ return code(*x); }
-    ///
-	int code(struct rusage *x)		{ return code(*x); }
-    ///
-	int code(struct statfs *x)		{ return code(*x); }
-    ///
-	int code(struct timezone *x)	{ return code(*x); }
-    ///
-	int code(struct timeval *x)		{ return code(*x); }
-    ///
-	int code(struct utimbuf *x)		{ return code(*x); }
-    ///
-	int code(struct rlimit *x)		{ return code(*x); }
-#endif // !defined(WIN32)
-
-#if HAS_64BIT_STRUCTS
-    ///
-	int code(struct stat64 *x)		{ return code(*x); }
-    ///
-	int code(struct rlimit64 *x)	{ return code(*x); }
-#endif
     //@}
 
     //@}
@@ -391,8 +301,17 @@ public:
 	int put(double);
 	int put(char const *);
 	int put(const MyString &);
-	int put(const std::string &);
+	int put(const std::string &str) {return this->put(str.c_str(), 1 + (int)str.length());}
+	// The second argument is the length of the string, including the
+	// NUL terminator.
 	int put(char const *, int);
+
+	// DO NOT USE THIS FUNCTION!
+	// Works like put(const char *), but the receiver will get a NULL
+	// pointer if the sender provides one.
+	// Used by the standard universe and the CONFIG_VAL command.
+	// This is legacy code that should not be used anywhere else.
+	int put_nullstr(char const *);
 
 
 	//	get operations
@@ -416,8 +335,8 @@ public:
 	int get(MyString &);
 	int get(std::string &);
 
-		// This function assigns the argument to a freshly mallocated string
-		// or NULL.  The caller should free the string.
+		// This function assigns the argument to a freshly mallocated string.
+		// The caller should free the string.
 		// NOTE: arg MUST be NULL when this function is called.
 	int get(char *&);
 
@@ -427,20 +346,33 @@ public:
 		// inserts a truncated (and terminated) string into the buffer.
 	int get(char *, int);
 
+		// DO NOT USE THIS FUNCTION!
+		// Works like get(char *&), but the receiver will get a NULL
+		// pointer if the sender provides one.
+		// Used by the standard universe and the CONFIG_VAL command.
+		// This is legacy code that should not be used anywhere else.
+	int get_nullstr(char *&);
+
 		// Points argument to a buffer containing the string at the
 		// current read position in the stream or NULL.  The buffer is
 		// ONLY valid until the next function call on this stream.
 		// Caller should NOT free the buffer or modify its contents.
+		// The length returned in argument len includes the NUL terminator.
 	int get_string_ptr( char const *&s );
+	int get_string_ptr( const char *&s, int &len );
 
 		// This is just like get(char const *&), but it calls
 		// prepare_crypto_for_secret() before and
 		// restore_crypto_after_secret() after.
+		// The length returned in argument len includes the NUL terminator.
 	int get_secret( char *&s );
+	int get_secret( const char *&s, int &len );
+
 		// This is just like put(char const *), but it calls
 		// prepare_crypto_for_secret() before and
 		// restore_crypto_after_secret() after.
 	int put_secret(char const *);
+	int put_secret(const std::string & secret) {return put_secret(secret.c_str());}
 
 		// Checks configuration parameter ENCRYPT_SECRETS and forces
 		// encryption on if necessary (and if possible).  After
@@ -457,7 +389,7 @@ public:
 		// or this socket is already encrypting everything
 		// or this socket is not capable of encrypting
 		// or our peer is too old to read secrets correctly.
-	bool prepare_crypto_for_secret_is_noop();
+	bool prepare_crypto_for_secret_is_noop() const;
 
 	/*
 	**	Stream protocol
@@ -518,7 +450,7 @@ public:
 	virtual int timeout(int) = 0;
 
 	/// get number of bytes currently available to read, -1 on failure
-	virtual int bytes_available_to_read() = 0;
+	virtual int bytes_available_to_read() const = 0;
 
 	/// set timeout in seconds for sum of all socket operations
 	/// After this amount of time (from now), all operations on
@@ -540,28 +472,28 @@ public:
 
 	/// Returns the current deadline time.
 	/// The special value 0 indicates no deadline.
-	virtual time_t get_deadline();
+	virtual time_t get_deadline() const;
 
 	/// returns true if the deadline timeout for this socket has expired
-	bool deadline_expired();
+	bool deadline_expired() const;
 
 	/// For stream types that support it, this returns the ip address we are connecting from.
-	virtual char const *my_ip_str() = 0;
+	virtual char const *my_ip_str() const = 0;
 
 	/// For stream types that support it, this returns the ip address we are connecting to.
-	virtual char const *peer_ip_str() = 0;
+	virtual char const *peer_ip_str() const = 0;
 
 	/// For stream types that support it, test if peer is a local interface, aka did this connection 
 	/// originate from a local process?
-	virtual bool peer_is_local() = 0;
+	virtual bool peer_is_local() const = 0;
 
 	/// For stream types that support it, this is the sinful address of peer.
-	virtual char const *default_peer_description() = 0;
+	virtual char const *default_peer_description() const = 0;
 
 	/// For stream types that support it, this is the sinful address of peer
 	/// or a more descriptive string assigned by set_peer_description().
 	/// This is suitable for passing to dprintf() (never NULL).
-	char const *peer_description();
+	char const *peer_description() const;
 
 	void set_peer_description(char const *str);
 
@@ -575,7 +507,7 @@ public:
 	/** Get this stream's type.
         @return the type of this stream
     */
-	virtual stream_type type() = 0;
+	virtual stream_type type() const = 0;
 
 	/** Create a copy of this stream (e.g. dups underlying socket).
 		Caller should delete the returned stream when finished with it.
@@ -590,22 +522,22 @@ public:
     ///
 	int rcv_int(int &val, int end_of_record);
 
-	bool get_encryption() const;
+	bool get_encryption() const {return crypto_mode_;}
         //------------------------------------------
         // PURPOSE: Return encryption mode
         // REQUIRE: None
         // RETURNS: true -- on, false -- off
         //------------------------------------------
 
-	void set_crypto_mode(bool enable);
+	bool set_crypto_mode(bool enable);
         //------------------------------------------
         // PURPOSE: enable or disable encryption
         // REQUIRE: bool, true -- on; false -- off
-        // RETURNS:
+        // RETURNS: bool, true if value was succesfully changed, false on error
         //------------------------------------------
 
 	/** Returns true if this stream can turn on encryption. */
-	virtual bool canEncrypt() = 0;
+	virtual bool canEncrypt() const = 0;
 
 	static int set_timeout_multiplier(int secs);
 	static int get_timeout_multiplier();
@@ -623,7 +555,7 @@ protected:
 
 	// serialize object (save/restore object state to an ascii string)
 	//
-	virtual char * serialize(char *) = 0;
+	virtual const char * serialize(const char *) = 0;
 	virtual char * serialize() const = 0;
 
 	/*
@@ -639,7 +571,7 @@ protected:
 
 	//	constructor
 	//
-	Stream(stream_code c=external);
+	Stream();
 	/*
 	**	Data structures
 	*/
@@ -647,7 +579,6 @@ protected:
 	bool                encrypt_;        // Encryption mode
 	bool                crypto_mode_;    // true == enabled, false == disabled.
 	bool m_crypto_state_before_secret;
-	stream_code	    _code;
 	stream_coding	    _coding;
 
 	int allow_empty_message_flag;

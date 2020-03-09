@@ -33,8 +33,13 @@
 #include "daemon.h"
 #include "condor_distribution.h"
 #include "condor_attributes.h"
+#include "match_prefix.h"
+#include "ad_printmask.h"
+#include "generic_query.h"
+#include "dc_collector.h"
 // for std::sort
 #include <algorithm> 
+#include <vector>
 
 //-----------------------------------------------------------------
 
@@ -102,12 +107,12 @@ struct LineRec {
 //-----------------------------------------------------------------
 
 static int CalcTime(int,int,int);
-static void usage(char* name);
-static void ProcessInfo(AttrList* ad,bool GroupRollup,bool HierFlag);
-static int CountElem(AttrList* ad);
-static void CollectInfo(int numElem, AttrList* ad, LineRec* LR, bool GroupRollup);
-static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag);
-static void PrintResList(AttrList* ad);
+static void usage(const char* name);
+static void ProcessInfo(ClassAd* ad,std::vector<ClassAd> &accountingAds, bool GroupRollup,bool HierFlag);
+static int CountElem(ClassAd* ad);
+static void CollectInfo(int numElem, ClassAd* ad, std::vector<ClassAd> & accountingAds, LineRec* LR, bool GroupRollup);
+static void PrintInfo(int tmLast, LineRec* LR, int NumElem, bool HierFlag);
+static void PrintResList(ClassAd* ad);
 
 //-----------------------------------------------------------------
 
@@ -125,9 +130,11 @@ bool UsersHaveQuotas = false;       // set to true if we got quota info back for
 bool HideGroups = false;            // set to true when it doesn't make sense to show groups (i.e. just displaying prio)
 bool HideUsers  = false;            // set to true when it doesn't make sense to show users (i.e. just showing quotas)
 time_t MinLastUsageTime;
+bool fromCollector = false; // query accounting ad from collector instead of negotiator
+bool forceFromCollector = false; // don't use default value
 
 enum {
-   SortByColumn1 = 0,  // sort by prio or by useage depending on which is in column 1 
+   SortByColumn1 = 0,  // sort by prio or by usage depending on which is in column 1 
    SortGroupsFirstByIndex,
    SortHierByGroupId,
    SortHierBySortKey,
@@ -239,32 +246,119 @@ struct LineRecLT {
     }
 };
 
+void ConvertLegacyUserprioAdToAdList(ClassAd &ad, std::vector<ClassAd> & prios)
+{
+	std::string attr;
+	int id;
 
-bool IsArg(const char * parg, const char * pval, int must_match_length = -1) {
-   if (*parg != '-') return false;
-   ++parg;
-   if (*parg == '-') ++parg; // allow -- as well as - for an arg prefix.
-   if (*parg != *pval) return false;
+	for (ClassAd::iterator next = ad.begin(); next != ad.end(); /*++next*/) {
+		ClassAd::iterator it = next++; // advance iterator now, in case we want to remove it
+		const char * pattr = it->first.c_str();
+		const char * p = pattr;
 
-   // do argument matching based on a minimum prefix. when we run out
-   // of characters in parg we must be at a \0 or no match and we
-   // must have matched at least must_match_length characters or no match
-   int match_length = 0;
-   while (*parg == *pval) {
-      ++match_length;
-      ++parg; ++pval;
-      if (!*pval) break;
-   }
-   if (*parg) return false;
-   if (must_match_length < 0) return (*pval == 0);
-   return match_length >= must_match_length;
+		// ConcurrencyLimits are also in this ad, and could end in a number.  Skip those
+		// Newer negotiators (post 8.6.10) don't send this anymore
+
+		if (strstr(pattr, "ConcurrencyLimit_") == pattr) {
+			continue;
+		}
+
+		// parse attribute nameNNN, looking for trailing NNN
+		// and set attr to name, and id to NNN.  
+		id = -1;
+		attr.clear();
+		while (*p) {
+			if (isdigit(*p)) {
+				const char * q = p;
+				while (isdigit(*q)) ++q;
+				if ( ! *q || isspace(*q)) {
+					// if the first thing after the digits is the end
+					// of the attribute name, then we found an id.
+					// so set attr and id appropriately
+					attr.assign(pattr, p-pattr);
+					id = atoi(p);
+					break;
+				}
+				p = q;
+			}
+			++p;
+		}
+
+		// the attribute was not of the form nameNNN, so ignore it.
+		if (id <= 0 || attr.empty()) {
+			continue;
+		}
+
+		if ((int)prios.size() <= id) {
+			prios.resize(id);
+		}
+
+		// move the right hand side from the input ad into the vector of ads.
+		prios[id-1].Insert(attr, it->second); ad.Remove(it->first);
+		prios[id-1].Assign("SubmittorId", id);
+	}
 }
 
-int
-main(int argc, char* argv[])
+static void PrintModularAds(
+	FILE *    out,
+	ClassAd* ad,
+	std::vector<ClassAd> accountingAds, // if ad is NULL, values are here
+	bool      customFormat,
+	AttrListPrintMask & print_mask,
+	GenericQuery constraint)
 {
+	std::vector<ClassAd> prioAds;
 
+	// if ad is not-null, we're passed in the ads in the old format in ad
+	if (ad != 0) {
+		ConvertLegacyUserprioAdToAdList(*ad, prioAds);
+	} else {
+		// otherwise, we've been given the ads in the new format, just copy them over
+		prioAds = accountingAds;
+	}
+
+	MyString my_constraint;
+	constraint.makeQuery(my_constraint);
+	// if (diagnostic) { fprintf(stderr, "Using effective constraint: %s\n", my_constraint.c_str()); }
+
+	ExprTree *constraintExpr=NULL;
+	if ( ! my_constraint.empty() && ParseClassAdRvalExpr( my_constraint.c_str(), constraintExpr ) ) {
+		fprintf( stderr, "Error:  could not parse constraint %s\n", my_constraint.c_str() );
+		exit( 1 );
+	}
+
+	if (customFormat) {
+		if (print_mask.has_headings()) print_mask.display_Headings(out);
+
+		// now print the userprio records
+		for (int id = 0; id < (int)prioAds.size(); ++id) {
+			if (constraintExpr && ! EvalExprBool(&prioAds[id], constraintExpr))
+				continue;
+			print_mask.display(out, &prioAds[id]);
+		}
+	} else {
+		// now print the userprio records
+		for (int id = 0; id < (int)prioAds.size(); ++id) {
+			if (constraintExpr && ! EvalExprBool(&prioAds[id], constraintExpr))
+				continue;
+			fprintf(out, "\n");
+			fPrintAd(out, prioAds[id]);
+		}
+	}
+
+	if (constraintExpr) delete constraintExpr;
+}
+
+
+// map local IsArg functions to the condor_utils is_dash_arg functions
+#define IsArg is_dash_arg_prefix
+#define IsArgColon is_dash_arg_colon_prefix
+
+int
+main(int argc, const char* argv[])
+{
   bool LongFlag=false;
+  int LegacyAdFormat = 1; // bit 1 = default to legacy, bit 2 = insist on legacy
   bool HierFlag=true;
   int ResetUsage=0;
   int DeleteUser=0;
@@ -276,10 +370,16 @@ main(int argc, char* argv[])
   bool ResetAll=false;
   int GetResList=0;
   int UserPrioFile=0;
+  std::string neg_name;
   std::string pool;
+  AttrListPrintMask print_mask;
+  GenericQuery constraint; // used to build a complex constraint.
+  bool customFormat = false;
   bool GroupRollup = false;
+  const char * pcolon = NULL; // used to parse -arg:opt arguments
 
   myDistro->Init( argc, argv );
+  set_priv_initialize(); // allow uid switching if root
   config();
 
   MinLastUsageTime=time(0)-60*60*24;  // Default to show only users active in the last day
@@ -325,6 +425,52 @@ main(int argc, char* argv[])
     }
     else if (IsArg(argv[i],"long",1)) {
       LongFlag=true;
+      //PRAGMA_REMIND("tj: make -modular the default in 8.5")
+      //LegacyAdFormat &= ~1; // clear the low bit only, so that -legacy ends up winning.
+    }
+    else if (IsArg(argv[i],"constraint",1)) {
+        // make sure we have at least one more argument
+        if (argc <= i+1) {
+            fprintf( stderr, "Error: Argument %s requires another parameter\n", argv[i]);
+            usage(argv[0]);
+        }
+        i++;
+        constraint.addCustomAND(argv[i]);
+    }
+    else if (IsArg(argv[i],"legacy",3)) {
+      LegacyAdFormat = 2 | 1;
+    }
+    else if (IsArg(argv[i],"modular",3)) {
+      LegacyAdFormat = 0;
+    }
+    else if (IsArgColon(argv[i],"af", &pcolon, 2) ||
+             IsArgColon(argv[i],"autoformat", &pcolon, 5)) {
+        // make sure we have at least one argument to autoformat
+        if (argc <= i+1 || *(argv[i+1]) == '-') {
+            fprintf (stderr, "Error: Argument %s requires at last one attribute parameter\n", argv[i]);
+            fprintf(stderr, "\t\te.g. condor_prio %s Name\n", argv[i]);
+            usage(argv[0]);
+        }
+        if (pcolon) ++pcolon; // if there are options, skip over the colon to the options.
+        classad::References refs;
+        int ixNext = parse_autoformat_args(argc, argv, i+1, pcolon, print_mask, refs, false);
+        if (ixNext < 0) {
+            fprintf (stderr, "Error: Invalid expression: %s\n", argv[-ixNext]);
+            exit(1);
+        }
+        //TODO: add support for projected queries?
+        //initStringListFromAttrs(projection, true, refs, true);
+        if (ixNext > i)
+            i = ixNext-1;
+        customFormat = true;
+    }
+    else if (IsArgColon(argv[i],"debug",&pcolon,1)) {
+      if (pcolon && pcolon[1]) {
+        set_debug_flags( ++pcolon, 0 );
+        // for now we also need to do this because dprintf_set_tool_debug reset global debug flags based on it
+        param_insert("TOOL_DEBUG", pcolon);
+      }
+      dprintf_set_tool_debug("TOOL", 0);
     }
     else if (IsArg(argv[i],"hierarchical",2) || IsArg(argv[i],"heir")) {
       HierFlag=true;
@@ -336,6 +482,8 @@ main(int argc, char* argv[])
     }
     else if (IsArg(argv[i],"grouprollup")) {
       GroupRollup=true;
+	  fromCollector = false;
+	  forceFromCollector = true;
     }
     else if (IsArg(argv[i],"grouporder")) {
       GroupOrder=true;
@@ -381,6 +529,8 @@ main(int argc, char* argv[])
       i+=3;
     }
     else if (IsArg(argv[i],"allusers")) {
+	  fromCollector = false;
+	  forceFromCollector = true;
       MinLastUsageTime=-1;
     }
     else if (IsArg(argv[i],"usage",2)) {
@@ -391,6 +541,8 @@ main(int argc, char* argv[])
     }
     else if (IsArg(argv[i],"getreslist",6)) {
       if (argc-i<=1) usage(argv[0]);
+	  fromCollector = false;
+	  forceFromCollector = true;
       GetResList=i;
       i+=1;
     }
@@ -403,6 +555,19 @@ main(int argc, char* argv[])
       if (argc-i<=1) usage(argv[0]);
       pool = argv[i+1];
       i++;
+    }
+    else if (IsArg(argv[i],"name")) {
+      if (argc-i<=1) usage(argv[0]);
+      neg_name = argv[i+1];
+      i++;
+	} 
+	else if (IsArg(argv[i], "collector", 3)) {
+		fromCollector = true;
+	  forceFromCollector = true;
+	}
+	else if (IsArg(argv[i], "negotiator", 3)) {
+		fromCollector = false;
+	    forceFromCollector = true;
 	}
     else {
       usage(argv[0]);
@@ -412,16 +577,25 @@ main(int argc, char* argv[])
   //----------------------------------------------------------
 
 	  // Get info on our negotiator
-  Daemon negotiator(DT_NEGOTIATOR, NULL, (pool != "") ? pool.c_str() : NULL);
-  if (!negotiator.locate()) {
+  Daemon negotiator(DT_NEGOTIATOR, (neg_name != "") ? neg_name.c_str() : NULL, (pool != "") ? pool.c_str() : NULL);
+  if (!negotiator.locate(Daemon::LOCATE_FOR_LOOKUP)) {
 	  fprintf(stderr, "%s: Can't locate negotiator in %s\n", 
               argv[0], (pool != "") ? pool.c_str() : "local pool");
 	  exit(1);
   }
 
+	// Only 8.5.3+ negotiators send their accounting data to the collector
+  const char *ver = negotiator.version();
+  if (ver) {
+	CondorVersionInfo vsi(ver);
+	if (!forceFromCollector && vsi.built_since_version(8,5,3)) {
+		fromCollector = true;
+	}
+  }
+
   if (SetPrio) { // set priority
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[SetPrio+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -452,7 +626,7 @@ main(int argc, char* argv[])
 
   else if (SetFactor) { // set priority
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[SetFactor+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -488,7 +662,7 @@ main(int argc, char* argv[])
 
   else if (SetAccum) { // set accumulated usage
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[SetAccum+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -522,7 +696,7 @@ main(int argc, char* argv[])
   }
   else if (SetBegin) { // set begin usage time
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[SetBegin+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -557,7 +731,7 @@ main(int argc, char* argv[])
   }
   else if (SetLast) { // set last usage time
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[SetLast+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -592,7 +766,7 @@ main(int argc, char* argv[])
   }
   else if (ResetUsage) { // set priority
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[ResetUsage+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -621,7 +795,7 @@ main(int argc, char* argv[])
 
   else if (DeleteUser) { // remove a user record from the accountant
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[DeleteUser+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the record you wish\n",
@@ -663,7 +837,7 @@ main(int argc, char* argv[])
 
   else if (GetResList) { // get resource list
 
-    char* tmp;
+	const char* tmp;
 	if( ! (tmp = strchr(argv[GetResList+1], '@')) ) {
 		fprintf( stderr, 
 				 "%s: You must specify the full name of the submittor you wish\n",
@@ -685,7 +859,7 @@ main(int argc, char* argv[])
 
     // get reply
     sock->decode();
-    AttrList* ad=new AttrList();
+    ClassAd* ad=new ClassAd();
     if (!getClassAdNoTypes(sock, *ad) ||
         !sock->end_of_message()) {
       fprintf( stderr, "failed to get classad from negotiator\n" );
@@ -708,10 +882,10 @@ main(int argc, char* argv[])
       exit(1);
     }
 
-    AttrList* ad=new AttrList();
+    ClassAd* ad=new ClassAd();
     bool is_eof = false; 
     int error = 0;
-	if ( ! ad->InsertFromFile(file, is_eof, error) && error) {
+	if ( ! InsertFromFile(file, *ad, is_eof, error) && error) {
       fprintf(stderr, "Error %d reading userprio ads\n", error);
       fclose(file);
       exit(1);
@@ -731,30 +905,79 @@ main(int argc, char* argv[])
        HideGroups = !HierFlag;
     }
 
-    if (LongFlag) fPrintAd(stdout, *ad);
-    else ProcessInfo(ad,GroupRollup,HierFlag);
+    if (LongFlag || customFormat) {
+       if ( ! LegacyAdFormat || customFormat) {
+		  std::vector<ClassAd> empty;
+          PrintModularAds(stdout, ad, empty, customFormat, print_mask, constraint);
+       } else {
+          fPrintAd(stdout, *ad);
+       }
+    }
+    else {
+		std::vector<ClassAd> empty;
+		ProcessInfo(ad,empty,GroupRollup,HierFlag);
+	}
 
   }
-  else {  // list priorities
+  else {  // Get prios not from file, but from collector or negotiator
 
-    Sock* sock;
-    if (!(sock = negotiator.startCommand((GroupRollup) ? GET_PRIORITY_ROLLUP : GET_PRIORITY, Stream::reli_sock, 0)) ||
-        !sock->end_of_message()) {
-        fprintf(stderr, "failed to send %s command to negotiator\n", (GroupRollup) ? "GET_PRIORITY_ROLLUP" : "GET_PRIORITY");
-        exit(1);
-    }
+	ClassAd *ad = NULL;
+	std::vector<ClassAd> accountingAds;
 
-    // get reply
-    sock->decode();
-    AttrList* ad=new AttrList();
-    if (!getClassAdNoTypes(sock, *ad) ||
-        !sock->end_of_message()) {
-      fprintf( stderr, "failed to get classad from negotiator\n" );
-      exit(1);
-    }
+	DCCollector c((pool.length() > 0) ? pool.c_str() : 0);
+	c.locate();
+	const char *v = c.version();
+	CondorVersionInfo cvi(v);
+	if (!cvi.built_since_version(8,5,2)) {
+		fromCollector = false;	
+	}
 
-    sock->close();
-    delete sock;
+	if (fromCollector) {
+		CondorQuery query(ACCOUNTING_AD);
+		ClassAdList ads;
+		CondorError errstack;
+		QueryResult q;
+
+		if ( !neg_name.empty() ) {
+			std::string constraint;
+			formatstr(constraint, "%s == \"%s\"", ATTR_NEGOTIATOR_NAME, neg_name.c_str());
+			query.addANDConstraint(constraint.c_str());
+		}
+
+		CollectorList * collectors = CollectorList::create((pool.length() > 0) ? pool.c_str() : 0);
+		q = collectors->query (query, ads, &errstack);
+		delete collectors;
+		if (q != Q_OK) {
+			fprintf(stderr, "Can't query collector for ads: %s\n", errstack.getFullText().c_str());
+			exit(1);
+		}
+        ads.Open();
+        while (ClassAd* oneAd = ads.Next()) {
+			accountingAds.push_back(*oneAd);
+		}
+		ads.Close();
+
+	} else { // oldWay
+
+		Sock* sock;
+		if (!(sock = negotiator.startCommand((GroupRollup) ? GET_PRIORITY_ROLLUP : GET_PRIORITY, Stream::reli_sock, 0)) ||
+			!sock->end_of_message()) {
+				fprintf(stderr, "failed to send %s command to negotiator\n", (GroupRollup) ? "GET_PRIORITY_ROLLUP" : "GET_PRIORITY");
+				exit(1);
+		}
+
+	    // get reply
+		sock->decode();
+		ad=new ClassAd();
+		if (!getClassAdNoTypes(sock, *ad) ||
+   	     !sock->end_of_message()) {
+			fprintf( stderr, "failed to get classad from negotiator\n" );
+			exit(1);
+   	 	}
+	
+		sock->close();
+		delete sock;
+	}
 
     // if no details specified, show priorities
     if ( ! DetailFlag) {
@@ -769,8 +992,27 @@ main(int argc, char* argv[])
        HideGroups = !HierFlag;
     }
 
-    if (LongFlag) fPrintAd(stdout, *ad);
-    else ProcessInfo(ad,GroupRollup,HierFlag);
+    if (LongFlag || customFormat) {
+       if ( ! LegacyAdFormat || customFormat) {
+          PrintModularAds(stdout, ad, accountingAds, customFormat, print_mask, constraint);
+       } else {
+			if (ad) {
+          		fPrintAd(stdout, *ad);
+			} else {
+					// if we have the ad in the vector-of-ads format, print them
+					// out like we do with condor_history, newline separated
+					// and without the numbered attr names.  Different, but more useful
+				for (std::vector<ClassAd>::iterator it = accountingAds.begin();
+						it != accountingAds.end();
+						it++) {
+					fPrintAd(stdout, *it);
+					fprintf(stdout, "\n");
+				}
+			}
+       }
+    } else {
+		ProcessInfo(ad, accountingAds,GroupRollup,HierFlag);
+	}
   }
 
   exit(0);
@@ -779,14 +1021,22 @@ main(int argc, char* argv[])
 
 //-----------------------------------------------------------------
 
-static void ProcessInfo(AttrList* ad,bool GroupRollup,bool HierFlag)
+static void ProcessInfo(ClassAd* ad, std::vector<ClassAd> &accountingAds, bool GroupRollup,bool HierFlag)
 {
-  int NumElem=CountElem(ad);
+  int NumElem = 0;
+
+  if (ad) {
+	NumElem = CountElem(ad);
+  } else {
+	NumElem = accountingAds.size();
+  }
+
   if ( NumElem <= 0 ) {
 	  return;
   }
+
   LineRec* LR=new LineRec[NumElem];
-  CollectInfo(NumElem,ad,LR,GroupRollup);
+  CollectInfo(NumElem,ad, accountingAds, LR,GroupRollup);
 
   // check to see if all of the visible users are in the none group.
   bool all_users_in_none_group = true;
@@ -816,7 +1066,7 @@ static void ProcessInfo(AttrList* ad,bool GroupRollup,bool HierFlag)
      HideUsers = true;
   }
 
-  int order = SortByColumn1; // sort by prio or by useage depending on which is in column 1
+  int order = SortByColumn1; // sort by prio or by usage depending on which is in column 1
   bool none_last = false;
   if (HierFlag) {
      none_last = (GlobalSurplusPolicy == SurplusRegroup);
@@ -828,13 +1078,19 @@ static void ProcessInfo(AttrList* ad,bool GroupRollup,bool HierFlag)
   }
   std::sort(LR, LR+NumElem, LineRecLT(DetailFlag, order, none_last));
 
-  PrintInfo(ad,LR,NumElem,HierFlag);
+  int tmLast = 0;
+  if (ad) {
+  	ad->LookupInteger( ATTR_LAST_UPDATE, tmLast );
+  } else {
+	accountingAds[0].LookupInteger(ATTR_LAST_UPDATE, tmLast);
+  }
+  PrintInfo(tmLast,LR,NumElem,HierFlag);
   delete[] LR;
 } 
 
 //-----------------------------------------------------------------
 
-static int CountElem(AttrList* ad)
+static int CountElem(ClassAd* ad)
 {
 	int numSubmittors;
 	if( ad->LookupInteger( "NumSubmittors", numSubmittors ) ) 
@@ -848,18 +1104,18 @@ static int CountElem(AttrList* ad)
 
 //-----------------------------------------------------------------
 
-static void CollectInfo(int numElem, AttrList* ad, LineRec* LR, bool GroupRollup)
+static void CollectInfo(int numElem, ClassAd* ad, std::vector<ClassAd> &accountingAds, LineRec* LR, bool GroupRollup)
 {
-  char  attrName[32], attrPrio[32], attrResUsed[32], attrWtResUsed[32], attrFactor[32], attrBeginUsage[32], attrAccUsage[42], attrRequested[32];
-  char  attrLastUsage[32];
-  MyString attrAcctGroup;
-  MyString attrIsAcctGroup;
+  char  attrName[64], attrPrio[64], attrResUsed[64], attrWtResUsed[64], attrFactor[64], attrBeginUsage[64], attrAccUsage[64], attrRequested[64];
+  char  attrLastUsage[64];
+  std::string attrAcctGroup;
+  std::string attrIsAcctGroup;
   char  name[128], policy[32];
-  float priority, Factor, AccUsage = -1;
+  float priority = 0, Factor = 0, AccUsage = -1;
   int   resUsed = 0, BeginUsage = 0;
   int   LastUsage = 0;
-  float wtResUsed, requested;
-  MyString AcctGroup;
+  float wtResUsed, requested = 0;
+  std::string AcctGroup;
   bool IsAcctGroup;
   float effective_quota = 0, config_quota = 0, subtree_quota = 0;
   bool fNeedGroupIdFixup = false;
@@ -874,17 +1130,29 @@ static void CollectInfo(int numElem, AttrList* ad, LineRec* LR, bool GroupRollup
     LR[i-1].HasDetail = 0;
     LR[i-1].LastUsage=MinLastUsageTime;
     LR[i-1].Requested=0.0;
-    sprintf( attrName , "Name%d", i );
-    sprintf( attrPrio , "Priority%d", i );
-    sprintf( attrResUsed , "ResourcesUsed%d", i );
-    sprintf( attrRequested , "Requested%d", i );
-    sprintf( attrWtResUsed , "WeightedResourcesUsed%d", i );
-    sprintf( attrFactor , "PriorityFactor%d", i );
-    sprintf( attrBeginUsage , "BeginUsageTime%d", i );
-    sprintf( attrLastUsage , "LastUsageTime%d", i );
-    sprintf( attrAccUsage , "WeightedAccumulatedUsage%d", i );
-    attrAcctGroup.formatstr("AccountingGroup%d", i);
-    attrIsAcctGroup.formatstr("IsAccountingGroup%d", i);
+
+	char strI[32];
+
+		// The old format, one big ad
+	if (accountingAds.size() == 0) {
+		sprintf(strI, "%d", i);
+	} else {
+		// The new format, all ads in the vector
+		strI[0] = '\0';
+		ad = & accountingAds[i - 1];
+	}
+
+    sprintf( attrName , "Name%s", strI );
+    sprintf( attrPrio , "Priority%s", strI );
+    sprintf( attrResUsed , "ResourcesUsed%s", strI );
+    sprintf( attrRequested , "Requested%s", strI );
+    sprintf( attrWtResUsed , "WeightedResourcesUsed%s", strI );
+    sprintf( attrFactor , "PriorityFactor%s", strI );
+    sprintf( attrBeginUsage , "BeginUsageTime%s", strI );
+    sprintf( attrLastUsage , "LastUsageTime%s", strI );
+    sprintf( attrAccUsage , "WeightedAccumulatedUsage%s", strI );
+    formatstr(attrAcctGroup, "AccountingGroup%s", strI);
+    formatstr(attrIsAcctGroup, "IsAccountingGroup%s", strI);
 
     if( !ad->LookupString	( attrName, name, COUNTOF(name) ) 		|| 
 		!ad->LookupFloat	( attrPrio, priority ) )
@@ -909,17 +1177,17 @@ static void CollectInfo(int numElem, AttrList* ad, LineRec* LR, bool GroupRollup
 		LR[i-1].HasDetail |= DetailWtResUsed;
 	}
 
-    if (!ad->LookupString(attrAcctGroup.Value(), AcctGroup)) {
+    if (!ad->LookupString(attrAcctGroup, AcctGroup)) {
         AcctGroup = "<none>";
     }
-    if (!ad->LookupBool(attrIsAcctGroup.Value(), IsAcctGroup)) {
+    if (!ad->LookupBool(attrIsAcctGroup, IsAcctGroup)) {
         IsAcctGroup = false;
     }
 
-    char attr[32];
-    sprintf( attr, "EffectiveQuota%d", i );
+    char attr[64];
+    sprintf( attr, "EffectiveQuota%s", strI );
     if (ad->LookupFloat(attr, effective_quota)) LR[i-1].HasDetail |= DetailEffQuota;
-    sprintf( attr, "ConfigQuota%d", i );
+    sprintf( attr, "ConfigQuota%s", strI );
     if (ad->LookupFloat(attr, config_quota)) LR[i-1].HasDetail |= DetailCfgQuota;
 
     if (IsAcctGroup) {
@@ -927,14 +1195,14 @@ static void CollectInfo(int numElem, AttrList* ad, LineRec* LR, bool GroupRollup
         if (!strcmp(name,"<none>") || !strcmp(name,"."))
            LR[i-1].GroupId = 0;
 
-        sprintf( attr, "GroupAutoRegroup%d", i );
+        sprintf( attr, "GroupAutoRegroup%s", strI );
         bool regroup = false;
         if (ad->LookupBool(attr, regroup)) LR[i-1].HasDetail |= DetailSurplus;
         LR[i-1].Surplus = regroup ? SurplusRegroup : SurplusNone;
         if (regroup)
            GlobalSurplusPolicy = SurplusRegroup;
 
-        sprintf( attr, "SurplusPolicy%d", i );
+        sprintf( attr, "SurplusPolicy%s", strI );
         if (ad->LookupString(attr, policy, COUNTOF(policy) )) {
            LR[i-1].HasDetail |= DetailSurplus;
            if (MATCH == strcasecmp(policy, "regroup")) {
@@ -951,11 +1219,11 @@ static void CollectInfo(int numElem, AttrList* ad, LineRec* LR, bool GroupRollup
         }
 
         float sort_key = LR[i-1].SortKey;
-        sprintf( attr, "GroupSortKey%d", i );
+        sprintf( attr, "GroupSortKey%s", strI );
         if (ad->LookupFloat(attr, sort_key)) LR[i-1].HasDetail |= DetailSortKey;
         LR[i-1].SortKey = sort_key;
 
-        sprintf( attr, "SubtreeQuota%d", i );
+        sprintf( attr, "SubtreeQuota%s", strI );
         if (ad->LookupFloat(attr, subtree_quota)) LR[i-1].HasDetail |= DetailTreeQuota;
         if (GroupRollup && !(LR[i-1].HasDetail & DetailEffQuota)) {
            LR[i-1].HasDetail &= ~DetailPrios;
@@ -1195,7 +1463,7 @@ static const struct {
 };
 const int MAX_NAME_COLUMN_WIDTH = 99;
 
-static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag)
+static void PrintInfo(int tmLast, LineRec* LR, int NumElem, bool HierFlag)
 {
 
    // figure out the width of the longest name column.
@@ -1213,8 +1481,6 @@ static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag)
       }
    }
 
-   int tmLast = 0;
-   ad->LookupInteger( ATTR_LAST_UPDATE, tmLast );
    printf("Last Priority Update: %s\n",format_date(tmLast));
 
    LineRec Totals;
@@ -1236,6 +1502,7 @@ static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag)
    if (max_name < min_name) max_name = min_name;
    if (HierFlag) max_name += 2;
    char * Line  = (char*)malloc(max_name*2+cols_max_width+4);
+   ASSERT(Line);
 
    // print first row of headings
    CopyAndPadToWidth(Line,HierFlag ? "Group" : NULL,max_name+1,' ');
@@ -1284,17 +1551,20 @@ static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag)
       // We want to avoid counting totals twice for acct group records
       bool is_group = LR[j].IsAcctGroup;
 
-      if (LR[j].LastUsage < MinLastUsageTime) 
+      if (LR[j].LastUsage < MinLastUsageTime)  {
          continue;
+	  }
 
       if ( ! is_group) {
          ++UserCount;
-         if (HideUsers)
+         if (HideUsers) {
             continue;
+		 }
       } else {
          if (HideGroups || 
-             ( ! HierFlag && HideNoneGroupIfPossible && ! LR[j].GroupId))
-            continue;
+             ( ! HierFlag && HideNoneGroupIfPossible && ! LR[j].GroupId)) {
+            	continue;
+		 }
          // if we show any groups, then show the none group.
          HideNoneGroupIfPossible = false;
       }
@@ -1319,8 +1589,9 @@ static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag)
       // append columnar data into Line
       for (int ii = 0; ii < (int)COUNTOF(aCols); ++ii)
          {
-         if (!(aCols[ii].DetailFlag & DetailFlag))
+         if (!(aCols[ii].DetailFlag & DetailFlag)) {
             continue;
+		 }
 
          Line[ix++] = ' ';
 
@@ -1469,43 +1740,66 @@ static void PrintInfo(AttrList* ad, LineRec* LR, int NumElem, bool HierFlag)
 
 //-----------------------------------------------------------------
 
-static void usage(char* name) {
+static void usage(const char* name) {
   fprintf( stderr, "usage: %s [options] [edit-option | display-options]\n"
-     "\twhere [options] are\n"
-     "\t\t-pool <host>\t\tUse host as the central manager to query\n"
-	 "\t\t-inputfile <file>\tDisplay priorities from <file>\n"
-     "\t\t-help\t\t\tThis Screen\n"
-     "\twhere [edit-option] is one of\n"
-     "\t\t-resetusage <user>\tReset usage data for <user>\n"
-     "\t\t-resetall\t\tReset all useage data\n"
-     "\t\t-delete <user>\t\tRemove a user record from the accountant\n"
-     "\t\t-setprio <user> <val>\tSet priority for <user>\n"
-     "\t\t-setfactor <user> <val>\tSet priority factor for <user>\n"
-     "\t\t-setaccum <user> <val>\tSet Accumulated usage for <user>\n"
-     "\t\t-setbegin <user> <val>\tset last first date for <user>\n"
-     "\t\t-setlast <user> <val>\tset last active date for <user>\n"
-     "\twhere [display-options] are\n"
-     "\t\t-getreslist <user>\tDisplay list of resources for <user>\n"
-     "\tor one or more of\n"
-     "\t\t-allusers\t\tDisplay data for all users\n"
-     "\t\t-activefrom <month> <day> <year> Display data for users active since this date\n"
-     "\t\t-priority\t\tDisplay user priority fields\n"
-     "\t\t-usage\t\t\tDisplay user/group usage fields\n"
-     "\t\t-quotas\t\t\tDisplay group quota fields\n"
-     "\t\t-most\t\t\tDisplay most useful prio and usage fields\n"
-     "\t\t-all\t\t\tDisplay all fields\n"
-     "\t\t-flat\t\t\tDo not display users under their groups\n"
-     "\t\t-hierarchical\t\tDisplay users under their groups\n"
-     "\t\t-grouporder\t\tDisplay groups first, then users\n"
-     "\t\t-grouprollup\t\tGroup value are the sum of user values\n"
-     "\t\t-long\t\t\tVerbose output (entire classads)\n"
+     "    where [options] are\n"
+     "\t-name <name>\t\tName of negotiator\n"
+     "\t-pool <host>\t\tUse host as the central manager to query\n"
+     "\t-inputfile <file>\tDisplay priorities from <file>\n"
+     "\t-help\t\t\tThis Screen\n"
+     "\t-debug[:<opts>]\t\tSend debug output to stderr, <opts> overrides TOOL_DEBUG\n"
+     "    where [edit-option] is one of\n"
+     "\t-resetusage <user>\tReset usage data for <user>\n"
+     "\t-resetall\t\tReset all usage data\n"
+     "\t-delete <user>\t\tRemove a user record from the accountant\n"
+     "\t-setprio <user> <val>\tSet priority for <user>\n"
+     "\t-setfactor <user> <val>\tSet priority factor for <user>\n"
+     "\t-setaccum <user> <val>\tSet Accumulated usage for <user>\n"
+     "\t-setbegin <user> <val>\tset last first date for <user>\n"
+     "\t-setlast <user> <val>\tset last active date for <user>\n"
+     "    where [display-options] are\n"
+     "\t-getreslist <user>\tDisplay list of resources for <user>\n"
+     "    or one or more of\n"
+     "\t-allusers\t\tDisplay data for all users\n"
+     "\t-activefrom <month> <day> <year> Display data for users active since this date\n"
+     "\t-priority\t\tDisplay user priority fields\n"
+     "\t-usage\t\t\tDisplay user/group usage fields\n"
+     "\t-quotas\t\t\tDisplay group quota fields\n"
+     "\t-most\t\t\tDisplay most useful prio and usage fields\n"
+     "\t-all\t\t\tDisplay all fields\n"
+     "\t-flat\t\t\tDo not display users under their groups\n"
+     "\t-hierarchical\t\tDisplay users under their groups\n"
+     "\t-grouporder\t\tDisplay groups first, then users\n"
+     "\t-grouprollup\t\tGroup value are the sum of user values\n"
+     "\t-collector\t\tForce the query to come from the collector\n"
+     "\t-negotiator\t\tForce the query to come from the negotiator\n"
+     "\t-long\t\t\tVerbose output (entire classads)\n"
+     "\t  -legacy\t\tCauses -long to show a single classad\n"
+     "\t  -modular\t\tCauses -long to show a classad per userprio record\n"
+     "\t-constraint <expr>\tDisplay users/groups that match <expr>\n"
+     "\t\t\t\twhen used with -long -modular or -autoformat\n"
+     "\t-autoformat[:jlhVr,tng] <attr> [<attr2> [...]]\n"
+     "\t-af[:jlhVr,tng] <attr> [attr2 [...]]\n"
+     "\t    Print attr(s) with automatic formatting\n"
+     "\t    the [jlhVr,tng] options modify the formatting\n"
+     "\t        j   display Job id\n"
+     "\t        l   attribute labels\n"
+     "\t        h   attribute column headings\n"
+     "\t        V   %%V formatting (string values are quoted)\n"
+     "\t        r   %%r formatting (raw/unparsed values)\n"
+     "\t        ,   comma after each value\n"
+     "\t        t   tab before each value (default is space)\n"
+     "\t        n   newline after each value\n"
+     "\t        g   newline between ClassAds, no space before values\n"
+     "\t    use -af:h to get tabular values with headings\n"
+     "\t    use -af:lrng to get -long equivalent format\n"
      , name );
   exit(1);
 }
 
 //-----------------------------------------------------------------
 
-static void PrintResList(AttrList* ad)
+static void PrintResList(ClassAd* ad)
 {
   // fPrintAd(stdout, *ad);
 

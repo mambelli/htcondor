@@ -151,8 +151,11 @@ protected:
 	int rm_kill_sig;
 	int hold_kill_sig;
 
-	UtcTime job_start_time;
-	UtcTime job_exit_time;
+	struct timeval job_start_time;
+	struct timeval job_exit_time;
+
+	virtual int outputOpenFlags() { return O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_LARGEFILE; }
+	virtual int streamingOpenFlags( bool isOutput ) { return isOutput ? O_CREAT | O_TRUNC | O_WRONLY : O_RDONLY; }
 
 	enum std_file_type {
 		SFT_IN, SFT_OUT, SFT_ERR
@@ -166,7 +169,7 @@ protected:
 	                 MyString* out_name);
 
 	int openStdFile( std_file_type type,
-	                 const char* attr, 
+	                 const char* attr,
 	                 bool allow_dash,
 	                 const char* log_header);
 

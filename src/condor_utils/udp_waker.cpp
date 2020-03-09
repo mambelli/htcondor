@@ -25,7 +25,7 @@
 #include "condor_classad.h"
 #include "condor_attributes.h"
 #include "condor_adtypes.h"
-#include "my_hostname.h"
+#include "ipv6_hostname.h"
 #include "daemon.h"
 #include "condor_sinful.h"
 
@@ -57,12 +57,14 @@ UdpWakeOnLanWaker::UdpWakeOnLanWaker (
 	: WakerBase (), 
 	m_port ( port )
 {
+	// TODO: Picking IPv4 arbitrarily.
+	MyString my_ip = get_local_ipaddr(CP_IPV4).to_ip_string();
 
     strncpy ( m_mac, mac, STRING_MAC_ADDRESS_LENGTH-1 );
 	m_mac[STRING_MAC_ADDRESS_LENGTH-1] = '\0';
     strncpy ( m_subnet, subnet, MAX_IP_ADDRESS_LENGTH-1 );
 	m_subnet[MAX_IP_ADDRESS_LENGTH-1] = '\0';
-    strncpy ( m_public_ip, my_ip_string (), MAX_IP_ADDRESS_LENGTH-1 );
+    strncpy ( m_public_ip, my_ip.Value(), MAX_IP_ADDRESS_LENGTH-1 );
 	m_public_ip[MAX_IP_ADDRESS_LENGTH-1] = '\0';
     m_can_wake = initialize ();	
 
@@ -74,6 +76,10 @@ UdpWakeOnLanWaker::UdpWakeOnLanWaker (
 {
 
     int     found   = 0;
+
+	// Basic initialization
+	m_port = 0;
+    memset ( &m_broadcast, 0, sizeof (m_broadcast));
 
     /* make sure we are only capable of sending the WOL
     magic packet if all of the initialization succeds */
@@ -312,7 +318,11 @@ UdpWakeOnLanWaker::initializeBroadcastAddress ()
     m_broadcast.sin_addr.s_addr ^= 0xffffffff;
 
     /* logically or the IP address with the inverted subnet mast */
-    inet_pton(AF_INET, m_public_ip, &public_ip_address.sin_addr.s_addr);
+    if (inet_pton(AF_INET, m_public_ip, &public_ip_address.sin_addr.s_addr) < 1)
+	{
+		dprintf(D_ALWAYS, "UDP waker, public ip is not a valid address, %s\n", m_public_ip);
+		goto Cleanup;
+	}
     m_broadcast.sin_addr.s_addr |= public_ip_address.sin_addr.s_addr;
 
     /* log display broadcast address */
@@ -426,7 +436,11 @@ UdpWakeOnLanWaker::doWake () const
     }
 
 	int  error	= SOCKET_ERROR;
+#ifdef WIN32
+	INT_PTR sock = INVALID_SOCKET;
+#else
 	int	 sock	= INVALID_SOCKET;
+#endif
 	int	 on		= 1;
 	bool ok		= false;
 	

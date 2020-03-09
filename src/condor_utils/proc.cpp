@@ -21,25 +21,18 @@
  
 #include "condor_common.h"
 
-#if defined(AIX32)
-#	define _BSD
-#endif
-
 #ifndef WIN32
 #include <sys/wait.h>
 #endif
 #include "proc.h"
 #include "condor_debug.h"
 
-#if defined(AIX31) || defined(AIX32)
-#include <time.h>
-#endif
-
 #include "util_lib_proto.h"
 
 int		DontDisplayTime;
 
-
+// note format_time.cpp has a version of this function that takes a time_t
+// does anyone actually link to this one?
 #define SECOND	1
 #define MINUTE	(60 * SECOND)
 #define HOUR	(60 * MINUTE)

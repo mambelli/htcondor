@@ -38,11 +38,8 @@ int GlobusResource::monitorDisableLength = DEFAULT_GM_DISABLE_LENGTH;
 int GlobusResource::gahpCallTimeout = 300;	// default value
 bool GlobusResource::enableGridMonitor = false;
 
-#define HASH_TABLE_SIZE			500
-
-HashTable <HashKey, GlobusResource *>
-    GlobusResource::ResourcesByName( HASH_TABLE_SIZE,
-									 hashFunction );
+HashTable <std::string, GlobusResource *>
+    GlobusResource::ResourcesByName( hashFunction );
 
 static unsigned int g_MonitorUID = 0;
 
@@ -59,7 +56,7 @@ GlobusResource *GlobusResource::FindOrCreateResource( const char *resource_name,
 	const char *hash_name = HashName( canonical_name, proxy->subject->fqan );
 	ASSERT(hash_name);
 
-	rc = ResourcesByName.lookup( HashKey( hash_name ), resource );
+	rc = ResourcesByName.lookup( hash_name, resource );
 	if ( rc != 0 ) {
 		resource = new GlobusResource( canonical_name, proxy, is_gt5 );
 		ASSERT(resource);
@@ -67,7 +64,7 @@ GlobusResource *GlobusResource::FindOrCreateResource( const char *resource_name,
 			delete resource;
 			resource = NULL;
 		} else {
-			ResourcesByName.insert( HashKey( hash_name ), resource );
+			ResourcesByName.insert( hash_name, resource );
 		}
 	} else {
 		ASSERT(resource);
@@ -105,6 +102,7 @@ GlobusResource::GlobusResource( const char *resource_name,
 	monitorDirectory = NULL;
 	monitorJobStatusFile = NULL;
 	monitorLogFile = NULL;
+	jobStatusFileLastReadTime = 0;
 	logFileLastReadTime = 0;
 	jobStatusFileLastUpdate = 0;
 	monitorGramJobId = NULL;
@@ -118,7 +116,7 @@ GlobusResource::GlobusResource( const char *resource_name,
 
 GlobusResource::~GlobusResource()
 {
-	ResourcesByName.remove( HashKey( HashName( resourceName, proxyFQAN ) ) );
+	ResourcesByName.remove( HashName( resourceName, proxyFQAN ) );
 	if ( checkMonitorTid != TIMER_UNSET ) {
 		daemonCore->Cancel_Timer( checkMonitorTid );
 	}
@@ -254,6 +252,8 @@ void GlobusResource::PublishResourceAd( ClassAd *resource_ad )
 	resource_ad->Assign( "RestartJobmanagerLimit", restartJMLimit );
 	resource_ad->Assign( "RestartJobmanagersAllowed", restartJMsAllowed.Number() );
 	resource_ad->Assign( "RestartJobmanagersWanted", restartJMsWanted.Number() );
+
+	gahp->PublishStats( resource_ad );
 }
 
 void GlobusResource::UnregisterJob( BaseJob *base_job )
@@ -540,11 +540,11 @@ GlobusResource::CheckMonitor()
 		int log_mod_time;
 
 		if(monitorJobStatusFile == NULL) {
-			EXCEPT("Consistency problem for GlobusResource %s, null job status file name\n", resourceName);
+			EXCEPT("Consistency problem for GlobusResource %s, null job status file name", resourceName);
 		}
 
 		if(monitorLogFile == NULL) {
-			EXCEPT("Consistency problem for GlobusResource %s, null monitor log file name\n", resourceName);
+			EXCEPT("Consistency problem for GlobusResource %s, null monitor log file name", resourceName);
 		}
 
 		rc = stat( monitorJobStatusFile, &file_status );
@@ -584,7 +584,7 @@ GlobusResource::CheckMonitor()
 
 			} else {
 				EXCEPT("ReadMonitorJobStatusFile returned unexpected %d "
-					"(for %s)\n", (int)status, resourceName);
+					"(for %s)", (int)status, resourceName);
 			}
 
 		}
@@ -611,7 +611,7 @@ GlobusResource::CheckMonitor()
 					monitorActive = true;
 					registeredJobs.Rewind();
 					while ( registeredJobs.Next( base_job ) ) {
-						job = dynamic_cast<GlobusJob*>( base_job );
+						job = static_cast<GlobusJob*>( base_job );
 						job->SetEvaluateState();
 					}
 				}
@@ -734,16 +734,18 @@ GlobusResource::CleanupMonitorJob()
 
 		formatstr( tmp_dir, "%s.remove", monitorDirectory );
 
-		MSC_SUPPRESS_WARNING_FIXME(6031) // warning: return value of 'rename' ignored.
-		rename( monitorDirectory, tmp_dir.c_str() );
+		if (0 != rename( monitorDirectory, tmp_dir.c_str())) {
+			dprintf(D_ALWAYS, "Cannot rename %s to %s\n", monitorDirectory, tmp_dir.c_str());
+		}
 		free( monitorDirectory );
 		monitorDirectory = NULL;
 
 		Directory tmp( tmp_dir.c_str() );
 		tmp.Remove_Entire_Directory();
 
-		MSC_SUPPRESS_WARNING_FIXME(6031) // warning: return value of 'rmdir' ignored.
-		rmdir( tmp_dir.c_str() );
+		if (0 != rmdir(tmp_dir.c_str())){
+			dprintf(D_ALWAYS, "Cannot remove %s\n", tmp_dir.c_str());
+		}
 	}
 	if(monitorJobStatusFile)
 	{
@@ -869,7 +871,7 @@ GlobusResource::ReadMonitorJobStatusFile()
 	int job_count = 0;
 
 	if(monitorJobStatusFile == NULL) {
-		EXCEPT("Consistency problem for GlobusResource::ReadMonitorJobStatusFile %s, null job status file name\n", resourceName);
+		EXCEPT("Consistency problem for GlobusResource::ReadMonitorJobStatusFile %s, null job status file name", resourceName);
 	}
 
 	fp = safe_fopen_wrapper_follow( monitorJobStatusFile, "r" );
@@ -916,7 +918,7 @@ GlobusResource::ReadMonitorJobStatusFile()
 
 			job_count++;
 
-			rc = JobsByContact.lookup( HashKey( globusJobId(contact) ), job );
+			rc = JobsByContact.lookup( globusJobId(contact), job );
 			if ( rc == 0 && job != NULL ) {
 				if ( status == GLOBUS_GRAM_PROTOCOL_JOB_STATE_DONE ) {
 					status=GLOBUS_GRAM_PROTOCOL_JOB_STATE_STAGE_OUT;
@@ -967,7 +969,7 @@ GlobusResource::ReadMonitorLogFile()
 
 	if( monitorLogFile == NULL)
 	{
-			EXCEPT("Consistency problem for GlobusResource::ReadMonitorLogFile %s, null monitor log file name\n", resourceName);
+			EXCEPT("Consistency problem for GlobusResource::ReadMonitorLogFile %s, null monitor log file name", resourceName);
 	}
 
 	fp = safe_fopen_wrapper_follow( monitorLogFile, "r" );

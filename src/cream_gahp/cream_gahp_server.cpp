@@ -31,6 +31,8 @@
 #include <ctime>
 #include <queue>
 #include <map>
+#include "globus_common.h"
+#include "gssapi.h"
 #include "glite/ce/cream-client-api-c/CreamProxyFactory.h"
 #include "glite/ce/cream-client-api-c/JobDescriptionWrapper.h"
 #include "glite/ce/cream-client-api-c/creamApiLogger.h"
@@ -1880,7 +1882,7 @@ int handle_results( char **input_line )
 
 	results_pending = false; // Reset results pending
 	
-	gahp_printf( "S %d\n", resultQueue.size( ));
+	gahp_printf( "S %lu\n", resultQueue.size( ));
 	
 	while ( !resultQueue.empty( )) {
 		gahp_printf( "%s\n", (resultQueue.front()).c_str( ));
@@ -2387,8 +2389,10 @@ int main(int /*argc*/, char ** /*argv*/)
 		//create & detach worker threads
 	for (i = 0; i < worker_cnt; i++){
 		
-		pthread_create(&threads[i], NULL, worker_main, NULL);
-		pthread_detach(threads[i]);
+		int result = pthread_create(&threads[i], NULL, worker_main, NULL);
+		if (result == 0) {
+			pthread_detach(threads[i]);
+		}
 	}
 	
 	while (1) {

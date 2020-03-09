@@ -36,6 +36,7 @@ namespace classad {
 
 ClassAdParser::
 ClassAdParser ()
+	: oldClassAd(false)
 {
 }
 
@@ -46,11 +47,38 @@ ClassAdParser::
 }
 
 
+void ClassAdParser::
+SetOldClassAd( bool old_syntax )
+{
+	oldClassAd = old_syntax;
+	lexer.SetOldClassAdLex( old_syntax );
+}
+
+bool ClassAdParser::
+GetOldClassAd()
+{
+	return oldClassAd;
+}
+
 bool ClassAdParser::
 ParseExpression( const string &buffer, ExprTree *&tree, bool full )
 {
 	bool              success;
 	StringLexerSource lexer_source(&buffer);
+
+	success      = false;
+	if (lexer.Initialize(&lexer_source)) {
+		success = parseExpression(tree, full);
+	}
+
+	return success;
+}
+
+bool ClassAdParser::
+ParseExpression( const char *buffer, ExprTree *&tree, bool full )
+{
+	bool              success;
+	CharLexerSource lexer_source(buffer);
 
 	success      = false;
 	if (lexer.Initialize(&lexer_source)) {
@@ -79,6 +107,25 @@ ParseExpression( const string &buffer, bool full)
 {
 	ExprTree          *tree;
 	StringLexerSource lexer_source(&buffer);
+
+	tree = NULL;
+
+	if (lexer.Initialize(&lexer_source)) {
+		if (!parseExpression(tree, full)) {
+			if (tree) {
+				delete tree;
+				tree = NULL;
+			}
+		}
+	}
+	return tree;
+}
+
+ExprTree *ClassAdParser::
+ParseExpression( const char *buffer, bool full)
+{
+	ExprTree          *tree;
+	CharLexerSource lexer_source(buffer);
 
 	tree = NULL;
 
@@ -191,16 +238,6 @@ bool ClassAdParser::ParseClassAd(FILE *file, ClassAd &classad, bool full)
 	return success;
 }
 
-bool ClassAdParser::ParseClassAd(istream &stream, ClassAd &classad, bool full)
-{
-	bool                    success;
-	InputStreamLexerSource lexer_source(stream);
-
-	success = ParseClassAd(&lexer_source, classad, full);
-
-	return success;
-}
-
 bool ClassAdParser::
 ParseClassAd(LexerSource *lexer_source, ClassAd &classad, bool full)
 {
@@ -211,14 +248,7 @@ ParseClassAd(LexerSource *lexer_source, ClassAd &classad, bool full)
 		success = parseClassAd(classad, full);
 	}
 
-	if (success) {
-		// The lexer swallows one extra character, so if we have
-		// two classads back to back we need to make sure to unread
-		// one of the characters.
-		if (lexer_source->ReadPreviousCharacter() != -1) {
-			lexer_source->UnreadCharacter();
-		} 
-	} else {
+	if (! success) {
 		classad.Clear();
 	}
 
@@ -289,16 +319,6 @@ ParseClassAd(FILE *file, bool full)
 }
 
 ClassAd *ClassAdParser::
-ParseClassAd(istream &stream, bool full)
-{
-	ClassAd                *ad;
-	InputStreamLexerSource lexer_source(stream);
-
-	ad = ParseClassAd(&lexer_source, full);
-	return ad;
-}
-
-ClassAd *ClassAdParser::
 ParseClassAd(LexerSource *lexer_source, bool full)
 {
 	ClassAd  *ad;
@@ -311,11 +331,6 @@ ParseClassAd(LexerSource *lexer_source, bool full)
 					delete ad;
 					ad = NULL;
 				}
-			} else if (lexer_source->ReadPreviousCharacter() != -1) {
-				// The lexer swallows one extra character, so if we have
-				// two classads back to back we need to make sure to unread
-				// one of the characters.
-				lexer_source->UnreadCharacter();
 			}
 		}
 	}
@@ -342,18 +357,25 @@ parseExpression( ExprTree *&tree, bool full )
 		lexer.ConsumeToken();
 		treeL = tree;
 
-		parseExpression(treeM);
-		if( ( tt = lexer.ConsumeToken() ) != Lexer::LEX_COLON ) {
-			CondorErrno = ERR_PARSE_ERROR;
-			CondorErrMsg="expected LEX_COLON, but got "+
-				string(Lexer::strLexToken(tt));
-			if( treeL ) delete treeL; 
-			if( treeM ) delete treeM;
-			tree = NULL;
-			return false;
+		if (lexer.PeekToken() == Lexer::LEX_COLON) {
+			// middle expression is empty
+			lexer.ConsumeToken(); // consume the colon
+			treeM = NULL; // mean return the lhs
+		} else {
+			// we have a middle expression
+			parseExpression(treeM);
+			if( ( tt = lexer.ConsumeToken() ) != Lexer::LEX_COLON ) {
+				CondorErrno = ERR_PARSE_ERROR;
+				CondorErrMsg="expected LEX_COLON, but got "+
+					string(Lexer::strLexToken(tt));
+				if( treeL ) delete treeL; 
+				if( treeM ) delete treeM;
+				tree = NULL;
+				return false;
+			}
 		}
 		parseExpression(treeR);
-		if( treeL && treeM && treeR && ( newTree=Operation::MakeOperation( 
+		if( treeL && treeR && ( newTree=Operation::MakeOperation( 
 				Operation::TERNARY_OP, treeL, treeM, treeR ) ) ) {
 			tree = newTree;
 			return( true );
@@ -1057,29 +1079,6 @@ parsePrimaryExpression(ExprTree *&tree)
 				val.SetStringValue( s );
 				return( (tree=Literal::MakeLiteral(val)) != NULL );
 			}
-
-		case Lexer::LEX_ABSOLUTE_TIME_VALUE:
-			{
-				Value	val;
-				abstime_t	asecs;
-
-				tv.GetAbsTimeValue( asecs );
-				lexer.ConsumeToken( );
-				val.SetAbsoluteTimeValue( asecs );
-				return( (tree=Literal::MakeLiteral(val)) != NULL );
-			}
-
-		case Lexer::LEX_RELATIVE_TIME_VALUE:
-			{
-				Value   val;
-				double  secs;
-
-				tv.GetRelTimeValue( secs );
-				lexer.ConsumeToken( );
-				val.SetRelativeTimeValue( secs );
-				return( (tree=Literal::MakeLiteral(val)) != NULL );
-			}
-
 		default:
 			tree = NULL;
 			return false;
@@ -1129,6 +1128,12 @@ parseArgumentList( vector<ExprTree*>& argList )
 			lexer.ConsumeToken();
 		else
 		if( tt != Lexer::LEX_CLOSE_PAREN ) {
+			vector<ExprTree*>::iterator itr = argList.begin( );
+			while(itr != argList.end()) {
+				delete *itr;
+				itr++;
+			}
+			argList.clear( );
 			CondorErrno = ERR_PARSE_ERROR;
 			CondorErrMsg = "expected LEX_COMMA or LEX_CLOSE_PAREN but got " + 
 				string( Lexer::strLexToken( tt ) );
@@ -1155,7 +1160,6 @@ parseClassAd( ClassAd &ad , bool full )
 	string				s;
 
 	ad.Clear( );
-	ad.DisableDirtyTracking();
 
 	if( ( tt = lexer.ConsumeToken() ) != Lexer::LEX_OPEN_BOX ) return false;
 	tt = lexer.PeekToken();
@@ -1224,7 +1228,6 @@ parseClassAd( ClassAd &ad , bool full )
 		return false;
 	}
 
-	ad.EnableDirtyTracking();
 	return true;
 }
 
@@ -1249,7 +1252,18 @@ parseExprList( ExprList *&list , bool full )
 	while( tt != Lexer::LEX_CLOSE_BRACE ) {
 		// parse the expression
 		parseExpression( tree );
-		if( tree == NULL ) return false;
+		if( tree == NULL ) {
+			CondorErrno = ERR_PARSE_ERROR;
+			CondorErrMsg = "while parsing expression list:  expected "
+				"LEX_CLOSE_BRACE or LEX_COMMA but got "+
+				string(Lexer::strLexToken(tt));
+			vector<ExprTree*>::iterator i = loe.begin( );
+			while(i != loe.end()) {
+				delete *i;
+				i++;
+			}
+			return false;
+		}
 
 		// insert the expression into the list
 		loe.push_back( tree );
@@ -1360,14 +1374,5 @@ Lexer::TokenType ClassAdParser::ConsumeToken(void)
         return Lexer::LEX_TOKEN_ERROR;
     }
 }
-
-std::istream & operator>>(std::istream &stream, ClassAd &ad)
-{
-	ClassAdParser parser;
-
-	parser.ParseClassAd(stream, ad);
-	return stream;
-}
-
 
 } // classad

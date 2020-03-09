@@ -104,18 +104,14 @@ JICLocalConfig::getLocalJobAd( void )
 			"STARTER_ALLOW_RUNAS_OWNER", false, true, NULL, job_ad );
 		if ( run_as_owner ) {
 				// Add the RunAsOwner attribute:
-			buffer.formatstr( "%s = True", ATTR_JOB_RUNAS_OWNER );
-			job_ad->Insert( buffer.Value() );
+			job_ad->Assign( ATTR_JOB_RUNAS_OWNER, true );
 				// Parse the OWNER attribute and add the new
 				// OWNER and NTDOMAIN attributes:
 			char const *local_domain = ".";
 			char *name = NULL, *domain = NULL;
 			getDomainAndName ( owner_defined, domain, name );
-			buffer.formatstr( "%s = \"%s\"", ATTR_OWNER, name );
-			job_ad->Insert( buffer.Value() );
-			buffer.formatstr( "%s = \"%s\"", ATTR_NT_DOMAIN, 
-				domain ? domain : local_domain );
-			job_ad->Insert( buffer.Value() );
+			job_ad->Assign( ATTR_OWNER, name );
+			job_ad->Assign( ATTR_NT_DOMAIN, domain ? domain : local_domain );
 		} else {
 			dprintf( D_ALWAYS, "Local job \"Owner\" defined, "
 				"but will not be used: please set "
@@ -147,22 +143,15 @@ JICLocalConfig::getLocalJobAd( void )
 
 		// only check for cluster and proc in the config file if we
 		// didn't get them on the command-line
-	MyString line;
 	if( job_cluster < 0 ) { 
 		getInt( 0, ATTR_CLUSTER_ID, "cluster" );
 	} else {
-		line = ATTR_CLUSTER_ID;
-		line += '=';
-		line += job_cluster;
-		job_ad->Insert( line.Value() );
+		job_ad->Assign( ATTR_CLUSTER_ID, job_cluster );
 	}
 	if( job_proc < 0 ) {
 		getInt( 1, ATTR_PROC_ID, "proc" );
 	} else {
-		line = ATTR_PROC_ID;
-		line += '=';
-		line += job_proc;
-		job_ad->Insert( line.Value() );
+		job_ad->Assign( ATTR_PROC_ID, job_proc );
 	}
 	return true;
 }
@@ -198,7 +187,7 @@ JICLocalConfig::getAttr( bool warn, bool is_string, const char* attr,
 {
 	char* tmp;
 	char param_name[256];
-	MyString expr;
+	std::string expr;
 	bool needs_quotes = false;
 
 	if( job_ad->LookupExpr(attr) ) {
@@ -225,8 +214,6 @@ JICLocalConfig::getAttr( bool warn, bool is_string, const char* attr,
 		needs_quotes = true;
 	}
 
-	expr = attr;
-	expr += " = ";
 	if( needs_quotes ) {
 		expr += "\"";
 	}
@@ -236,11 +223,11 @@ JICLocalConfig::getAttr( bool warn, bool is_string, const char* attr,
 	}
 	free( tmp );
 
-	if( job_ad->Insert(expr.Value()) ) {
+	if( job_ad->AssignExpr(attr, expr.c_str()) ) {
 		return true;
 	}
 	dprintf( D_ALWAYS, "ERROR: Failed to insert into job ad: %s\n",
-			 expr.Value() );
+			 expr.c_str() );
 	return false;
 }
 
@@ -294,23 +281,11 @@ JICLocalConfig::getUniverse( void )
 		return false;
 	}
 
-		// MyString likes to append strings, so print out the string
-		// version of the integer so we can use it.
-	char univ_str[32];
-	sprintf( univ_str, "%d", univ );
-
-		// finally, we can construct the expression and insert it into
-		// the ClassAd
-	MyString expr;
-	expr = ATTR_JOB_UNIVERSE;
-	expr += " = ";
-	expr += univ_str;
-
-	if( job_ad->Insert(expr.Value()) ) {
+	if( job_ad->Assign( ATTR_JOB_UNIVERSE, univ ) ) {
 		return true;
 	}
-	dprintf( D_ALWAYS, "ERROR: Failed to insert into job ad: %s\n",
-			 expr.Value() );
+	dprintf( D_ALWAYS, "ERROR: Failed to insert into job ad: %s = %d\n",
+			 ATTR_JOB_UNIVERSE, univ );
 	return false;
 }
 

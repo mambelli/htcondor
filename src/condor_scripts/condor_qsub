@@ -267,7 +267,14 @@ clean_error() {
 }
 
 # as long as there are relevant job in the queue wait and try again
-while [ \$(condor_q -long -attributes Owner \$hold_jids | grep "$USER" | wc -l) -ge 1 ]; do
+counter=3
+while [ \$(condor_q -long -attributes Owner \$hold_jids | grep "$USER" | wc -l) -ge 1 -o \$counter -ge 1 ]; do
+	job_count=\$(condor_q -long -attributes Owner \$hold_jids | grep "$USER" | wc -l)
+	if [ \$job_count -eq 0 ]; then
+		counter=\$((counter-1))
+	else
+		counter=3
+	fi
 	sleep 5
 done
 
@@ -691,7 +698,7 @@ if [ -n "$deferral_date_time" ]; then
 #	printf "+HoldReasonCode = 15\n" >> $submit_file
 #	# We want to make sure that the reason why the job would be released from being on hold is because we put the job
 #	# on hold on submission and the current time is after the specified eligible execution time.
-#	printf "periodic_release = ( ( CurrentTime >= $deferral_unix_epoch ) && ( HoldReasonCode == 15 ) )\n" >> $submit_file
+#	printf "periodic_release = ( ( time() >= $deferral_unix_epoch ) && ( HoldReasonCode == 15 ) )\n" >> $submit_file
 ############################################################
 # The Deferral Time Route
 ############################################################
@@ -827,7 +834,7 @@ if [ -n "$resource_list" ]; then
 #			cput=*) shift;; #ignore
 #			epilogue=*) shift;; #NEED DAGMan or PostCmd
 			file=*) file_value=${resource_type#*=}
-				file_value="echo $file_value | tr a-z A-Z" #Uppercase
+				file_value=`echo $file_value | tr a-z A-Z` #Uppercase
 				printf "request_disk = $file_value\n" >> $submit_file;;
 			host=*) host_value=${resource_type#*=}
 				host_string="\"Machine == $host_value\""
@@ -838,7 +845,7 @@ if [ -n "$resource_list" ]; then
 				fi;;
 #				printf "requirements = \"Machine == $host_value\"\n" >> $submit_file;;
 			mem=*) mem_value=${resource_type#*=}
-				mem_value="echo $mem_value | tr a-z A-Z"
+				mem_value=`echo $mem_value | tr a-z A-Z`
 				printf "request_memory = $mem_value\n" >> $submit_file;;
 #			nice=*) nice_value=(((${resource_type#*=})*(-1))) #issues with *-1
 #				printf "JobPriority = $nice_value\n" >> $submit_file;;
@@ -923,7 +930,7 @@ if [ -n "$resource_list" ]; then
 #			pmem=*) pmem_value=${resource_type#*=}
 #				printf "RequestMemory = $pmem_value\n" >> $submit_file;;
 			procs=*) procs_value=${resource_type#*=}
-				printf "requst_cpus = $procs_value\n" >> $submit_file;;
+				printf "request_cpus = $procs_value\n" >> $submit_file;;
 # More potential support for MPI commands/parallel universe.
 #				printf "machine_count = $procs_value\n" >> $submit_file
 #				if [ "$procs_value" -gt 1 ]; then

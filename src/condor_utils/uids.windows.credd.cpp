@@ -20,7 +20,6 @@
 
 #include "condor_common.h"
 #include "condor_debug.h"
-#include "condor_syscall_mode.h"
 #include "condor_uid.h"
 #include "condor_config.h"
 #include "condor_environ.h"
@@ -42,13 +41,14 @@ bool get_password_from_credd (
 	Daemon credd(DT_CREDD);
 	Sock * credd_sock = credd.startCommand(CREDD_GET_PASSWD,Stream::reli_sock,10);
 	if ( credd_sock ) {
+		credd_sock->set_crypto_mode(true);
 		credd_sock->put((char*)username);	// send user
 		credd_sock->put((char*)domain);		// send domain
 		credd_sock->end_of_message();
 		credd_sock->decode();
 		pw[0] = '\0';
 		char *my_buffer = pw;
-		if ( credd_sock->code(my_buffer,cb) && pw[0] ) {
+		if ( credd_sock->get(my_buffer,cb) && pw[0] ) {
 			got_password = true;
 		} else {
 			dprintf(D_FULLDEBUG,
@@ -73,7 +73,7 @@ cache_credd_locally (
 	bool fAdded = false;
 	MyString my_full_name;
 	my_full_name.formatstr("%s@%s",username,domain);
-	if ( addCredential(my_full_name.Value(),pw) == SUCCESS ) {
+	if ( do_store_cred(my_full_name.Value(),pw,ADD_PWD_MODE) == SUCCESS ) {
 		dprintf(D_FULLDEBUG,
 			"init_user_ids: "
 			"Successfully stashed credential in registry for user %s\n",

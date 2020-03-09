@@ -78,7 +78,7 @@ extern char *myUserName;
 extern int main_shutdown_graceful();
 
 int
-request_pipe_handler(Service*, int) {
+request_pipe_handler(int) {
 
 	std::string* next_line;
 	while ((next_line = request_buffer.GetNextLine()) != NULL) {
@@ -125,6 +125,7 @@ doContactSchedd()
 	bool do_reschedule = false;
 	int failure_line_num = 0;
 	int failure_errno = 0;
+	std::set< std::string, classad::CaseIgnLTStr > filter_attrs;
 
 	// Try connecting to schedd
 	DCSchedd dc_schedd ( ScheddAddr, ScheddPool );
@@ -560,10 +561,12 @@ doContactSchedd()
 
 	// Try connecting to the queue
 	Qmgr_connection * qmgr_connection;
-	
-	if ((qmgr_connection = ConnectQ(dc_schedd.addr(), QMGMT_TIMEOUT, false, NULL, NULL, dc_schedd.version() )) == NULL) {
+
+	errstack.clear();
+	if ((qmgr_connection = ConnectQ(dc_schedd.addr(), QMGMT_TIMEOUT, false, &errstack, NULL, dc_schedd.version() )) == NULL) {
 		error = TRUE;
-		formatstr( error_msg, "Error connecting to schedd %s", ScheddAddr );
+		formatstr( error_msg, "Error connecting to schedd %s: %s", ScheddAddr,
+				   errstack.getFullText().c_str() );
 		dprintf( D_ALWAYS, "%s\n", error_msg.c_str() );
 	} else {
 		errno = 0;
@@ -571,6 +574,11 @@ doContactSchedd()
 		if ( errno == ETIMEDOUT ) {
 			failure_line_num = __LINE__;
 			failure_errno = errno;
+			dprintf( D_ALWAYS, "Network error talking to schedd at line %d in "
+					 "doContactSchedd(), probably an authorization failure\n",
+					 failure_line_num );
+			formatstr( error_msg, "Network error talking to schedd, "
+					   "probably an authorization failure" );
 			goto contact_schedd_disconnect;
 		}
 	}
@@ -607,11 +615,12 @@ doContactSchedd()
 			goto contact_schedd_disconnect;
 		}
 
-		current_command->classad->ResetExpr();
 		ExprTree *tree;
 		const char *lhstr, *rhstr;
-		while( current_command->classad->NextExpr(lhstr, tree) ) {
+		for( auto itr = current_command->classad->begin(); itr != current_command->classad->end(); itr++ ) {
 
+			lhstr = itr->first.c_str();
+			tree = itr->second;
 			rhstr = ExprTreeToString( tree );
 			if( !lhstr || !rhstr) {
 				formatstr( error_msg, "ERROR: ClassAd problem in Updating by constraint %s",
@@ -707,8 +716,6 @@ update_report_result:
 	command_queue.Rewind();
 	while (command_queue.Next(current_command)) {
 		
-		error = FALSE;
-
 		if (current_command->status != SchedDRequest::SDCS_NEW)
 			continue;
 
@@ -721,10 +728,7 @@ update_report_result:
 		}
 
 		std::string success_job_ids="";
-		if (qmgr_connection == NULL) {
-			formatstr( error_msg, "Error connecting to schedd %s", ScheddAddr );
-			error = TRUE;
-		} else {
+		if (qmgr_connection != NULL) {
 			error = FALSE;
 			errno = 0;
 			BeginTransaction();
@@ -815,6 +819,17 @@ update_report_result:
 
 	dprintf (D_FULLDEBUG, "Processing SUBMIT_JOB requests\n");
 
+	// Starting in 8.5.8, schedd clients can't set X509-related attributes
+	// other than the name of the proxy file.
+	if ( ver_info.built_since_version(8,5,8) ) {
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_SUBJECT );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_EXPIRATION );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_EMAIL );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_VONAME );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_FIRST_FQAN );
+		 filter_attrs.insert( ATTR_X509_USER_PROXY_FQAN );
+	}
+
 	// SUBMIT_JOB
 	command_queue.Rewind();
 	while (command_queue.Next(current_command)) {
@@ -869,6 +884,18 @@ update_report_result:
 			error = TRUE;
 			error_msg =
 				"Number of submitted jobs would exceed MAX_JOBS_SUBMITTED\n";
+			dprintf( D_ALWAYS, "%s\n", error_msg.c_str() );
+		}
+		if( ProcId == -3 ) {
+			error = TRUE;
+			error_msg =
+				"Number of submitted jobs would exceed MAX_JOBS_PER_OWNER\n";
+			dprintf( D_ALWAYS, "%s\n", error_msg.c_str() );
+		}
+		if( ProcId == -4 ) {
+			error = TRUE;
+			error_msg =
+				"Number of submitted jobs would exceed MAX_JOBS_PER_SUBMISSION\n";
 			dprintf( D_ALWAYS, "%s\n", error_msg.c_str() );
 		}
 
@@ -943,11 +970,15 @@ update_report_result:
 			}
 
 			// Set all the classad attribute on the remote classad
-			current_command->classad->ResetExpr();
 			ExprTree *tree;
 			const char *lhstr, *rhstr;
-			while( current_command->classad->NextExpr(lhstr, tree) ) {
+			for( auto itr = current_command->classad->begin(); itr != current_command->classad->end(); itr++ ) {
+				lhstr = itr->first.c_str();
+				tree = itr->second;
 
+				if ( filter_attrs.find( lhstr ) != filter_attrs.end() ) {
+					continue;
+				}
 				rhstr = ExprTreeToString( tree );
 				if( !lhstr || !rhstr) {
 					formatstr( error_msg, "ERROR: ClassAd problem in Updating by constraint %s",
@@ -994,13 +1025,18 @@ submit_report_result:
 			}
 			current_command->status = SchedDRequest::SDCS_COMPLETED;
 		} else {
-			if ( RemoteCommitTransaction() < 0 ) {
+			CondorError errstack;
+			if ( RemoteCommitTransaction(0, &errstack) < 0 ) {
 				// We assume the preceeding SetAttribute() with NoAck
 				// is what really failed. Mark this command as failed
 				// and jump to the end (since the schedd has closed
 				// the connection). Any subsequent commands will be
 				// tried the next time we come through.
 				error_msg =  "ERROR: Failed to submit job";
+				if (errstack.subsys())
+				{
+					error_msg += ".  " + errstack.getFullText();
+				}
 				const char * result[] = {
 					GAHP_RESULT_FAILURE,
 					job_id_buff,
@@ -1024,6 +1060,18 @@ submit_report_result:
 		
 	// STATUS_CONSTRAINED
 	command_queue.Rewind();
+	if (qmgr_connection != NULL)
+	{
+		DisconnectQ(qmgr_connection, FALSE);
+		if ((qmgr_connection = ConnectQ(dc_schedd.addr(), QMGMT_TIMEOUT, true, &errstack, NULL, dc_schedd.version() )) == NULL)
+		{
+			formatstr(error_msg, "Error connecting to schedd %s for read-only commands: %s", ScheddAddr, errstack.getFullText().c_str());
+			dprintf(D_ALWAYS, "%s\n", error_msg.c_str());
+			failure_line_num = __LINE__;
+			failure_errno = errno;
+			goto contact_schedd_disconnect;
+		}
+	}
 	while (command_queue.Next(current_command)) {
 
 		if (current_command->status != SchedDRequest::SDCS_NEW)
@@ -1040,8 +1088,6 @@ submit_report_result:
 		if (qmgr_connection != NULL) {
 			SimpleList <std::string *> matching_ads;
 
-			error = FALSE;
-			
 			ClassAd *next_ad;
 			ClassAdList adlist;
 				// Only use GetAllJobsByConstraint if remote schedd is
@@ -1084,6 +1130,7 @@ submit_report_result:
 
 			// now output this list of classads into a result
 			const char ** result  = new const char* [matching_ads.Length() + 3];
+			ASSERT(result);
 
 			std::string _ad_count;
 			formatstr( _ad_count, "%d", matching_ads.Length() );
@@ -1132,15 +1179,17 @@ submit_report_result:
 			// incomplete commands and mark them as failed.
 			// TODO Consider retrying these commands, rather than
 			//   immediately marking them as failed.
-		if ( failure_errno == ETIMEDOUT ) {
-			dprintf( D_ALWAYS, "Timed out talking to schedd at line %d in "
-					 "doContactSchedd()\n", failure_line_num );
-			formatstr( error_msg, "Timed out talking to schedd" );
-		} else {
-			dprintf( D_ALWAYS, "Error talking to schedd at line %d in "
-					 "doContactSchedd(), errno=%d (%s)\n", failure_line_num,
-					 failure_errno, strerror(failure_errno) );
-			formatstr( error_msg, "Error talking to schedd" );
+		if ( error_msg.empty() ) {
+			if ( failure_errno == ETIMEDOUT ) {
+				dprintf( D_ALWAYS, "Network error talking to schedd at line %d in "
+						 "doContactSchedd()\n", failure_line_num );
+				formatstr( error_msg, "Network error talking to schedd" );
+			} else {
+				dprintf( D_ALWAYS, "Error talking to schedd at line %d in "
+						 "doContactSchedd(), errno=%d (%s)\n", failure_line_num,
+						 failure_errno, strerror(failure_errno) );
+				formatstr( error_msg, "Error talking to schedd" );
+			}
 		}
 		command_queue.Rewind();
 		while (command_queue.Next(current_command)) {
@@ -1475,6 +1524,13 @@ handle_gahp_command(char ** argv, int argc) {
 			init_done = true;
 		}
 		return TRUE;
+	} else if (!strcasecmp(argv[0], GAHP_COMMAND_UPDATE_TOKEN_FROM_FILE)) {
+		if (argc != 2) {
+			dprintf(D_ALWAYS, "Invalid args to %s\n", argv[0]);
+			return false;
+		}
+		param_insert("SCITOKENS_FILE", argv[1]);
+		return true;
 	}
 
 	dprintf (D_ALWAYS, "Invalid command %s\n", argv[0]);
@@ -1573,6 +1629,8 @@ enqueue_result (int req_id, const char ** results, const int argc)
 				case '\r':
 				case '\n':
 					*buffer += '\\';
+					// Fall through...
+					//@fallthrough@
 				default:
 					*buffer += results[i][j];
 				}

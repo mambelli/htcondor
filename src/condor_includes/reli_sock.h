@@ -28,6 +28,7 @@
 #include "condor_ipverify.h"
 #include "condor_md.h"
 
+#include <memory>
 
 /*
 **	R E L I A B L E    S O C K
@@ -37,6 +38,10 @@
 // They are for use with the Globus GSI gss-assist library.
 int relisock_gsi_get(void *arg, void **bufp, size_t *sizep);
 int relisock_gsi_put(void *arg,  void *buf, size_t size);
+// These variables hold the size of the last data block handled by each
+// respective function. They are part of a hacky workaround for a GSI bug.
+extern size_t relisock_gsi_get_last_size;
+extern size_t relisock_gsi_put_last_size;
 
 class Authentication;
 class Condor_MD_MAC;
@@ -55,6 +60,8 @@ class BlockingModeGuard;
 class ReliSock : public Sock {
 	friend class Authentication;
 	friend class BlockingModeGuard;
+	friend class DockerProc;
+	friend class OsProc;
 
 //	PUBLIC INTERFACE TO RELIABLE SOCKS
 //
@@ -96,12 +103,13 @@ public:
 	virtual int connect(char const *s, int port=0, 
 							bool do_not_block = false);
 
+	virtual int close();
 
 	virtual int do_reverse_connect(char const *ccb_contact,bool nonblocking);
 
 	virtual void cancel_reverse_connect();
 
-	virtual int do_shared_port_local_connect( char const *shared_port_id, bool nonblocking );
+	virtual int do_shared_port_local_connect( char const *shared_port_id, bool nonblocking,char const *sharedPortIP );
 
 		/** Connect this socket to another socket (s).
 			An implementation of socketpair() that works on windows as well
@@ -111,7 +119,8 @@ public:
 			                                use normal interface
 			@returns true on success, false on failure.
 		 */
-	bool connect_socketpair(ReliSock &dest,bool use_standard_interface=false);
+	bool connect_socketpair( ReliSock & dest );
+	bool connect_socketpair( ReliSock & dest, char const * asIfConnectingTo );
 
     ///
 	ReliSock();
@@ -125,15 +134,11 @@ public:
 
     ///
 	~ReliSock();
-    ///
-	void init();				/* shared initialization method */
 
     ///
 	int listen();
     /// FALSE means this is an incoming connection
 	int listen(condor_protocol proto, int port);
-    /// FALSE means this is an incoming connection
-	int listen(char *s);
 	bool isListenSock() { return _state == sock_special && _special_state == relisock_listen; }
 
     ///
@@ -144,7 +149,7 @@ public:
 	int accept(ReliSock *);
 
     ///
-	int put_line_raw( char *buffer );
+	int put_line_raw( const char *buffer );
     ///
 	int get_line_raw( char *buffer, int max_length );
     ///
@@ -152,7 +157,7 @@ public:
     ///
 	int get_bytes_raw( char *buffer, int length );
     ///
-	int put_bytes_nobuffer(char *buf, int length, int send_size=1);
+	int put_bytes_nobuffer(const char *buf, int length, int send_size=1);
     ///
 	int get_bytes_nobuffer(char *buffer, int max_length, int receive_size=1);
 
@@ -192,9 +197,20 @@ public:
 	// returns -1 on failure, 0 for ok
 	int put_empty_file( filesize_t *size );
 
-	/// returns -1 on failure, 0 for ok
-	int get_x509_delegation( filesize_t *size, const char *destination,
-							 bool flush_buffers=false );
+	/// returns delegation_error on failure, delegation_ok on success,
+	/// and delegation_continue if the delegation is incomplete.
+	///
+	/// The continuations are allowed only if state_ptr is non-NULL.
+	/// When more data is available on the socket, the caller should call
+	/// get_x509_delegation_finish.
+	enum x509_delegation_result {delegation_ok, delegation_continue, delegation_error};
+	x509_delegation_result get_x509_delegation( const char *destination, bool flush_buffers, void **state_ptr );
+
+	/// The second half of get_x509_delegation.  If state_ptr was non-NULL to the original function call,
+	/// one must pass the same pointer here.  The function takes ownership of the value and will call delete
+	/// on it.
+	x509_delegation_result get_x509_delegation_finish( const char *destination, bool flush_buffers, void *state_ptr );
+
 	/// returns -1 on failure, 0 for ok
 	// expiration_time: 0 if none; o.w. timestamp of delegated proxy expiration
 	// result_expiration_time: if non-NULL will be set to actual expiration
@@ -217,6 +233,12 @@ public:
 	void enter_reverse_connecting_state();
 	void exit_reverse_connecting_state(ReliSock *sock);
 
+		// returns a pointer to an internally managed
+		// buffer with a human-readable string containing
+		// tcp statistics from the TCP_INFO sockopt.  Don't free.
+		// may return null
+	char *get_statistics();
+
 #ifndef WIN32
 	// interface no longer supported 
 	int attach_to_file_desc(int);
@@ -227,12 +249,13 @@ public:
 	*/
 
     ///
-	virtual stream_type type();
+	virtual stream_type type() const;
 
 	//	byte operations
 	//
     ///
 	virtual int put_bytes(const void *, int);
+	int put_bytes_after_encryption(const void *, int);
     ///
 	virtual int get_bytes(void *, int);
     ///
@@ -241,21 +264,29 @@ public:
 	virtual int peek(char &);
 
     ///
-	int authenticate( const char* methods, CondorError* errstack, int auth_timeout );
+	int authenticate( const char* methods, CondorError* errstack, int auth_timeout, bool non_blocking );
     ///
-	int authenticate( KeyInfo *& key, const char* methods, CondorError* errstack, int auth_timeout, char **method_used=NULL );
+	int authenticate( KeyInfo *& key, const char* methods, CondorError* errstack, int auth_timeout, bool non_blocking, char **method_used );
     ///
-	int isClient() { return is_client; };
+	int authenticate_continue( CondorError* errstack, bool non_blocking, char **method_used );
+    ///
+	int isClient() const { return is_client; };
 
 	// Normally, the side of the connection that called connect() is
 	// the client.  The opposite is true for a reversed connection.
 	// This matters for the authentication protocol.
 	void isClient(bool flag) { is_client=flag; };
 
-    const char * isIncomingDataMD5ed();
+    const char * isIncomingDataHashed();
 
 	int clear_backlog_flag() {bool state = m_has_backlog; m_has_backlog = false; return state;}
 	int clear_read_block_flag() {bool state = m_read_would_block; m_read_would_block = false; return state;}
+
+	bool is_closed() const {return rcv_msg.m_closed;}
+
+	// serialize and deserialize
+	const char * serialize(const char *);	// restore state from buffer
+	char * serialize() const;	// save state into buffer
 
 //	PROTECTED INTERFACE TO RELIABLE SOCKS
 //
@@ -276,13 +307,11 @@ protected:
 	/*
 	**	Methods
 	*/
-	char * serialize(char *);	// restore state from buffer
-	char * serialize() const;	// save state into buffer
 
 	int prepare_for_nobuffering( stream_coding = stream_unknown);
 	int perform_authenticate( bool with_key, KeyInfo *& key, 
 							  const char* methods, CondorError* errstack,
-							  int auth_timeout, char **method_used );
+							  int auth_timeout, bool non_blocking, char **method_used );
 
 
 	/*
@@ -301,13 +330,15 @@ protected:
 		Buf		*m_tmp;
 	public:
 		RcvMsg();
-                ~RcvMsg();
+		~RcvMsg();
+		void reset();
 		int rcv_packet(char const *peer_description, SOCKET, int);
 		void init_parent(ReliSock *tmp){ p_sock = tmp; } 
 
 		ChainBuf	buf;
 		int			ready;
-                bool init_MD(CONDOR_MD_MODE mode, KeyInfo * key);
+		bool m_closed;
+		bool init_MD(CONDOR_MD_MODE mode, KeyInfo * key);
 	} rcv_msg;
 
 	class SndMsg {
@@ -319,7 +350,8 @@ protected:
 
 	public:
 		SndMsg();
-                ~SndMsg();
+		~SndMsg();
+		void reset();
 		Buf			buf;
 		int snd_packet(char const *peer_description, int, int, int);
 
@@ -346,10 +378,15 @@ protected:
 
 	int is_client;
 	char *hostAddr;
+	char *statsBuf;
+
 	classy_counted_ptr<class CCBClient> m_ccb_client; // for reverse connects
 
 		// after connecting, request to be routed to this daemon
 	char *m_target_shared_port_id;
+
+	Authentication *m_authob;
+	bool m_auth_in_progress;
 
 	bool m_has_backlog;
 	bool m_read_would_block;
@@ -358,6 +395,12 @@ protected:
 	virtual void setTargetSharedPortID( char const *id );
 	virtual bool sendTargetSharedPortID();
 	char const *getTargetSharedPortID() { return m_target_shared_port_id; }
+
+private:
+    ///
+	void init();				/* shared initialization method */
+
+	bool connect_socketpair_impl( ReliSock & dest, condor_protocol proto, bool isLoopback );
 };
 
 class BlockingModeGuard {

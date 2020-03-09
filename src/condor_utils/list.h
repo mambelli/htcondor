@@ -30,6 +30,7 @@
 	  IsEmpty		- return true if list is empty and false otherwise
 	  Number		- return the number of elements in the list
 	Scans
+	  First			- set scan pointer before beginning first obj in list, then advance scan pointer one obj & return ref or ptr to it
 	  Rewind		- set scan pointer before beginning first obj in list
 	  Next			- advance scan pointer one obj & return ref or ptr to it
 	  Current		- return ref or ptr to current object
@@ -61,6 +62,8 @@
 		Rewind - The scan pointer is moved to a position before the first
 			element in the list.
 		List - The list constructor places the scan in the "rewound" condition.
+		First - The First operator moves the scan pointer to the first element 
+			in the list and returns a pointer to that element.
 		Next - The next operator moves the scan pointer one element forward
 			and returns a pointer to or copy of the element at the new
 			location.
@@ -107,6 +110,8 @@
 
 #ifndef LIST_H
 #define LIST_H
+
+#include <cstddef>
 #include "condor_fix_assert.h"
 
 template <class ObjType> class Item;
@@ -121,7 +126,9 @@ public:
 	List(int dummy); // to allow custruction of list as struct member
 
 	virtual ~List();
+	List<ObjType> & operator=(List<ObjType> &&rhs);
 	bool	Append( ObjType * obj );
+	void	Clear();
 
     /// Insert an element before the current element
 	/// Warning: if AtEnd(), Insert() will add the element before the
@@ -142,9 +149,12 @@ public:
 	ObjType *   Next ();
     bool        Next (ObjType   & obj);
     inline bool Next (ObjType * & obj) { return (obj = Next()) != NULL; }
+	inline ObjType* First() { Rewind(); return Next(); }
 
 	ObjType *   Head ( void );
     bool        Head (ObjType   & obj);
+	ObjType *   PopHead();
+
 
 	bool	AtEnd() const;
 	void	DeleteCurrent();
@@ -287,11 +297,48 @@ List<ObjType>::IsEmpty() const
 template <class ObjType>
 List<ObjType>::~List()
 {
+	if (!dummy) return;
+
 	while( !IsEmpty() ) {
 		RemoveItem( dummy->next );
 	}
 	delete dummy;
-	// cout << "Destructed list" << endl;
+}
+
+template <class ObjType>
+List<ObjType> &
+List<ObjType>::operator=(List<ObjType> &&rhs)
+{
+	// First destroy ourselves
+	while( !IsEmpty() ) {
+		RemoveItem( dummy->next );
+	}
+	delete dummy;
+
+	// Now move the rhs list over...
+	this->dummy = rhs.dummy;
+	this->current = rhs.current;
+	this->num_elem = rhs.num_elem;
+
+	// and make the old rhs destroyable
+	rhs.dummy = nullptr;
+	rhs.current = rhs.dummy;
+	rhs.num_elem = 0;
+	return *this;
+}
+
+/*
+  Remove all elements from the list. The scan pointer is reset to the
+  rewound position.
+*/
+template <class ObjType>
+void
+List<ObjType>::Clear()
+{
+	while( !IsEmpty() ) {
+		RemoveItem( dummy->next );
+	}
+	current = dummy;
 }
 
 /*
@@ -491,6 +538,28 @@ List<ObjType>::Head()
 	return dummy->next->obj;
 }
 
+/*
+  Remove and return the first item in the list
+  the list is empty.  This does *NOT* effect the "current" position of
+  the list unless the item being removed is the current position. in that case
+  the current position *advances* (this is different from what DeleteCurrent does)
+*/
+template <class ObjType>
+ObjType *
+List<ObjType>::PopHead()
+{
+	if( IsEmpty() ) {
+		return 0;
+	}
+
+	ObjType *rval = dummy->next->obj;
+	Item<ObjType> *tmp = dummy->next;
+	if( tmp == current ) {
+		current = current->next;
+	}
+	RemoveItem( tmp );
+	return rval;
+}
 
 /*
   Return true if the scan pointer is at the end of the list or the list

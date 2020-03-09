@@ -20,6 +20,8 @@
 #if !defined(_LOG_H)
 #define _LOG_H
 
+#include "condor_common.h"
+#include "condor_classad.h"
 #include <string>
 using std::string;
 
@@ -73,7 +75,15 @@ private:
 	int WriteTail(FILE *fp);
 };
 
-LogRecord *ReadLogEntry(FILE* fp, unsigned long recnum, LogRecord* (*InstantiateLogEntry)(FILE *fp, unsigned long recnum, int type));
+class ConstructLogEntry
+{
+public:
+	virtual ClassAd* New(const char * key, const char * mytype) const = 0;
+	virtual void Delete(ClassAd*& val) const = 0;
+	virtual ~ConstructLogEntry() {}; // declare (superfluous) virtual constructor to get rid of g++ warning.
+};
+
+LogRecord *ReadLogEntry(FILE* fp, unsigned long recnum, LogRecord* (*InstantiateLogEntry)(FILE *fp, unsigned long recnum, int type, const ConstructLogEntry & ctor), const ConstructLogEntry & ctor);
 
 bool valid_record_optype(int optype);
 
@@ -91,7 +101,7 @@ class LogRecordError : public LogRecord {
             body = buf;
             free(buf);
         }
-        return body.size();
+        return (int)body.size();
     }
     string body;
 };

@@ -83,6 +83,8 @@ class ResourceRequestList: public std::list<ResourceRequestCluster *> {
  *
  */
 
+class JobQueueJob; // forward ref
+
 class ScheddNegotiate: public DCMsg {
  public:
 	ScheddNegotiate(
@@ -125,15 +127,26 @@ class ScheddNegotiate: public DCMsg {
 	virtual bool scheduler_getJobAd( PROC_ID job_id, ClassAd &job_ad ) = 0;
 
 		// returns false if we should still try getting a match
-	virtual bool scheduler_skipJob(PROC_ID job_id) = 0;
+	virtual bool scheduler_skipJob(JobQueueJob * job, ClassAd *match_ad, bool &skip_all, const char * &skip_because) = 0;
+
+		// returns false if we should skip this request ad (i.e. and not send it to the negotiator at all)
+		// if return is true, and match_max is not null, match_max will be set to the maximum matches constraint
+		// and the request constraint expression will be added to the request_ad
+	virtual bool scheduler_getRequestConstraints(PROC_ID job_id, ClassAd &request_ad, int * match_max) = 0;
 
 		// a job was rejected by the negotiator
 	virtual void scheduler_handleJobRejected(PROC_ID job_id,char const *reason) = 0;
 
 		// returns true if the match was successfully handled (so far)
-	virtual bool scheduler_handleMatch(PROC_ID job_id,char const *claim_id,ClassAd &match_ad, char const *slot_name) = 0;
+	virtual bool scheduler_handleMatch(PROC_ID job_id,char const *claim_id, char const *extra_claims, ClassAd &match_ad, char const *slot_name) = 0;
 
 	virtual void scheduler_handleNegotiationFinished( Sock *sock ) = 0;
+
+		// Return the number of resource requests we should offer in this negotiation round.
+		// -1 indicates there is no limit.
+		// This is useful in helping to enforce MAX_JOBS_RUNNING as a single resource request
+		// can bring back thousands of matches from the negotiator.
+	virtual int scheduler_maxJobsToOffer() {return -1;};
 
 		///////// end of virtual functions for scheduler to define  //////////
 
@@ -143,6 +156,9 @@ class ScheddNegotiate: public DCMsg {
 	int m_current_resources_requested;
 		// how many resources have been delivered so far with this request?
 	int m_current_resources_delivered;
+		// how many more resources can we offer to the matchmaker?
+		// If -1, then we don't limit the offered resources.
+	int m_jobs_can_offer;
 
  private:
 	std::set<int> m_rejected_auto_clusters;
@@ -157,12 +173,18 @@ class ScheddNegotiate: public DCMsg {
 	int m_jobs_rejected;
 	int m_jobs_matched;
 
+	int m_num_resource_reqs_sent; // used when sending a resource request list
+	int m_num_resource_reqs_to_send; // used when sending a resource request list
+
 	bool m_negotiation_finished;
+	bool m_first_rrl_request;
 
 		// data in message received from negotiator
 	int m_operation;             // the negotiation operation
-	std::string m_reject_reason; // why the job was rejected
+	MyString m_reject_reason; // why the job was rejected
 	std::string m_claim_id;      // the string "null" if none
+	std::string m_extra_claims;
+
 	ClassAd m_match_ad;          // the machine we matched to
 
 		// Updates m_current_job_id to next job in the list
@@ -175,7 +197,9 @@ class ScheddNegotiate: public DCMsg {
 		// marks the specified cluster as rejected
 	void setAutoClusterRejected(int auto_cluster_id);
 
-	bool sendJobInfo(Sock *sock);
+	bool sendJobInfo(Sock *sock, bool just_sig_attrs=false);
+
+	bool sendResourceRequestList(Sock *sock);
 
 		/////////////// DCMsg hooks ///////////////
 
@@ -206,11 +230,13 @@ public:
 
 	virtual bool scheduler_getJobAd( PROC_ID job_id, ClassAd &job_ad );
 
-	virtual bool scheduler_skipJob(PROC_ID job_id);
+	virtual bool scheduler_skipJob(JobQueueJob * job, ClassAd *match_ad, bool &skip_all, const char * &skip_because); // match ad may be null
+
+	virtual bool scheduler_getRequestConstraints(PROC_ID job_id, ClassAd &request_ad, int * match_max);
 
 	virtual void scheduler_handleJobRejected(PROC_ID job_id,char const *reason);
 
-	virtual bool scheduler_handleMatch(PROC_ID job_id,char const *claim_id,ClassAd &match_ad, char const *slot_name);
+	virtual bool scheduler_handleMatch(PROC_ID job_id,char const *claim_id, char const *extra_claims, ClassAd &match_ad, char const *slot_name);
 
 	virtual void scheduler_handleNegotiationFinished( Sock *sock );
 

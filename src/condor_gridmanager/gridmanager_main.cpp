@@ -30,6 +30,7 @@
 #include "gridmanager.h"
 
 char *myUserName = NULL;
+char *SelectionValue = NULL;
 
 // this appears at the bottom of this file
 int display_dprintf_header(char **buf,int *bufpos,int *buflen);
@@ -38,7 +39,7 @@ void
 usage( char *name )
 {
 	dprintf( D_ALWAYS, 
-		"Usage: %s [-f] [-b] [-t] [-p <port>] [-s <schedd addr>] [-o <owern@uid-domain>] [-C <job constraint>] [-S <scratch dir>]\n",
+		"Usage: %s [-f] [-b] [-t] [-p <port>] [-s <schedd addr>] [-o <owern@uid-domain>] [-C <job constraint>] [-S <scratch dir>] [-A <aux id>]\n",
 		condor_basename( name ) );
 	DC_Exit( 1 );
 }
@@ -60,9 +61,21 @@ main_init( int argc, char ** const argv )
 			usage( argv[0] );
 
 		switch( argv[i][1] ) {
+		case 'A':
+			if ( argc <= i + 1 )
+				usage( argv[0] );
+			if (SelectionValue) {
+				free(SelectionValue);
+			}
+			SelectionValue = strdup( argv[i + 1] );
+			i++;
+			break;
 		case 'C':
 			if ( argc <= i + 1 )
 				usage( argv[0] );
+			if (ScheddJobConstraint) {
+				free(ScheddJobConstraint);
+			}
 			ScheddJobConstraint = strdup( argv[i + 1] );
 			i++;
 			break;
@@ -70,12 +83,18 @@ main_init( int argc, char ** const argv )
 			// don't check parent for schedd addr. use this one instead
 			if ( argc <= i + 1 )
 				usage( argv[0] );
+			if (ScheddAddr) {
+				free(ScheddAddr);
+			}
 			ScheddAddr = strdup( argv[i + 1] );
 			i++;
 			break;
 		case 'S':
 			if ( argc <= i + 1 )
 				usage( argv[0] );
+			if (GridmanagerScratchDir) {
+				free(GridmanagerScratchDir);
+			}
 			GridmanagerScratchDir = strdup( argv[i + 1] );
 			i++;
 			break;
@@ -157,7 +176,8 @@ main_pre_dc_init( int argc, char* argv[] )
 		// We can't call daemonCore->Register_Priv_State() here because
 		// there's no daemonCore object yet. We'll call it in main_init().
 
-		free( owner );
+		free( myUserName );
+		myUserName = owner;
 	} else if ( is_root() ) {
 		dprintf( D_ALWAYS, "Don't know what user to run as!\n" );
 		DC_Exit( 1 );

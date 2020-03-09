@@ -27,8 +27,11 @@
 #define MAXOWNERLEN 20
 #define MAXSCHEDDLEN 255
 
-// This is for the getFilterAndProcess function
-typedef void (*condor_q_process_func)(void*, classad_shared_ptr<ClassAd>);
+// This callback signature is for the getFilterAndProcess function.
+// This callback should return false to take ownership of ad, true otherwise.
+// we do this to avoid a makeing a copy of the ad in a common use case,
+// because the caller will normally delete the ad, but in fact has no more use for it.
+typedef bool (*condor_q_process_func)(void*, ClassAd *ad);
 
 /* a list of all types of direct DB query defined here */
 enum CondorQQueryType
@@ -42,7 +45,8 @@ enum
 	Q_SCHEDD_COMMUNICATION_ERROR,
 	Q_INVALID_REQUIREMENTS,
 	Q_INTERNAL_ERROR,
-	Q_REMOTE_ERROR
+	Q_REMOTE_ERROR,
+	Q_UNSUPPORTED_OPTION_ERROR
 };
 
 enum CondorQIntCategories
@@ -94,7 +98,20 @@ class CondorQ
 	// from the local schedd
 	int fetchQueue (ClassAdList &, StringList &attrs, ClassAd * = 0, CondorError* errstack = 0);
 	int fetchQueueFromHost (ClassAdList &, StringList &attrs, const char * = 0, char const *schedd_version = 0,CondorError* errstack = 0);
-	int fetchQueueFromHostAndProcess ( const char *, StringList &attrs, condor_q_process_func process_func, void * process_func_data, int useFastPath, CondorError* errstack = 0);
+	int fetchQueueFromHostAndProcess ( const char *, StringList &attrs, int fetch_opts, int match_limit, condor_q_process_func process_func, void * process_func_data, int useFastPath, CondorError* errstack = 0, ClassAd ** psummary_ad=NULL);
+
+	// option flags for fetchQueueFromHost* functions, these can modify the meaning of attrs
+	// use only one of the choices < fetch_FromMask, optionally OR'd with one or more fetch flags
+	// currently only fetch_Jobs accepts flags.
+	typedef enum {
+		fetch_Jobs=0,
+		fetch_DefaultAutoCluster=1,
+		fetch_GroupBy=2,
+		fetch_FromMask=0x03,         // mask off the 'from' bits
+		fetch_MyJobs=0x04,           // modifies fetch_Jobs
+		fetch_SummaryOnly=0x08,      // modifies fetch_Jobs
+		fetch_IncludeClusterAd=0x10, // modifies fetch_Jobs
+	} QueryFetchOpts;
 	
 		// fetch the job ads from database 	
 	int fetchQueueFromDB (ClassAdList &, char *&lastUpdate, const char * = 0, CondorError* errstack = 0);
@@ -105,6 +122,7 @@ class CondorQ
 	// return the effective query constraint directly to the user.
 	// the caller is responsible for deleting the returned ExprTree.
 	int  rawQuery(ExprTree * &tree) { return query.makeQuery(tree); }
+	int  rawQuery(MyString & str) { return query.makeQuery(str); }
 
   private:
 	GenericQuery query;
@@ -122,9 +140,9 @@ class CondorQ
 	time_t scheddBirthdate;
 	
 	// helper functions
-	int fetchQueueFromHostAndProcessV2 ( const char * host, const char * constraint, StringList &attrs, condor_q_process_func process_func, void * process_func_data, int connect_timeout, CondorError* errstack = 0);
-	int getAndFilterAds( const char *, StringList &attrs, ClassAdList &, int useAll );
-	int getFilterAndProcessAds( const char *, StringList &attrs, condor_q_process_func pfn, void * process_func_data, bool useAll );
+	int fetchQueueFromHostAndProcessV2 ( const char * host, const char * constraint, StringList &attrs, int fetch_opts, int match_limit, condor_q_process_func process_func, void * process_func_data, int connect_timeout, int useFastPath, CondorError* errstack = 0, ClassAd ** psummary_ad=NULL);
+	int getAndFilterAds( const char *, StringList &attrs, int match_limit, ClassAdList &, int useAll );
+	int getFilterAndProcessAds( const char *, StringList &attrs, int match_limit, condor_q_process_func pfn, void * process_func_data, bool useAll );
 };
 
 int JobSort(ClassAd *job1, ClassAd *job2, void *data);

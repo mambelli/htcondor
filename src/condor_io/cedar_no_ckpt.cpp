@@ -40,7 +40,6 @@
 #include "ccb_client.h"
 #include "condor_sinful.h"
 #include "shared_port_client.h"
-#include "daemon_core_sock_adapter.h"
 #include "condor_netdb.h"
 #include "internet.h"
 #include "ipv6_hostname.h"
@@ -116,7 +115,7 @@ ReliSock::get_file( filesize_t *size, const char *destination,
 		dprintf(D_ALWAYS,
 				"ReliSock: get_file: close failed, errno = %d (%s)\n",
 				errno, strerror(errno));
-		return -1;
+		result = -1;
 	}
 
 	if(result<0) {
@@ -172,9 +171,9 @@ ReliSock::get_file( filesize_t *size, int fd,
 
 	// Now, read it all in & save it
 	while( total < bytes_to_receive ) {
-		UtcTime t1,t2;
+		struct timeval t1,t2;
 		if( xfer_q ) {
-			t1.getTime();
+			condor_gettimestamp(t1);
 		}
 
 		int	iosize =
@@ -182,8 +181,8 @@ ReliSock::get_file( filesize_t *size, int fd,
 		int	nbytes = get_bytes_nobuffer( buf, iosize, 0 );
 
 		if( xfer_q ) {
-			t2.getTime();
-			xfer_q->AddUsecNetRead(t2.difference_usec(t1));
+			condor_gettimestamp(t2);
+			xfer_q->AddUsecNetRead(timersub_usec(t2, t1));
 		}
 
 		if ( nbytes <= 0 ) {
@@ -237,11 +236,11 @@ ReliSock::get_file( filesize_t *size, int fd,
 			}
 		}
 		if( xfer_q ) {
-			t1.getTime();
+			condor_gettimestamp(t1);
 				// reuse t2 above as start time for file write
-			xfer_q->AddUsecFileWrite(t1.difference_usec(t2));
+			xfer_q->AddUsecFileWrite(timersub_usec(t1, t2));
 			xfer_q->AddBytesReceived(written);
-			xfer_q->ConsiderSendingReport(t1.seconds());
+			xfer_q->ConsiderSendingReport(t1.tv_sec);
 		}
 
 		total += written;
@@ -273,7 +272,7 @@ ReliSock::get_file( filesize_t *size, int fd,
 	}
 
 	if (flush_buffers && fd != GET_FILE_NULL_FD ) {
-		if (condor_fsync(fd) < 0) {
+		if (condor_fdatasync(fd) < 0) {
 			dprintf(D_ALWAYS, "get_file(): ERROR on fsync: %d\n", errno);
 			return -1;
 		}
@@ -445,19 +444,19 @@ ReliSock::put_file( filesize_t *size, int fd, filesize_t offset, filesize_t max_
 				return -1;
 			}
 
-			UtcTime t1;
-			t1.getTime();
+			struct timeval t1;
+			condor_gettimestamp(t1);
 
 			// Now transmit file using special optimized Winsock call
 			bool transmit_success = TransmitFile(_sock,(HANDLE)_get_osfhandle(fd),bytes_to_send,0,NULL,NULL,0) != FALSE;
 
 			if( xfer_q ) {
-				UtcTime t2;
-				t2.getTime();
+				struct timeval t2;
+				condor_gettimestamp(t2);
 					// We don't know how much of the time was spent reading
 					// from disk vs. writing to the network, so we just report
 					// it all as network i/o time.
-				xfer_q->AddUsecNetWrite(t2.difference_usec(t1));
+				xfer_q->AddUsecNetWrite(timersub_usec(t2, t1));
 			}
 
 			if( !transmit_success ) {
@@ -483,18 +482,18 @@ ReliSock::put_file( filesize_t *size, int fd, filesize_t offset, filesize_t max_
 		// Note that on Win32, we use this method as well if encryption 
 		// is required.
 		while (total < bytes_to_send) {
-			UtcTime t1;
-			UtcTime t2;
+			struct timeval t1;
+			struct timeval t2;
 			if( xfer_q ) {
-				t1.getTime();
+				condor_gettimestamp(t1);
 			}
 
 			// Be very careful about where the cast to size_t happens; see gt#4150
 			nrd = ::read(fd, buf, (size_t)((bytes_to_send-total) < (int)sizeof(buf) ? bytes_to_send-total : sizeof(buf)));
 
 			if( xfer_q ) {
-				t2.getTime();
-				xfer_q->AddUsecFileRead(t2.difference_usec(t1));
+				condor_gettimestamp(t2);
+				xfer_q->AddUsecFileRead(timersub_usec(t2, t1));
 			}
 
 			if( nrd <= 0) {
@@ -514,10 +513,10 @@ ReliSock::put_file( filesize_t *size, int fd, filesize_t offset, filesize_t max_
 			if( xfer_q ) {
 					// reuse t2 from above to mark the start of the
 					// network op and t1 to mark the end
-				t1.getTime();
-				xfer_q->AddUsecNetWrite(t1.difference_usec(t2));
+				condor_gettimestamp(t1);
+				xfer_q->AddUsecNetWrite(timersub_usec(t1, t2));
 				xfer_q->AddBytesSent(nbytes);
-				xfer_q->ConsiderSendingReport(t1.seconds());
+				xfer_q->ConsiderSendingReport(t1.tv_sec);
 			}
 			total += nbytes;
 		}
@@ -673,10 +672,11 @@ ReliSock::put_file_with_permissions( filesize_t *size, const char *source, files
 	return result;
 }
 
-int
-ReliSock::get_x509_delegation( filesize_t *size, const char *destination,
-							   bool flush_buffers )
+ReliSock::x509_delegation_result
+ReliSock::get_x509_delegation( const char *destination,
+                               bool flush_buffers, void **state_ptr )
 {
+	void *st;
 	int in_encode_mode;
 
 		// store if we are in encode or decode mode
@@ -686,14 +686,21 @@ ReliSock::get_x509_delegation( filesize_t *size, const char *destination,
 		 !end_of_message() ) {
 		dprintf( D_ALWAYS, "ReliSock::get_x509_delegation(): failed to "
 				 "flush buffers\n" );
-		return -1;
+		return delegation_error;
 	}
 
-	if ( x509_receive_delegation( destination, relisock_gsi_get, (void *) this,
-								  relisock_gsi_put, (void *) this ) != 0 ) {
+	int rc =  x509_receive_delegation( destination, relisock_gsi_get, (void *) this,
+	                                                relisock_gsi_put, (void *) this,
+	                                                &st );
+	if (rc == -1) {
 		dprintf( D_ALWAYS, "ReliSock::get_x509_delegation(): "
 				 "delegation failed: %s\n", x509_error_string() );
-		return -1;
+		return delegation_error;
+	}
+		// NOTE: if we provide a state pointer, x509_receive_delegation *must* either fail or continue.
+	else if (rc == 0) {
+		dprintf(D_ALWAYS, "Programmer error: x509_receive_delegation completed unexpectedy.\n");
+		return delegation_error;
 	}
 
 		// restore stream mode (either encode or decode)
@@ -702,11 +709,26 @@ ReliSock::get_x509_delegation( filesize_t *size, const char *destination,
 	} else if ( !in_encode_mode && is_encode() ) { 
 		decode();
 	}
-	if ( !prepare_for_nobuffering( stream_unknown ) ) {
-		dprintf( D_ALWAYS, "ReliSock::get_x509_delegation(): failed to "
-				 "flush buffers afterwards\n" );
-		return -1;
+
+	if (state_ptr) {
+		*state_ptr = st;
+		return delegation_continue;
 	}
+
+	return get_x509_delegation_finish( destination, flush_buffers, st );
+}
+
+ReliSock::x509_delegation_result
+ReliSock::get_x509_delegation_finish( const char *destination, bool flush_buffers, void *state_ptr )
+{
+                // store if we are in encode or decode mode
+        int in_encode_mode = is_encode();
+
+        if ( x509_receive_delegation_finish( relisock_gsi_get, (void *) this, state_ptr ) != 0 ) {
+                dprintf( D_ALWAYS, "ReliSock::get_x509_delegation_finish(): "
+                                 "delegation failed to complete: %s\n", x509_error_string() );
+                return delegation_error;
+        }
 
 	if ( flush_buffers ) {
 		int rc = 0;
@@ -714,7 +736,7 @@ ReliSock::get_x509_delegation( filesize_t *size, const char *destination,
 		if ( fd < 0 ) {
 			rc = fd;
 		} else {
-			rc = condor_fsync( fd, destination );
+			rc = condor_fdatasync( fd, destination );
 			::close( fd );
 		}
 		if ( rc < 0 ) {
@@ -724,10 +746,19 @@ ReliSock::get_x509_delegation( filesize_t *size, const char *destination,
 		}
 	}
 
-		// We should figure out how many bytes were sent
-	*size = 0;
+		// restore stream mode (either encode or decode)
+	if ( in_encode_mode && is_decode() ) {
+		encode();
+	} else if ( !in_encode_mode && is_encode() ) {
+		decode();
+	}
+	if ( !prepare_for_nobuffering( stream_unknown ) ) {
+		dprintf( D_ALWAYS, "ReliSock::get_x509_delegation(): failed to "
+			"flush buffers afterwards\n" );
+		return delegation_error;
+	}
 
-	return 0;
+	return delegation_ok;
 }
 
 int
@@ -770,6 +801,10 @@ ReliSock::put_x509_delegation( filesize_t *size, const char *source, time_t expi
 	return 0;
 }
 
+// These variables hold the size of the last data block handled by each
+// respective function. They are part of a hacky workaround for a GSI bug.
+size_t relisock_gsi_get_last_size = 0;
+size_t relisock_gsi_put_last_size = 0;
 
 int relisock_gsi_get(void *arg, void **bufp, size_t *sizep)
 {
@@ -781,15 +816,18 @@ int relisock_gsi_get(void *arg, void **bufp, size_t *sizep)
     sock->decode();
     
     //read size of data to read
-    stat = sock->code( *((int *)sizep) );
+    stat = sock->code( *sizep );
+	if ( stat == FALSE ) {
+		*sizep = 0;
+	}
 
-	if( *((int *)sizep) == 0 ) {
+	if( *sizep == 0 ) {
 			// We avoid calling malloc(0) here, because the zero-length
 			// buffer is not being freed by globus.
 		*bufp = NULL;
 	}
 	else {
-		*bufp = malloc( *((int *)sizep) );
+		*bufp = malloc( *sizep );
 		if ( !*bufp ) {
 			dprintf( D_ALWAYS, "malloc failure relisock_gsi_get\n" );
 			stat = FALSE;
@@ -797,7 +835,7 @@ int relisock_gsi_get(void *arg, void **bufp, size_t *sizep)
 
 			//if successfully read size and malloced, read data
 		if ( stat ) {
-			sock->code_bytes( *bufp, *((int *)sizep) );
+			stat = sock->code_bytes( *bufp, *sizep );
 		}
 	}
     
@@ -806,8 +844,13 @@ int relisock_gsi_get(void *arg, void **bufp, size_t *sizep)
     //check to ensure comms were successful
     if ( stat == FALSE ) {
         dprintf( D_ALWAYS, "relisock_gsi_get (read from socket) failure\n" );
+        *sizep = 0;
+        free( *bufp );
+        *bufp = NULL;
+        relisock_gsi_get_last_size = 0;
         return -1;
     }
+    relisock_gsi_get_last_size = *sizep;
     return 0;
 }
 
@@ -820,12 +863,13 @@ int relisock_gsi_put(void *arg,  void *buf, size_t size)
     sock->encode();
     
     //send size of data to send
-    stat = sock->put( (int)size );
+    stat = sock->put( size );
     
     
     //if successful, send the data
     if ( stat ) {
-        if ( !(stat = sock->code_bytes( buf, ((int) size )) ) ) {
+        // don't call code_bytes() on a zero-length buffer
+        if ( size != 0 && !(stat = sock->code_bytes( buf, ((int) size )) ) ) {
             dprintf( D_ALWAYS, "failure sending data (%lu bytes) over sock\n",(unsigned long)size);
         }
     }
@@ -838,8 +882,10 @@ int relisock_gsi_put(void *arg,  void *buf, size_t size)
     //ensure data send was successful
     if ( stat == FALSE) {
         dprintf( D_ALWAYS, "relisock_gsi_put (write to socket) failure\n" );
+        relisock_gsi_put_last_size = 0;
         return -1;
     }
+    relisock_gsi_put_last_size = size;
     return 0;
 }
 
@@ -880,14 +926,17 @@ int Sock::special_connect(char const *host,int /*port*/,bool nonblocking)
 			sinful.getPort() && strcmp(sinful.getPort(),"0")==0;
 
 		bool same_host = false;
-		char const *my_ip = my_ip_string();
-		if( my_ip && sinful.getHost() && strcmp(my_ip,sinful.getHost())==0 ) {
+		// TODO: Picking IPv4 arbitrarily.
+		//   We should do a better job of detecting whether sinful
+		//   points to a local interface.
+		MyString my_ip = get_local_ipaddr(CP_IPV4).to_ip_string();
+		if( sinful.getHost() && strcmp(my_ip.Value(),sinful.getHost())==0 ) {
 			same_host = true;
 		}
 
 		bool i_am_shared_port_server = false;
-		if( daemonCoreSockAdapter.isEnabled() ) {
-			char const *daemon_addr = daemonCoreSockAdapter.publicNetworkIpAddr();
+		if( daemonCore ) {
+			char const *daemon_addr = daemonCore->publicNetworkIpAddr();
 			if( daemon_addr ) {
 				Sinful my_sinful(daemon_addr);
 				if( my_sinful.getHost() && sinful.getHost() &&
@@ -908,7 +957,16 @@ int Sock::special_connect(char const *host,int /*port*/,bool nonblocking)
 				dprintf(D_FULLDEBUG,"Bypassing connection to shared port server, because its address is not yet established; passing socket directly to %s.\n",host);
 			}
 
-			return do_shared_port_local_connect( shared_port_id,nonblocking );
+			// do_shared_port_local_connect() calls connect_socketpair(), which
+			// normally uses loopback addresses.  However, the loopback address
+			// may not be in the ALLOW list.  Instead, we need to use the
+			// address we would use to contact the shared port daemon.
+			const char * sharedPortIP = sinful.getHost();
+			// Presently, for either same_host or i_am_shared_port_server to
+			// be true, this must be as well.
+			ASSERT( sharedPortIP );
+
+			return do_shared_port_local_connect( shared_port_id, nonblocking, sharedPortIP );
 		}
 	}
 
@@ -940,6 +998,13 @@ int
 ReliSock::do_reverse_connect(char const *ccb_contact,bool nonblocking)
 {
 	ASSERT( !m_ccb_client.get() ); // only one reverse connect at a time!
+
+	//
+	// Since we can't change the CCB server without also changing the CCB
+	// client (that is, without breaking backwards compatibility), we have
+	// to determine if the server sent us ... a string we can't use.  Joy.
+	//
+
 	m_ccb_client =
 		new CCBClient( ccb_contact, (ReliSock *)this );
 
@@ -957,7 +1022,7 @@ ReliSock::do_reverse_connect(char const *ccb_contact,bool nonblocking)
 }
 
 int
-SafeSock::do_shared_port_local_connect( char const *, bool )
+SafeSock::do_shared_port_local_connect( char const *, bool, char const * )
 {
 	dprintf(D_ALWAYS,
 			"SharedPortClient: WARNING: UDP not supported."
@@ -968,7 +1033,7 @@ SafeSock::do_shared_port_local_connect( char const *, bool )
 }
 
 int
-ReliSock::do_shared_port_local_connect( char const *shared_port_id, bool nonblocking )
+ReliSock::do_shared_port_local_connect( char const *shared_port_id, bool nonblocking, char const *sharedPortIP )
 {
 		// Without going through SharedPortServer, we want to connect
 		// to a daemon that is local to this machine and which is set up
@@ -979,12 +1044,8 @@ ReliSock::do_shared_port_local_connect( char const *shared_port_id, bool nonbloc
 
 	SharedPortClient shared_port_client;
 	ReliSock sock_to_pass;
-		// do not use loopback interface for socketpair unless this happens
-		// to be the standard network interface, because localhost
-		// typically does not happen to be allowed in the authorization policy
-	const bool use_standard_interface = true;
 	std::string orig_connect_addr = get_connect_addr() ? get_connect_addr() : "";
-	if( !connect_socketpair(sock_to_pass,use_standard_interface) ) {
+	if( !connect_socketpair(sock_to_pass, sharedPortIP) ) {
 		dprintf(D_ALWAYS,
 				"Failed to connect to loopback socket, so failing to connect via local shared port access to %s.\n",
 				peer_description());
@@ -1032,7 +1093,7 @@ ReliSock::sendTargetSharedPortID()
 }
 
 char const *
-Sock::get_sinful_public()
+Sock::get_sinful_public() const
 {
 		// In case TCP_FORWARDING_HOST changes, do not cache it.
 	MyString tcp_forwarding_host;

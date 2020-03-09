@@ -23,13 +23,11 @@
 
 #include "condor_common.h"
 #include "condor_classad.h"
-#include "classad_hashtable.h"
 
 #include "basejob.h"
 #include "gceresource.h"
 #include "proxymanager.h"
 #include "gahp-client.h"
-#include "vm_univ_utils.h"
 
 void GCEJobInit();
 void GCEJobReconfig();
@@ -57,7 +55,6 @@ public:
 	static int gahpCallTimeout;
 	static int maxConnectFailures;
 	static int funcRetryInterval;
-	static int pendingWaitTime;
 	static int maxRetryTimes;
 	
 	static void setSubmitInterval( int new_interval )	{ submitInterval = new_interval; }
@@ -93,11 +90,14 @@ private:
 	std::string m_project;
 	std::string m_zone;
 	std::string m_authFile;
+	std::string m_account;
 	std::string m_image;
 	std::string m_metadata;
 	std::string m_metadataFile;
 	std::string m_machineType;
-	bool m_was_job_completion;
+	bool m_preemptible;
+	std::string m_jsonFile;
+	std::vector< std::pair< std::string, std::string > > m_labels;
 
 	int m_retry_times;
 	
@@ -108,7 +108,7 @@ private:
 	
 	std::string m_state_reason_code;
 	
-    bool probeNow;
+	bool probeNow;
 };
 
 #endif

@@ -34,8 +34,6 @@ use Check::CondorLog;
 my $ClusterId = 0;
 my $mismatch = 0;
 
-CondorTest::SetUseNewRunning();
-
 my $firstappend_condor_config = '
 	DAEMON_LIST = MASTER,SCHEDD,COLLECTOR,NEGOTIATOR,STARTD
 	WANT_SUSPEND = FALSE
@@ -100,6 +98,7 @@ my %hashcompareexceptions =
 	"PID" => "1",
 	"PPID" => "1",
 	"SUBSYSTEM" => "1",
+	"LOCALNAME" => "1",
 	"TOOL_TIMEOUT_MULTIPLIER" => "1",
 	"IsNegotiator" => "1",
 );
@@ -184,7 +183,7 @@ sub CompareParams
 				if(exists $hashcompareexceptions{$keys}) {
 					print "- ALLOWED\n";
 				} else { 
-					print "- EORROR\n";
+					print "- ERROR\n";
 					$mismatch += 1;
 				}
 			}

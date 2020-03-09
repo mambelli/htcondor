@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -24,7 +25,7 @@ use CondorUtils;
 $cmd = 'job_dagman_always_run_post-D.dag';
 $testdesc =  'Condor DAGman test for always running the POST script - scheduler U';
 $testname = "job_dagman_always_run_post-D";
-$dagman_args = "-verbose";
+$dagman_args = "-verbose -AlwaysRunPost";
 
 $outfile = "$testname.dag.dagman.out";
 runcmd("rm -f $outfile");
@@ -75,7 +76,7 @@ $failure = sub
 
 $success = sub 
 {
-	CondorTest::debug("Execution was a failure ... as expected\n",1);
+	CondorTest::debug("DAG failed as expected\n",1);
 	CondorTest::debug("Verifying output\n",1);
 	$diditpass = 1;
 	# D_A.out should not exist
@@ -107,7 +108,7 @@ $success = sub
 		}
 	}
 	if($passed_first != 1) {
-		CondorTest::debug("failed $outfile\n",1);
+		CondorTest::debug("ERROR: failed $outfile (missing PRE_SKIP event)\n",1);
 		$diditpass = 0;
 	}
 	if($diditpass == 0) {

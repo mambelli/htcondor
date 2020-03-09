@@ -193,7 +193,7 @@ check_winsta(wchar_t* winsta_name, LPARAM)
 }
 
 int WINAPI
-wWinMain(HINSTANCE, HINSTANCE, wchar_t*, int)
+wWinMain(__in HINSTANCE, __in_opt HINSTANCE, __in wchar_t*, __in int)
 {
 	// usage is:
 	//   condor_softkill.exe <target_pid> [debug_output_file]
@@ -239,6 +239,10 @@ wWinMain(HINSTANCE, HINSTANCE, wchar_t*, int)
 	}
 
 	if (!window_found) {
+		debug(L"Window not found, attempting to generate a Ctrl+Break event to pid=%d\n", target_pid);
+		if (GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, target_pid)) {
+			return SOFTKILL_SUCCESS;
+		}
 		return SOFTKILL_WINDOW_NOT_FOUND;
 	}
 	else if (!message_posted) {

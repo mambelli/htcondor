@@ -83,6 +83,9 @@ extern "C" {
 	int REMOTE_CONDOR_lchown( char *path, int uid, int gid );
 	int REMOTE_CONDOR_truncate( char *path, int length );
 	int REMOTE_CONDOR_utime( char *path, int actime, int modtime );
+	int REMOTE_CONDOR_dprintf_stats(const char *message);
+	int REMOTE_CONDOR_getcreds( const char *creds_receive_dir );
+	int REMOTE_CONDOR_get_delegated_proxy( const char* proxy_source_path, const char* proxy_dest_path, time_t proxy_expiration );
 
     int REMOTE_CONDOR_get_sec_session_info(
 		char const *starter_reconnect_session_info,

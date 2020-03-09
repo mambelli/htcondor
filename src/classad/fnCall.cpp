@@ -28,7 +28,11 @@
 #include "classad/sink.h"
 #include "classad/util.h"
 
-#ifndef WIN32
+#ifdef WIN32
+ #if _MSC_VER < 1900
+ double rint(double rval) { return floor(rval + .5); }
+ #endif
+#else
 #include <sys/time.h>
 #endif
 
@@ -72,6 +76,8 @@ stringListsIntersect(const char*,const ArgumentList &argList,EvalState &state,Va
 FunctionCall::
 FunctionCall( )
 {
+	parentScope = NULL;
+
 	function = NULL;
 
 	if( !initialized ) {
@@ -135,6 +141,7 @@ FunctionCall( )
 		
 			// string manipulation
 		functionTable["strcat"		] =	(void*)strCat;
+		functionTable["join"		] =	(void*)strCat;
 		functionTable["toupper"		] =	(void*)changeCase;
 		functionTable["tolower"		] =	(void*)changeCase;
 		functionTable["substr"		] =	(void*)subString;
@@ -146,6 +153,8 @@ FunctionCall( )
 		functionTable["regexp"		] =	(void*)matchPattern;
         functionTable["regexpmember"] =	(void*)matchPatternMember;
 		functionTable["regexps"     ] = (void*)substPattern;
+		functionTable["replace"     ] = (void*)substPattern;
+		functionTable["replaceall"  ] = (void*)substPattern;
 #endif
 
 			// conversion functions
@@ -230,6 +239,8 @@ CopyFrom(const FunctionCall &functioncall)
 	ExprTree *newArg;
 
     success      = true;
+	parentScope = functioncall.parentScope;
+
     ExprTree::CopyFrom(functioncall);
     functionName = functioncall.functionName;
 	function     = functioncall.function;
@@ -334,7 +345,23 @@ bool FunctionCall::RegisterSharedLibraryFunctions(
 		
 	success = false;
 	if (shared_library_path) {
-		dynamic_library_handle = dlopen(shared_library_path, RTLD_LAZY|RTLD_GLOBAL);
+		// We use "deep bind" here to make sure the library uses its own version of the
+		// symbol in case of duplicates.
+		//
+		// In particular, we were observing crashes in condor_shadow (which statically
+		// links libcondor_utils) and libclassad_python_user.so (which dynamically links
+		// libcondor_utils).  This causes the finalizers for global objects to be called
+		// twice - once for the dynamic version (which bound against the global one) and
+		// again at exit().
+		//
+		// With DEEPBIND, the finalizer for the dynamic library points at its own copy
+		// of the global and doesn't touch the shadow's.  See #4998
+		//
+		int flags = RTLD_LAZY;
+#ifdef LINUX
+		flags |= RTLD_DEEPBIND;
+#endif
+		dynamic_library_handle = dlopen(shared_library_path, flags);
 		if (dynamic_library_handle) {
 			ClassAdSharedLibraryInit init_function;
 
@@ -387,6 +414,8 @@ bool FunctionCall::RegisterSharedLibraryFunctions(
 void FunctionCall::
 _SetParentScope( const ClassAd* parent )
 {
+	parentScope = parent;
+
 	for( ArgumentList::iterator i=arguments.begin(); i!=arguments.end(); i++ ) {
 		(*i)->SetParentScope( parent );
 	}
@@ -1114,7 +1143,7 @@ listCompare(
 						}
 					} else {
 						val.SetErrorValue();
-						return false;
+						return true;
 					}
 					return true;
 				} else if (b) {
@@ -1430,7 +1459,7 @@ formatTime(const char*, const ArgumentList &argList, EvalState &state,
 	struct  tm time_components;
     ClassAd    *splitClassAd;
     string     format;
-    int        number_of_args;
+    size_t     number_of_args;
     bool       did_eval;
 
     memset(&time_components, 0, sizeof(time_components));
@@ -1500,7 +1529,7 @@ formatTime(const char*, const ArgumentList &argList, EvalState &state,
             delete splitClassAd;
         }
     } else {
-        did_eval = false;
+        result.SetErrorValue();
     }
 
     if (!did_eval) {
@@ -1566,53 +1595,95 @@ inTimeUnits(const char*name,const ArgumentList &argList,EvalState &state,
 
 	// concatenate all arguments (expected to be strings)
 bool FunctionCall::
-strCat( const char*, const ArgumentList &argList, EvalState &state, 
+strCat( const char* name, const ArgumentList &argListIn, EvalState &state,
 	Value &result )
 {
 	ClassAdUnParser	unp;
-	string			buf, s;
+	string			buf, s, sep;
 	bool			errorFlag=false, undefFlag=false, rval=true;
+	bool			is_join = (0 == strcasecmp( name, "join" ));
+	int				num_args = (int)argListIn.size();
+	ArgumentList	argTemp; // in case we need it
+	Value			listVal; // in case we need it
+	Literal *		sepLit=NULL; // in case we need it
 
-	for( int i = 0 ; (unsigned)i < argList.size() ; i++ ) {
+	const ArgumentList * args = &argListIn;
+
+	// join has a special case for 1 or 2 args when the last argument is a list.
+	// for 1 arg, join the list items, for 2 args, join arg1 with arg0 as the separator
+	if (is_join && num_args > 0 && num_args <= 2) {
+		rval = argListIn[num_args-1]->Evaluate(state, listVal);
+		if (rval) {
+			ExprList *listToJoin;
+			if (listVal.IsListValue(listToJoin)) {
+				// cons up a new temporary argument list using the contents of the list
+				// and the (optional) separator arg.
+				listToJoin->GetComponents(argTemp);
+				if (num_args > 1) {
+					argTemp.insert(argTemp.begin(), argListIn[0]);
+				} else {
+					Value sep; sep.SetStringValue(""); // cons up a default separator as the first argument
+					sepLit = Literal::MakeLiteral(sep);
+					argTemp.insert(argTemp.begin(), sepLit);
+				}
+				// now use this as the input arguments
+				args = &argTemp;
+				num_args = (int)argTemp.size();
+			}
+		}
+	}
+
+	for( int i = 0 ; (unsigned)i < args->size() ; i++ ) {
 		Value  val;
-        Value  stringVal;
+		Value  stringVal;
 
 		s = "";
-		if( !( rval = argList[i]->Evaluate( state, val ) ) ) {
+		if( !( rval = (*args)[i]->Evaluate( state, val ) ) ) {
 			break;
 		}
 
-        if (val.IsStringValue(s)) {
-            buf += s;
-        } else {
-            convertValueToStringValue(val, stringVal);
-            if (stringVal.IsUndefinedValue()) {
-                undefFlag = true;
-                break;
-            } else if (stringVal.IsErrorValue()) {
-                errorFlag = true;
-                result.SetErrorValue();
-                break;
-            } else if (stringVal.IsStringValue(s)) {
-                buf += s;
-            } else {
-                errorFlag = true;
-                break;
-            }
-        }
-    }
-	
-    // failed evaluating some argument
+		if (!val.IsStringValue(s)) {
+			convertValueToStringValue(val, stringVal);
+			if (stringVal.IsUndefinedValue()) {
+				undefFlag = true;
+				break;
+			} else if (stringVal.IsErrorValue()) {
+				errorFlag = true;
+				result.SetErrorValue();
+				break;
+			} else if (!stringVal.IsStringValue(s)) {
+				errorFlag = true;
+				break;
+			}
+		}
+		// if we get here, s is the string value of the item
+		if (is_join) {
+			if (0 == i) {
+				sep = s;
+				continue;
+			}
+			if (i > 1) {
+				buf += sep;
+			}
+		}
+		buf += s;
+	}
+
+	// clean up the temporary arglist
+	while (argTemp.size() > 0) { argTemp.pop_back(); }
+	delete sepLit; sepLit = NULL;
+
+	// failed evaluating some argument
 	if( !rval ) {
 		result.SetErrorValue( );
 		return( false );
 	}
-		// type error
+	// type error
 	if( errorFlag ) {
 		result.SetErrorValue( );
 		return( true );
 	} 
-		// some argument was undefined
+	// some argument was undefined
 	if( undefFlag ) {
 		result.SetUndefinedValue( );
 		return( true );
@@ -1657,7 +1728,7 @@ changeCase(const char*name,const ArgumentList &argList,EvalState &state,
         }
 	}
 
-	len = str.size( );
+	len = (int)str.size( );
 	for( int i=0; i <= len; i++ ) {
 		str[i] = lower ? tolower( str[i] ) : toupper( str[i] );
 	}
@@ -1704,7 +1775,7 @@ subString( const char*, const ArgumentList &argList, EvalState &state,
 
 		// perl-like substr; negative offsets and lengths count from the end
 		// of the string
-	alen = buf.size( );
+	alen = (int)buf.size( );
 	if( offset < 0 ) { 
 		offset = alen + offset; 
 	} else if( offset >= alen ) {
@@ -1900,6 +1971,7 @@ convBool( const char*, const ArgumentList &argList, EvalState &state,
 
 		case Value::ERROR_VALUE:
 		case Value::CLASSAD_VALUE:
+		case Value::SCLASSAD_VALUE:
 		case Value::LIST_VALUE:
 		case Value::SLIST_VALUE:
 		case Value::ABSOLUTE_TIME_VALUE:
@@ -1930,11 +2002,15 @@ convBool( const char*, const ArgumentList &argList, EvalState &state,
 			{
 				string buf;
 				arg.IsStringValue( buf );
-				if( strcasecmp( "false", buf.c_str( ) ) || buf == "" ) {
+				if (strcasecmp("false", buf.c_str()) == 0) { 
 					result.SetBooleanValue( false );
-				} else {
+					return( true );
+				} 
+				if (strcasecmp("true", buf.c_str()) == 0) { 
 					result.SetBooleanValue( true );
-				}
+					return( true );
+				} 
+				result.SetUndefinedValue();
 				return( true );
 			}
 
@@ -2015,6 +2091,7 @@ convTime(const char* name,const ArgumentList &argList,EvalState &state,
 
 		case Value::ERROR_VALUE:
 		case Value::CLASSAD_VALUE:
+		case Value::SCLASSAD_VALUE:
 		case Value::LIST_VALUE:
 		case Value::SLIST_VALUE:
 		case Value::BOOLEAN_VALUE:
@@ -2059,12 +2136,7 @@ convTime(const char* name,const ArgumentList &argList,EvalState &state,
 					    atvalue.offset = arg2num;
 					  else    // the default offset is the current timezone
 					    atvalue.offset = Literal::findOffset(atvalue.secs);
-					  if(atvalue.offset == -1) {
-					    result.SetErrorValue( );
-					    return( false );
-					  }
-					  else	
-					    result.SetAbsoluteTimeValue( atvalue );
+					  result.SetAbsoluteTimeValue( atvalue );
 				}
 				return( true );
 			}
@@ -2100,12 +2172,7 @@ convTime(const char* name,const ArgumentList &argList,EvalState &state,
 						atvalue.offset = arg2num;
 					else      // the default offset is the current timezone
 						atvalue.offset = Literal::findOffset(atvalue.secs);	
-					if(atvalue.offset == -1) {
-						result.SetErrorValue( );
-						return( false );
-					}
-					else
-					  result.SetAbsoluteTimeValue( atvalue );
+					result.SetAbsoluteTimeValue( atvalue );
 				}
 				return( true );
 			}
@@ -2143,7 +2210,7 @@ doRound( const char* name,const ArgumentList &argList,EvalState &state,
             double rvalue;
             realValue.IsRealValue(rvalue);
             if (strcasecmp("floor", name) == 0) {
-                result.SetIntegerValue((int) floor(rvalue));
+                result.SetIntegerValue((long long) floor(rvalue));
             } else if (   strcasecmp("ceil", name)    == 0 
                        || strcasecmp("ceiling", name) == 0) {
                 result.SetIntegerValue((long long) ceil(rvalue));
@@ -2363,12 +2430,14 @@ ifThenElse( const char* /* name */,const ArgumentList &argList,EvalState &state,
 
 	case Value::ERROR_VALUE:
 	case Value::CLASSAD_VALUE:
+	case Value::SCLASSAD_VALUE:
 	case Value::LIST_VALUE:
 	case Value::SLIST_VALUE:
 	case Value::STRING_VALUE:
 	case Value::ABSOLUTE_TIME_VALUE:
 	case Value::RELATIVE_TIME_VALUE:
 	case Value::NULL_VALUE:
+	default:
 		result.SetErrorValue();
 		return( true );
 	}
@@ -2413,6 +2482,11 @@ eval( const char* /* name */,const ArgumentList &argList,EvalState &state,
 		return true;
 	}
 
+	if( state.depth_remaining <= 0 ) {
+		result.SetErrorValue();
+		return false;
+	}
+
 	ClassAdParser parser;
 	ExprTree *expr = NULL;
 	if( !parser.ParseExpression( s.c_str(), expr, true ) || !expr ) {
@@ -2423,9 +2497,13 @@ eval( const char* /* name */,const ArgumentList &argList,EvalState &state,
 		return true;
 	}
 
+	state.depth_remaining--;
+
 	expr->SetParentScope( state.curAd );
 
-	bool eval_ok = expr->Evaluate( result );
+	bool eval_ok = expr->Evaluate( state, result );
+
+	state.depth_remaining++;
 
 	delete expr;
 
@@ -2527,7 +2605,7 @@ static bool regexp_helper(const char *pattern, const char *target,
                           Value &result);
 
 bool FunctionCall::
-substPattern( const char*,const ArgumentList &argList,EvalState &state,
+substPattern( const char *name,const ArgumentList &argList,EvalState &state,
 	Value &result )
 {
     bool        have_options;
@@ -2580,6 +2658,14 @@ substPattern( const char*,const ArgumentList &argList,EvalState &state,
         result.SetErrorValue( );
         return( true );
     }
+
+	if( strcasecmp( name, "replace" ) == 0 ) {
+		have_options = true;
+		options_string += "f";
+	} else if( strcasecmp( name, "replaceall" ) == 0 ) {
+		have_options = true;
+		options_string += "fg";
+	}
 
 		// if either argument is not a string, the result is an error
 	if( !arg0.IsStringValue( pattern ) || !arg1.IsStringValue( target ) || !arg2.IsStringValue( replace ) ) {
@@ -2714,6 +2800,7 @@ matchPatternMember( const char*,const ArgumentList &argList,EvalState &state,
     result.SetBooleanValue(false);
     
     ExprTree *target_expr;
+	bool couldBeUndefined = false;
     ExprList::const_iterator list_iter = target_list->begin();
     while (list_iter != target_list->end()) {
         Value target_value;
@@ -2724,9 +2811,18 @@ matchPatternMember( const char*,const ArgumentList &argList,EvalState &state,
                 result.SetErrorValue();
                 return true;
             }
+
+			// If the list element is not a string, result is error
+			// unless it is undefined, then total result is either
+			// true (if one matches) or undefined
             if (!target_value.IsStringValue(target)) {
-                result.SetErrorValue();
-                return true;
+				if (target_value.IsUndefinedValue()) {
+					couldBeUndefined = true;
+				} else {
+					// Some non-string, not-undefined value, error and give up
+                	result.SetErrorValue();
+                	return true;
+				}
             } else {
                 bool have_match;
                 bool success = regexp_helper(pattern, target, NULL, have_options, options_string, have_match_value);
@@ -2746,6 +2842,9 @@ matchPatternMember( const char*,const ArgumentList &argList,EvalState &state,
         }
         list_iter++;
     }
+	if (couldBeUndefined) {
+		result.SetUndefinedValue();
+	}
     return true;
 }
 
@@ -2759,6 +2858,8 @@ static bool regexp_helper(
 {
     int         options;
 	int			status;
+	bool		full_target = false;
+	bool		find_all = false;
 
 #if defined (USE_POSIX_REGEX)
 	regex_t		re;
@@ -2777,6 +2878,9 @@ static bool regexp_helper(
         // forwards compatibility.
         if ( options_string.find( 'i' ) != string::npos ) {
             options |= REG_ICASE;
+        }
+        if ( options_string.find( 'f' ) != string::npos ) {
+            full_target = true;
         }
     }
 
@@ -2814,6 +2918,9 @@ static bool regexp_helper(
 		string output;
 		bool replace_success = true;
 
+		if ( full_target ) {
+			output.append(target, pmatch[0].rm_so);
+		}
 		while (*replace) {
 			if (*replace == '\\') {
 				if (isdigit(replace[1])) {
@@ -2832,6 +2939,9 @@ static bool regexp_helper(
 			}
 			replace++;
 		}
+		if ( replace_success && full_target ) {
+			output.append(target+pmatch[0].rm_eo, strlen(target+pmatch[0].rm_eo));
+		}
 
 		if( replace_success ) {
 			result.SetStringValue( output );
@@ -2842,7 +2952,11 @@ static bool regexp_helper(
 		return( true );
 	}
 	else if( status == REG_NOMATCH && replace ) {
-		result.SetStringValue( "" );
+		if ( full_target ) {
+			result.SetStringValue( target );
+		} else {
+			result.SetStringValue( "" );
+		}
 		return( true );
 	}
 
@@ -2861,7 +2975,15 @@ static bool regexp_helper(
 #elif defined (USE_PCRE)
     const char  *error_message;
     int         error_offset;
-    pcre        *re;
+    pcre        *re = NULL;
+	int group_count = 0;
+	int oveccount = 0;
+	int *ovector = NULL;
+	bool empty_match = false;
+	int addl_opts = 0;
+	int target_len = strlen(target);
+	int target_idx = 0;
+	string output;
 
     options     = 0;
     if( have_options ){
@@ -2880,6 +3002,19 @@ static bool regexp_helper(
         if ( options_string.find( 'x' ) != string::npos ) {
             options |= PCRE_EXTENDED;
         }
+		if ( replace ) {
+			// The 'f' option means that the result should consist of
+			// the full target string with any replacement(s) applied
+			// in-place.
+			if ( options_string.find( 'f' ) != string::npos ) {
+				full_target = true;
+			}
+			// The 'g' option means that all matches to the pattern
+			// should be found in the target string (without overlaps).
+			if ( options_string.find( 'g' ) != string::npos ) {
+				find_all = true;
+			}
+		}
     }
 
     re = pcre_compile( pattern, options, &error_message,
@@ -2887,68 +3022,96 @@ static bool regexp_helper(
     if ( re == NULL ){
 			// error in pattern
 		result.SetErrorValue( );
-    } else {
-		int group_count;
-		pcre_fullinfo(re, NULL, PCRE_INFO_CAPTURECOUNT, &group_count);
-		int oveccount = 3 * (group_count + 1); // +1 for the string itself
-		int * ovector = (int *) malloc(oveccount * sizeof(int));
+		goto cleanup;
+	}
 
+	pcre_fullinfo(re, NULL, PCRE_INFO_CAPTURECOUNT, &group_count);
+	oveccount = 3 * (group_count + 1); // +1 for the string itself
+	ovector = (int *) malloc(oveccount * sizeof(int));
 
-        status = pcre_exec(re, NULL, target, strlen(target),
-                           0, 0, ovector, oveccount);
-        if (status >= 0) {
-            result.SetBooleanValue( true );
-        } else {
-            result.SetBooleanValue( false );
-        }
+	// NOTE: For global replacement option 'g', we don't properly
+	//   handle situations where a single character of the target
+	//   consists of multiple bytes. These are UTF-8 strings and
+	//   environments where a newline is CRLF. These options can be
+	//   enabled within the search pattern in PCRE.
 
-		pcre_free(re);
+	do {
 
-		if( replace && status<0 ) {
-			result.SetStringValue( "" );
+		if ( empty_match ) {
+			addl_opts = PCRE_NOTEMPTY_ATSTART | PCRE_ANCHORED;
+		} else {
+			addl_opts = 0;
 		}
-		else if( replace ) {
+
+        status = pcre_exec(re, NULL, target, target_len,
+                           target_idx, addl_opts, ovector, oveccount);
+
+		if (empty_match && status == PCRE_ERROR_NOMATCH) {
+			output += target[target_idx];
+			target_idx++;
+			empty_match = false;
+			status = 0;
+			continue;
+		}
+
+		if( status >= 0 && replace ) {
 
 			const char **groups = NULL;
-			string output;
 			int ngroups = status;
-			bool replace_success = true;
+			const char *replace_ptr = replace;
+
+			if ( full_target ) {
+				output.append(&target[target_idx], ovector[0] - target_idx);
+			}
 
 			if( pcre_get_substring_list(target,ovector,ngroups,&groups)!=0 ) {
 				result.SetErrorValue( );
-				replace_success = false;
+				goto cleanup;
 			}
-			else while (*replace) {
-				if (*replace == '\\') {
-					if (isdigit(replace[1])) {
-						int offset = replace[1] - '0';
-						replace++;
+			else while (*replace_ptr) {
+				if (*replace_ptr == '\\') {
+					if (isdigit(replace_ptr[1])) {
+						int offset = replace_ptr[1] - '0';
+						replace_ptr++;
 						if( offset >= ngroups ) {
-							replace_success = false;
-							break;
+							result.SetErrorValue();
+							goto cleanup;
 						}
 						output += groups[offset];
 					} else {
 						output += '\\';
 					}
 				} else {
-					output += *replace;
+					output += *replace_ptr;
 				}
-				replace++;
+				replace_ptr++;
 			}
 
 			pcre_free_substring_list( groups );
 
-			if( replace_success ) {
-				result.SetStringValue( output );
-			}
-			else {
-				result.SetErrorValue( );
+			target_idx = ovector[1];
+			if ( ovector[0] == ovector[1] ) {
+				empty_match = true;
 			}
 		}
 
-		free( ovector );
-    }
+    } while (status >= 0 && find_all);
+
+	if ( status < 0 && status != PCRE_ERROR_NOMATCH ) {
+		result.SetErrorValue();
+	} else if ( !replace ) {
+		result.SetBooleanValue( status >= 0 );
+	} else {
+		if ( full_target ) {
+			output += &target[target_idx];
+		}
+		result.SetStringValue(output);
+	}
+ cleanup:
+	if ( re ) {
+		pcre_free(re);
+	}
+	free(ovector);
     return true;
 #endif
 }

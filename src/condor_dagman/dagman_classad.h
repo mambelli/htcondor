@@ -24,6 +24,7 @@
 #include "condor_common.h"
 #include "condor_id.h"
 #include "dag.h"
+#include "dagman_stats.h"
 #include "condor_qmgr.h"
 
 class DCSchedd;
@@ -38,6 +39,16 @@ class DagmanClassad {
 	*/
 	~DagmanClassad();
 
+	/** Initialize the DAGMan job's classad.
+		@param maxJobs Maximum number of submitted jobs
+		@param maxIdle Maximum number of idle jobs
+		@param maxPreScripts Maximum number of active pre scripts
+		@param maxPostScripts Maximum number of active post scripts
+	**/
+	void Initialize( int maxJobs, int maxIdle, int maxPreScripts,
+			int maxPostScripts );
+
+
 	/** Update the status information in the DAGMan job's classad.
 		@param The total number of nodes
 		@param The number of nodes that are done
@@ -49,10 +60,31 @@ class DagmanClassad {
 		@param The number of nodes that are unready
 		@param The overall DAG status
 		@param Whether the DAG is in recovery mode
+		@param A ClassAd of DAGMan runtime statistics
 	*/
 	void Update( int total, int done, int pre, int submitted, int post,
 				int ready, int failed, int unready,
-				Dag::dag_status dagStatus, bool recovery );
+				Dag::dag_status dagStatus, bool recovery, const DagmanStats &stats,
+				int &maxJobs, int &maxIdle, int &maxPreScripts, int &maxPostScripts );
+
+		/** Get information we need from our own ClassAd.
+			@param owner: A MyString to receive the Owner value.
+			@param nodeName: A MyString to receive the DAGNodeName value.
+		*/
+	void GetInfo( MyString &owner, MyString &nodeName );
+
+		/** Get the JobBatchName value from our ClassAd (setting it
+		    to the default if it's not already set).
+			@param batchName: A MyString to receive the JobBatchName value
+		*/
+	void GetSetBatchName( const MyString &primaryDagFile,
+				MyString &batchName );
+
+		/** Get the AcctGroup and AcctGroupUser values from our ClassAd.
+			@param group: A MyString to receive the AcctGroup value
+			@param user: A MyString to receive the AcctGroupUser value
+		*/
+	void GetAcctInfo( MyString &group, MyString &user );
 
   private:
 		/** Initialize metrics information related to our classad.
@@ -76,10 +108,35 @@ class DagmanClassad {
 		*/
 	void SetDagAttribute( const char *attrName, int attrVal );
 
+		/** Set an attribute in this DAGMan's classad.
+			@param attrName The name of the attribute to set.
+			@param attrVal The value of the attribute.
+		*/
+	void SetDagAttribute( const char *attrName, const MyString &value );
+
+		/** Set a nested ClassAd attribute in this DAGMan's classad.
+			@param attrName The name of the attribute to set.
+			@param ad The ClassAd to set.
+		*/
+	void SetDagAttribute( const char *attrName, const ClassAd &ad );
+
+		/** Get the specified attribute (string) value from our ClassAd.
+			@param attrName: The name of the attribute.
+			@param attrVal: A MyString to receive the attribute value.
+			@param printWarning: Whether to print a warning if we
+				can't get the requested attribute.
+			@return true if we got the requested attribute, false otherwise
+		*/
+	bool GetDagAttribute( const char *attrName, MyString &attrVal,
+				bool printWarning = true );
+
+	bool GetDagAttribute( const char *attrName, int &attrVal,
+				bool printWarning = true );
+
 		// Whether this object is valid.
 	bool _valid;
 
-		// The Condor ID for this DAGMan -- that's the classad we'll
+		// The HTCondor ID for this DAGMan -- that's the classad we'll
 		// update.
 	CondorID _dagmanId;
 

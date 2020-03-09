@@ -20,12 +20,23 @@
 #ifndef __COLLECTOR_STATS_H__
 #define __COLLECTOR_STATS_H__
 
-#include "condor_classad.h"
-#include "condor_collector.h"
-#include "hashkey.h"
 #include "extArray.h"
+#include "generic_stats.h"
+
+#define TRACK_QUERIES_BY_SUBSYS 1 // for testing, we may want to turn this code off...
+#ifdef TRACK_QUERIES_BY_SUBSYS
+#include "subsystem_info.h"
+#endif
+
+// Enable a series of fine-grained timing probes of the details of the
+// receive_update() CEDAR command handler.
+//#define PROFILE_RECEIVE_UPDATE 1
 
 #define DEFAULT_COLLECTOR_STATS_GARBAGE_INTERVAL (3600*4)
+
+// probes for doing timing analysis, enable one, the probe is more detailed.
+#define collector_runtime_probe stats_entry_probe<double>
+//#define collector_runtime_probe stats_recent_counter_timer
 
 // Base
 class CollectorBaseStats
@@ -39,7 +50,7 @@ class CollectorBaseStats
 	int getTotal( void ) { return updatesTotal; };
 	int getSequenced( void ) { return updatesSequenced; };
 	int getDropped( void ) { return updatesDropped; };
-	char *getHistoryString( void );
+	//char *getHistoryString( void );
 	char *getHistoryString( char * );
 	int getHistoryStringLen( void ) { return 1 + ( (historySize + 3) / 4 ); };
 	bool wasRecentlyUpdated() { return m_recently_updated; }
@@ -47,13 +58,14 @@ class CollectorBaseStats
 
   private:
 	int storeStats( bool sequened, int dropped );
+	int setHistoryBits( bool dropped, int count );
 
-	int			updatesTotal;			// Total # of updates
-	int			updatesSequenced;		// # of updates "sequenced"
+	int			updatesTotal;			// Total # of updates received
+	int			updatesSequenced;		// # of updates "sequenced" (Total+dropped-Initial) expected to match UpdateSequenceNumber if Initial==1
 	int			updatesDropped;			// # of updates dropped
 
 	// History info
-	unsigned		*historyBuffer;			// History buffer
+	unsigned	*historyBuffer;			// History buffer
 	int			historySize;			// Size of history to report
 	int			historyWords;			// # of words allocated
 	int			historyWordBits;		// # of bits / word (used a lot)
@@ -127,23 +139,89 @@ class CollectorDaemonStatsList
   private:
 	bool hashKey( StatsHashKey &key, const char *class_name, ClassAd *ad );
 
-	enum { STATS_TABLE_SIZE = 1024 };
 	StatsHashTable		*hashTable;
 	int				historySize;
 	bool				enabled;
 };
+
+
+class stats_entry_lost_updates : public stats_entry_recent<Probe> {
+public:
+	static const int PubRatio = 4;  // publish loss ratio. value between 0 and 1 where 1 is all loss.
+	static const int PubMax = 8;    // publish largest loss gap
+	void Publish(ClassAd & ad, const char * pattr, int flags) const;
+};
+
+
+// update counters that are tracked globally, and per Ad type.
+struct UpdatesCounters {
+	stats_entry_recent<long>   UpdatesTotal;
+	stats_entry_recent<long>   UpdatesInitial;
+	//stats_entry_recent<Probe> UpdatesLost;
+	stats_entry_lost_updates  UpdatesLost;
+
+	void RegisterCounters(StatisticsPool &Pool, const char * className, int recent_max);
+	void UnregisterCounters(StatisticsPool &Pool);
+};
+
+struct UpdatesStats {
+
+	// aggregation of updates stats for the whole collector
+	UpdatesCounters Any;
+	stats_entry_abs<int> MachineAds;
+	stats_entry_abs<int> SubmitterAds;
+
+	stats_entry_abs<int> ActiveQueryWorkers;
+	stats_entry_abs<int> PendingQueries;
+	stats_entry_recent<long> DroppedQueries;
+
+#ifdef TRACK_QUERIES_BY_SUBSYS
+	stats_entry_recent<long> InProcQueriesFrom[SUBSYSTEM_ID_COUNT]; // Track subsystems < the AUTO subsys.
+	stats_entry_recent<long> ForkQueriesFrom[SUBSYSTEM_ID_COUNT]; // Track subsystems < the AUTO subsys.
+#endif
+
+	// per-ad-type counters 
+	std::map<std::string, UpdatesCounters> PerClass;
+
+	// these are used by generic tick
+	time_t StatsLifetime;         // the total time covered by this set of statistics
+	time_t StatsLastUpdateTime;   // last time that statistics were last updated. (a freshness time)
+	time_t RecentStatsLifetime;   // actual time span of current RecentXXX data.
+	time_t RecentStatsTickTime;   // last time Recent values Advanced
+
+	StatisticsPool Pool;
+
+	// non-published values
+	time_t InitTime;            // last time we init'ed the structure
+	int    RecentWindowMax;     // size of the time window over which RecentXXX values are calculated.
+	int    RecentWindowQuantum;
+	int    PublishFlags;
+	int    AdvanceAtLastTick;
+
+	// methods
+	//
+	void Init();
+	void Clear();
+	time_t Tick(time_t now=0); // call this when time may have changed to update StatsUpdateTime, etc.
+	void Reconfig();
+	void SetWindowSize(int window);
+	void Publish(ClassAd & ad, int flags) const;
+	void Publish(ClassAd & ad, const char * config) const;
+
+	// this is called when a new update arrives.
+	int  updateStats( const char * className, bool sequenced, int dropped );
+};
+
 
 // Collector stats
 class CollectorStats
 {
   public:
 	CollectorStats( bool enable_daemon_stats,
-					int class_history_size,
 					int daemon_history_size );
 	virtual ~CollectorStats( void );
 	int update( const char *className, ClassAd *oldAd, ClassAd *newAd );
-	int publishGlobal( ClassAd *Ad );
-	int setClassHistorySize( int size );
+	int publishGlobal( ClassAd *Ad, const char * config );
 	int setDaemonStats( bool );
 	int setDaemonHistorySize( int size );
 	void setGarbageCollectionInterval( time_t interval ) {
@@ -152,16 +230,17 @@ class CollectorStats
 
 		// If it is time to collect garbage, remove all records that
 		// have not been updated since the last sweep.
-	void considerCollectingGarbage();
+	time_t considerCollectingGarbage();
+
+	UpdatesStats				global;
 
   private:
 
-	CollectorBaseStats			global;
-	CollectorClassStatsList		*classList;
 	CollectorDaemonStatsList	*daemonList;
 
 	time_t m_garbage_interval;
 	time_t m_last_garbage_time;
 };
+
 
 #endif /* _CONDOR_COLLECTOR_STATS_H */

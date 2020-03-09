@@ -22,16 +22,11 @@
 #include "condor_common.h"
 #include "parallelshadow.h"
 #include "condor_daemon_core.h"
-#include "condor_qmgr.h"         // need to talk to schedd's qmgr
 #include "condor_attributes.h"   // for ATTR_ ClassAd stuff
 #include "condor_email.h"        // for email.
-#include "list.h"                // List class
-#include "internet.h"            // sinful->hostname stuff
 #include "daemon.h"
-#include "env.h"
 #include "condor_config.h"
 #include "spooled_job_files.h"
-#include "condor_claimid_parser.h"
 
 RemoteResource *parallelMasterResource = NULL;
 
@@ -39,8 +34,6 @@ ParallelShadow::ParallelShadow() {
     nextResourceToStart = 0;
 	numNodes = 0;
     shutDownMode = FALSE;
-    ResourceList.fill(NULL);
-    ResourceList.truncate(-1);
 	actualExitReason = -1;
 	info_tid = -1;
 	is_reconnect = false;
@@ -49,7 +42,7 @@ ParallelShadow::ParallelShadow() {
 
 ParallelShadow::~ParallelShadow() {
         // Walk through list of Remote Resources.  Delete all.
-    for ( int i=0 ; i<=ResourceList.getlast() ; i++ ) {
+    for ( size_t i=0 ; i<ResourceList.size() ; i++ ) {
         delete ResourceList[i];
     }
 	daemonCore->Cancel_Command( SHADOW_UPDATEINFO );
@@ -58,8 +51,6 @@ ParallelShadow::~ParallelShadow() {
 void 
 ParallelShadow::init( ClassAd* job_ad, const char* schedd_addr, const char *xfer_queue_contact_info )
 {
-
-	char buf[256];
 
     if( ! job_ad ) {
         EXCEPT( "No job_ad defined!" );
@@ -82,31 +73,27 @@ ParallelShadow::init( ClassAd* job_ad, const char* schedd_addr, const char *xfer
     MpiResource *rr = new MpiResource( this );
 	parallelMasterResource = rr;
 
-	char *lspool = param("SPOOL");
-	char *dir = gen_ckpt_name(lspool, getCluster(), 0, 0);
-	free(lspool);
+	std::string dir;
+	SpooledJobFiles::getJobSpoolPath(jobAd, dir);
 	job_ad->Assign(ATTR_REMOTE_SPOOL_DIR,dir);
-	free(dir); dir = NULL;
 
-    snprintf( buf, 256, "%s = %s", ATTR_MPI_IS_MASTER, "TRUE" );
-    if( !job_ad->Insert(buf) ) {
-        dprintf( D_ALWAYS, "Failed to insert %s into jobAd.\n", buf );
+    if( !job_ad->Assign(ATTR_MPI_IS_MASTER, true) ) {
+        dprintf( D_ALWAYS, "Failed to insert %s into jobAd.\n", ATTR_MPI_IS_MASTER );
         shutDown( JOB_NOT_STARTED );
     }
 
 	replaceNode( job_ad, 0 );
 	rr->setNode( 0 );
-	snprintf( buf, 256, "%s = 0", ATTR_NODE );
-	job_ad->Insert( buf );
+	job_ad->Assign( ATTR_NODE, 0 );
     rr->setJobAd( job_ad );
 
 	rr->setStartdInfo( job_ad );
 
-    ResourceList[ResourceList.getlast()+1] = rr;
+    ResourceList.push_back(rr);
 
 	shutdownPolicy = ParallelShadow::WAIT_FOR_NODE0;
 
-	MyString policy;
+	std::string policy;
 	job_ad->LookupString(ATTR_PARALLEL_SHUTDOWN_POLICY, policy);
 	if (policy == "WAIT_FOR_ALL") {
 		dprintf(D_ALWAYS, "Setting parallel shutdown policy to WAIT_FOR_ALL\n");
@@ -143,7 +130,7 @@ ParallelShadow::supportsReconnect( void )
 {
 		// Iff all remote resources support reconect,
 		// then this shadow does.  If any do not, we do not
-    for ( int i=0 ; i<=ResourceList.getlast() ; i++ ) {
+    for ( size_t i=0 ; i<ResourceList.size() ; i++ ) {
         if (! ResourceList[i]->supportsReconnect()) {
 			return false;
 		}
@@ -186,7 +173,7 @@ ParallelShadow::spawn( void )
 }
 
 
-int 
+void
 ParallelShadow::getResources( void )
 {
     dprintf ( D_FULLDEBUG, "Getting machines from schedd now...\n" );
@@ -195,7 +182,6 @@ ParallelShadow::getResources( void )
     char *claim_id = NULL;
     MpiResource *rr;
 	int job_cluster;
-	char buf[128];
 
     int numProcs=0;    // the # of procs to come
     int numInProc=0;   // the # in a particular proc.
@@ -217,19 +203,19 @@ ParallelShadow::getResources( void )
 		
 	sock->encode();
 	if( ! sock->code(job_cluster) ) {
-		EXCEPT( "Can't send cluster (%d) to schedd\n", job_cluster );
+		EXCEPT( "Can't send cluster (%d) to schedd", job_cluster );
 	}
 	if( ! sock->code(claim_id) ) {
-		EXCEPT( "Can't send ClaimId to schedd\n" );
+		EXCEPT( "Can't send ClaimId to schedd" );
 	}
 
 		// Now that we sent this, free the memory that was allocated
 		// with getClaimId() above
-	delete [] claim_id;
+	free( claim_id );
 	claim_id = NULL;
 
 	if( ! sock->end_of_message() ) {
-		EXCEPT( "Can't send EOM to schedd\n" );
+		EXCEPT( "Can't send EOM to schedd" );
 	}
 	
 		// Ok, that's all we need to send, now we can read the data
@@ -291,17 +277,15 @@ ParallelShadow::getResources( void )
 
 			replaceNode ( job_ad, nodenum );
 			rr->setNode( nodenum );
-			snprintf( buf, 128, "%s = %d", ATTR_NODE, nodenum );
-			job_ad->Insert( buf );
-			snprintf( buf, 128, "%s = \"%s\"", ATTR_MY_ADDRESS,
-					 daemonCore->InfoCommandSinfulString() );
-			job_ad->Insert( buf );
+			job_ad->Assign( ATTR_NODE, nodenum );
+			job_ad->Assign( ATTR_MY_ADDRESS,
+			                daemonCore->InfoCommandSinfulString() );
 
-			char *lspool = param("SPOOL");
-			char *dir = gen_ckpt_name(lspool, job_cluster, 0, 0);
-			free(lspool);
+				// We want the spool directory of Proc 0, so use data
+				// member jobAd, NOT local variable job_ad.
+			std::string dir;
+			SpooledJobFiles::getJobSpoolPath(jobAd, dir);
 			job_ad->Assign(ATTR_REMOTE_SPOOL_DIR, dir);
-			free(dir); dir = NULL;
 
 				// Put the correct claim id into this ad's ClaimId attribute.
 				// Otherwise, it is the claim id of the master proc.
@@ -311,7 +295,7 @@ ParallelShadow::getResources( void )
 			rr->setJobAd( job_ad );
 			nodenum++;
 
-            ResourceList[ResourceList.getlast()+1] = rr;
+            ResourceList.push_back(rr);
 
                 /* free stuff so next code() works correctly */
             free( host );
@@ -329,7 +313,8 @@ ParallelShadow::getResources( void )
 			int jobAdNumInProc = 0;
 			if (!job_ad->LookupInteger(ATTR_MAX_HOSTS, jobAdNumInProc)) {
 				dprintf(D_ALWAYS, "ERROR: no attribute MaxHosts in parallel job\n");	
-				return false;
+				delete sock;
+				return;
 			};
 			ASSERT( jobAdNumInProc == numInProc);
         } // end of for loop for this proc
@@ -345,7 +330,7 @@ ParallelShadow::getResources( void )
 
     startMaster();
 
-    return TRUE;
+    delete sock;
 }
 
 
@@ -375,8 +360,8 @@ ParallelShadow::spawnAllComrades( void )
 		*/
 
     MpiResource *rr;
-	int last = ResourceList.getlast();
-	while( nextResourceToStart <= last ) {
+	int size = ResourceList.size();
+	while( nextResourceToStart < size ) {
         rr = ResourceList[nextResourceToStart];
 		spawnNode( rr );  // This increments nextResourceToStart 
     }
@@ -407,14 +392,13 @@ ParallelShadow::spawnNode( MpiResource* rr )
 
 
 void 
-ParallelShadow::cleanUp( void )
+ParallelShadow::cleanUp( bool graceful )
 {
 	// kill all the starters
 	MpiResource *r;
-	int i;
-    for( i=0 ; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 		r = ResourceList[i];
-		r->killStarter();
+		r->killStarter(graceful);
 	}		
 }
 
@@ -422,8 +406,7 @@ int ParallelShadow::JobSuspend(int sig)
 {
 	int iRet = 0;
 	MpiResource *r;
-	int i;
-    for( i=0 ; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 		r = ResourceList[i];
 		if (!r || !r->suspend())
 		{
@@ -440,8 +423,7 @@ int ParallelShadow::JobResume(int sig)
 {
 	int iRet = 0;
 	MpiResource *r;
-	int i;
-    for( i=0 ; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 		r = ResourceList[i];
 		if (!r || !r->resume())
 		{
@@ -470,10 +452,10 @@ ParallelShadow::gracefulShutDown( void )
 void
 ParallelShadow::emailTerminateEvent( int exitReason, update_style_t kind )
 {
-	int i;
+	size_t i;
 	FILE* mailer;
 	Email msg;
-	MyString str;
+	std::string str;
 	char *s;
 
 	mailer = msg.open_stream( jobAd, exitReason );
@@ -497,7 +479,7 @@ ParallelShadow::emailTerminateEvent( int exitReason, update_style_t kind )
 		// This should be a more rare case in any event.
 
 		jobAd->LookupString(ATTR_REMOTE_HOSTS, str);
-		StringList slist(str.Value());
+		StringList slist(str.c_str());
 
 		slist.rewind();
 		while((s = slist.next()) != NULL)
@@ -522,7 +504,7 @@ ParallelShadow::emailTerminateEvent( int exitReason, update_style_t kind )
 
 	int allexitsone = TRUE;
 	int exit_code;
-	for ( i=0 ; i<=ResourceList.getlast() ; i++ ) {
+	for ( i=0 ; i<ResourceList.size() ; i++ ) {
 		(ResourceList[i])->printExit( mailer );
 		exit_code = (ResourceList[i])->exitCode();
 		if( exit_code != 1 ) {
@@ -551,9 +533,9 @@ ParallelShadow::shutDown( int exitReason )
 	if (exitReason != JOB_NOT_STARTED) {
 		if (shutdownPolicy == WAIT_FOR_ALL) {
 			
-			unsigned int iResources = ResourceList.length();
+			unsigned int iResources = ResourceList.size();
 			
-			for ( int i=0 ; i<=ResourceList.getlast() ; i++ ) {
+			for ( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 				RemoteResource *r = ResourceList[i];
 				// If the policy is wait for all nodes to exit
 				// see if any are still running.  If so,
@@ -614,7 +596,7 @@ ParallelShadow::shutDownLogic( int& exitReason ) {
 		   dupe that to all resources and exit right away. */
 	if ( exitReason == JOB_NOT_STARTED  ||
 		 exitReason == JOB_SHADOW_USAGE ) {
-		for ( int i=0 ; i<ResourceList.getlast() ; i++ ) {
+		for ( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 			(ResourceList[i])->setExitReason( exitReason );
 		}
 		return TRUE;
@@ -645,14 +627,14 @@ ParallelShadow::shutDownLogic( int& exitReason ) {
 	int alldone = TRUE;
 	MpiResource *r;
 
-    for ( int i=0 ; i<=ResourceList.getlast() ; i++ ) {
+    for ( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 		r = ResourceList[i];
 		char *res = NULL;
 		r->getMachineName( res );
 		dprintf( D_FULLDEBUG, "Resource %s...%13s %d\n", res,
 				 rrStateToString(r->getResourceState()), 
 				 r->getExitReason() );
-		delete [] res;
+		free( res );
 		switch ( r->getResourceState() )
 		{
 			case RR_PENDING_DEATH:
@@ -703,7 +685,7 @@ ParallelShadow::handleJobRemoval( int sig ) {
 
 	ResourceState s;
 
-    for ( int i=0 ; i<=ResourceList.getlast() ; i++ ) {
+    for ( size_t i=0 ; i<ResourceList.size() ; i++ ) {
 		s = ResourceList[i]->getResourceState();
 		if( s == RR_EXECUTING || s == RR_STARTUP ) {
 			ResourceList[i]->setExitReason( JOB_KILLED );
@@ -719,15 +701,14 @@ ParallelShadow::handleJobRemoval( int sig ) {
 void
 ParallelShadow::replaceNode ( ClassAd *ad, int nodenum ) {
 
-	ExprTree *tree = NULL;
 	char node[9];
 	const char *lhstr, *rhstr;
 
 	snprintf( node, 9, "%d", nodenum );
 
-	ad->ResetExpr();
-	while( ad->NextExpr(lhstr, tree) ) {
-		rhstr = ExprTreeToString(tree);
+	for ( auto itr = ad->begin(); itr != ad->end(); itr++ ) {
+		lhstr = itr->first.c_str();
+		rhstr = ExprTreeToString(itr->second);
 		if( !lhstr || !rhstr ) {
 			dprintf( D_ALWAYS, "Could not replace $(NODE) in ad!\n" );
 			return;
@@ -749,8 +730,13 @@ ParallelShadow::updateFromStarter(int  /*command*/, Stream *s)
 {
 	ClassAd update_ad;
 	s->decode();
-	getClassAd(s, update_ad);
+	if (!getClassAd(s, update_ad)) {
+		s->end_of_message();
+		dprintf(D_ALWAYS, "ParallelShadow::updateFromStarter could not get Class Ad\n");
+		return FALSE;
+	}
 	s->end_of_message();
+	fix_update_ad(update_ad);
 	return updateFromStarterClassAd(&update_ad);
 }
 
@@ -776,7 +762,7 @@ ParallelShadow::updateFromStarterClassAd(ClassAd* update_ad)
 		return FALSE;
 	}
 
-	int prev_disk = getDiskUsage();
+	int64_t prev_disk = getDiskUsage();
 	struct rusage prev_rusage = getRUsage();
 
 
@@ -788,7 +774,7 @@ ParallelShadow::updateFromStarterClassAd(ClassAd* update_ad)
 		// want to store the maximum in there?  Seperate stuff for
 		// each node?  
 
-    int cur_disk = getDiskUsage();
+	int64_t cur_disk = getDiskUsage();
     if( cur_disk > prev_disk ) {
 		job_ad->Assign(ATTR_DISK_USAGE, cur_disk);
     }
@@ -808,8 +794,7 @@ MpiResource*
 ParallelShadow::findResource( int node )
 {
 	MpiResource* mpi_res;
-	int i;
-	for( i=0; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		if( node == mpi_res->getNode() ) {
 			return mpi_res;
@@ -825,9 +810,8 @@ ParallelShadow::getRUsage( void )
 	MpiResource* mpi_res;
 	struct rusage total;
 	struct rusage cur;
-	int i;
 	memset( &total, 0, sizeof(struct rusage) );
-	for( i=0; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		cur = mpi_res->getRUsage();
 		total.ru_stime.tv_sec += cur.ru_stime.tv_sec;
@@ -842,7 +826,7 @@ ParallelShadow::getImageSize( int64_t & memory_usage, int64_t & rss, int64_t & p
 {
 	MpiResource* mpi_res;
 	int64_t max_size = 0, max_usage = 0, max_rss = 0, max_pss = -1;
-	for(int i=0; i<=ResourceList.getlast() ; i++ ) {
+	for(size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		int64_t usage = 0, rs = 0, ps = 0;
 		int64_t val = mpi_res->getImageSize( usage, rs, ps );
@@ -858,12 +842,12 @@ ParallelShadow::getImageSize( int64_t & memory_usage, int64_t & rss, int64_t & p
 }
 
 
-int
+int64_t
 ParallelShadow::getDiskUsage( void )
 {
 	MpiResource* mpi_res;
-	int i, max = 0, val;
-	for( i=0; i<=ResourceList.getlast() ; i++ ) {
+	int64_t max = 0, val;
+	for( size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		val = mpi_res->getDiskUsage();
 		if( val > max ) {
@@ -878,9 +862,8 @@ float
 ParallelShadow::bytesSent( void )
 {
 	MpiResource* mpi_res;
-	int i;
 	float total = 0;
-	for( i=0; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		total += mpi_res->bytesSent();
 	}
@@ -892,9 +875,8 @@ float
 ParallelShadow::bytesReceived( void )
 {
 	MpiResource* mpi_res;
-	int i;
 	float total = 0;
-	for( i=0; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		total += mpi_res->bytesReceived();
 	}
@@ -905,8 +887,7 @@ void
 ParallelShadow::getFileTransferStatus(FileTransferStatus &upload_status,FileTransferStatus &download_status)
 {
 	MpiResource* mpi_res;
-	int i;
-	for( i=0; i<=ResourceList.getlast() ; i++ ) {
+	for( size_t i=0; i<ResourceList.size() ; i++ ) {
 		mpi_res = ResourceList[i];
 		FileTransferStatus this_upload_status = XFER_STATUS_UNKNOWN;
 		FileTransferStatus this_download_status = XFER_STATUS_UNKNOWN;
@@ -924,7 +905,7 @@ ParallelShadow::getFileTransferStatus(FileTransferStatus &upload_status,FileTran
 int
 ParallelShadow::getExitReason( void )
 {
-	if( ResourceList[0] ) {
+	if( ResourceList.size() && ResourceList[0] ) {
 		return ResourceList[0]->getExitReason();
 	}
 	return -1;
@@ -941,7 +922,7 @@ ParallelShadow::setMpiMasterInfo( char*   /*str*/ )
 bool
 ParallelShadow::exitedBySignal( void )
 {
-	if( ResourceList[0] ) {
+	if( ResourceList.size() && ResourceList[0] ) {
 		return ResourceList[0]->exitedBySignal();
 	}
 	return false;
@@ -951,7 +932,7 @@ ParallelShadow::exitedBySignal( void )
 int
 ParallelShadow::exitSignal( void )
 {
-	if( ResourceList[0] ) {
+	if( ResourceList.size() && ResourceList[0] ) {
 		return ResourceList[0]->exitSignal();
 	}
 	return -1;
@@ -961,7 +942,7 @@ ParallelShadow::exitSignal( void )
 int
 ParallelShadow::exitCode( void )
 {
-	if( ResourceList[0] ) {
+	if( ResourceList.size() && ResourceList[0] ) {
 		return ResourceList[0]->exitCode();
 	}
 	return -1;
@@ -973,8 +954,7 @@ ParallelShadow::resourceBeganExecution( RemoteResource* rr )
 {
 	bool all_executing = true;
 
-	int i;
-	for( i=0; i<=ResourceList.getlast() && all_executing ; i++ ) {
+	for( size_t i=0; i<ResourceList.size() && all_executing ; i++ ) {
 		if( ResourceList[i]->getResourceState() != RR_EXECUTING ) {
 			all_executing = false;
 		}
@@ -986,7 +966,7 @@ ParallelShadow::resourceBeganExecution( RemoteResource* rr )
 		ExecuteEvent event;
 		event.setExecuteHost( "MPI_job" );
 		if ( !uLog.writeEvent( &event, jobAd )) {
-			dprintf ( D_ALWAYS, "Unable to log EXECUTE event." );
+			dprintf ( D_ALWAYS, "Unable to log EXECUTE event.\n" );
 		}
 		
 			// Now that everything is started, we can finally invoke
@@ -999,7 +979,11 @@ ParallelShadow::resourceBeganExecution( RemoteResource* rr )
 void
 ParallelShadow::resourceReconnected( RemoteResource*  /*rr*/ )
 {
-		//EXCEPT( "impossible: MPIShadow doesn't support reconnect" );
+		// Since our reconnect worked, clear attemptingReconnectAtStartup
+		// flag so if we disconnect again and fail, we will exit
+		// with JOB_SHOULD_REQUEUE instead of JOB_RECONNECT_FAILED.
+		// See gt #4783.
+	attemptingReconnectAtStartup = false;
 }
 
 
@@ -1040,7 +1024,7 @@ ParallelShadow::logReconnectedEvent( void )
 	char* starter = NULL;
 	remRes->getStarterAddress( starter );
 	event.setStarterAddr( starter );
-	delete [] starter;
+	free( starter );
 	starter = NULL;
 
 */

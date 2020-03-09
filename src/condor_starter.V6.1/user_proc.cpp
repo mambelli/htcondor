@@ -55,6 +55,8 @@ UserProc::initialize( void )
 	m_dedicated_account = NULL;
 	m_deleteJobAd = false;
 	job_universe = 0;  // we'll fill in a real value if we can...
+	timerclear( &job_start_time );
+	timerclear( &job_exit_time );
 	int i;
 	for(i=0;i<3;i++) {
 		m_pre_defined_std_fds[i] = -1;
@@ -148,7 +150,7 @@ UserProc::JobReaper(int pid, int status)
 	if (JobPid == pid) {
 		m_proc_exited = true;
 		exit_status = status;
-		job_exit_time.getTime();
+		condor_gettimestamp( job_exit_time );
 	}
 	return m_proc_exited;
 }
@@ -157,28 +159,26 @@ UserProc::JobReaper(int pid, int status)
 bool
 UserProc::PublishUpdateAd( ClassAd* ad )
 {
-	char buf[256];
+	std::string prefix = name ? name : "";
+	std::string attrn;
 
 	dprintf( D_FULLDEBUG, "Inside UserProc::PublishUpdateAd()\n" );
 
-	if( JobPid >= 0 ) { 
-		sprintf( buf, "%s%s=%d", name ? name : "", ATTR_JOB_PID,
-				 JobPid );
-		ad->Insert( buf );
+	if( JobPid >= 0 ) {
+		attrn = prefix + ATTR_JOB_PID;
+		ad->Assign( attrn, JobPid );
 	}
 
-	if( job_start_time.seconds() > 0 ) {
-		sprintf( buf, "%s%s=%ld", name ? name : "", ATTR_JOB_START_DATE,
-				 job_start_time.seconds() );
-		ad->Insert( buf );
+	if( job_start_time.tv_sec > 0 ) {
+		attrn = prefix + ATTR_JOB_START_DATE;
+		ad->Assign( attrn, (long)job_start_time.tv_sec );
 	}
 
 	if (m_proc_exited) {
 
-		if( job_exit_time.seconds() > 0 ) {
-			sprintf( buf, "%s%s=%f", name ? name : "", ATTR_JOB_DURATION, 
-					 job_exit_time.difference(&job_start_time) );
-			ad->Insert( buf );
+		if( job_exit_time.tv_sec > 0 ) {
+			attrn = prefix + ATTR_JOB_DURATION;
+			ad->Assign( attrn, timersub_double( job_exit_time, job_start_time ) );
 		}
 
 			/*
@@ -191,23 +191,19 @@ UserProc::PublishUpdateAd( ClassAd* ad )
 			  got back from a different platform.
 			*/
 		if( WIFSIGNALED(exit_status) ) {
-			sprintf( buf, "%s%s = TRUE", name ? name : "",
-					 ATTR_ON_EXIT_BY_SIGNAL );
-			ad->Insert( buf );
-			sprintf( buf, "%s%s = %d", name ? name : "",
-					 ATTR_ON_EXIT_SIGNAL, WTERMSIG(exit_status) );
-			ad->Insert( buf );
-			sprintf( buf, "%s%s = \"died on %s\"",
-					 name ? name : "", ATTR_EXIT_REASON,
-					 daemonCore->GetExceptionString(WTERMSIG(exit_status)) );
-			ad->Insert( buf );
+			attrn = prefix + ATTR_ON_EXIT_BY_SIGNAL;
+			ad->Assign( attrn, true );
+			attrn = prefix + ATTR_ON_EXIT_SIGNAL;
+			ad->Assign( attrn, WTERMSIG(exit_status) );
+			attrn = prefix + ATTR_EXIT_REASON;
+			std::string attrv = "died on ";
+			attrv += daemonCore->GetExceptionString(WTERMSIG(exit_status));
+			ad->Assign( attrn, attrv );
 		} else {
-			sprintf( buf, "%s%s = FALSE", name ? name : "",
-					 ATTR_ON_EXIT_BY_SIGNAL );
-			ad->Insert( buf );
-			sprintf( buf, "%s%s = %d", name ? name : "",
-					 ATTR_ON_EXIT_CODE, WEXITSTATUS(exit_status) );
-			ad->Insert( buf );
+			attrn = prefix + ATTR_ON_EXIT_BY_SIGNAL;
+			ad->Assign( attrn, false );
+			attrn = prefix + ATTR_ON_EXIT_CODE;
+			ad->Assign( attrn, WEXITSTATUS(exit_status) );
 		}
 	}
 	return true;
@@ -237,11 +233,11 @@ UserProc::PublishToEnv( Env* proc_env )
 		if( WIFSIGNALED(exit_status) ) {
 			env_name = base.Value();
 			env_name += "EXIT_SIGNAL";
-			proc_env->SetEnv( env_name.Value(), WTERMSIG(exit_status) );
+			proc_env->SetEnv( env_name.Value(), IntToStr( WTERMSIG(exit_status) ) );
 		} else {
 			env_name = base.Value();
 			env_name += "EXIT_CODE";
-			proc_env->SetEnv( env_name.Value(), WEXITSTATUS(exit_status) );
+			proc_env->SetEnv( env_name.Value(), IntToStr( WEXITSTATUS(exit_status) ) );
 		}
 	}
 }
@@ -354,7 +350,7 @@ UserProc::getStdFile( std_file_type type,
 		//////////////////////
 	if( wants_stream && ! is_null_file ) {
 		StreamHandler *handler = new StreamHandler;
-		if( !handler->Init(filename, stream_name, is_output) ) {
+		if( !handler->Init(filename, stream_name, is_output, streamingOpenFlags( is_output ) ) ) {
 			MyString err_msg;
 			err_msg.formatstr( "unable to establish %s stream", phrase );
 			Starter->jic->notifyStarterError( err_msg.Value(), true,
@@ -363,8 +359,8 @@ UserProc::getStdFile( std_file_type type,
 			return false;
 		}
 		*out_fd = handler->GetJobPipe();
-		dprintf( D_ALWAYS, "%s: streaming from remote file %s\n",
-				 log_header, filename );
+		dprintf( D_ALWAYS, "%s: streaming %s remote file %s\n",
+				 log_header, is_output ? "to" : "from", filename );
 		return true;
 	}
 
@@ -429,7 +425,7 @@ UserProc::openStdFile( std_file_type type,
 		// we got back
 	bool is_output = (type != SFT_IN);
 	if( is_output ) {
-		int flags = O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_LARGEFILE;
+		int flags = outputOpenFlags();
 		fd = safe_open_wrapper_follow( filename.Value(), flags, 0666 );
 		if( fd < 0 ) {
 				// if failed, try again without O_TRUNC
@@ -491,5 +487,5 @@ UserProc::ThisProcRunsAlongsideMainProc()
 char const *
 UserProc::getArgv0()
 {
-	return CONDOR_EXEC;
+	return 0;
 }

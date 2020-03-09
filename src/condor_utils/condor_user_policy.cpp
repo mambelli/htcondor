@@ -55,7 +55,11 @@ void
 BaseUserPolicy::init( ClassAd* job_ad_ptr )
 {
 	this->job_ad = job_ad_ptr;
+#ifdef USE_NON_MUTATING_USERPOLICY
+	this->user_policy.Init();
+#else
 	this->user_policy.Init( this->job_ad );
+#endif
 	this->interval = param_integer("PERIODIC_EXPR_INTERVAL",
 								   DEFAULT_PERIODIC_EXPR_INTERVAL);
 }
@@ -108,11 +112,14 @@ BaseUserPolicy::startTimer( void )
 void
 BaseUserPolicy::checkAtExit( void )
 {
-	float old_run_time;
+	double old_run_time;
 	this->updateJobTime( &old_run_time );
 
+#ifdef USE_NON_MUTATING_USERPOLICY
+	int action = this->user_policy.AnalyzePolicy( *(this->job_ad), PERIODIC_THEN_EXIT );
+#else
 	int action = this->user_policy.AnalyzePolicy( PERIODIC_THEN_EXIT );
-
+#endif
 	this->restoreJobTime( old_run_time );
 
 		//
@@ -131,10 +138,14 @@ BaseUserPolicy::checkAtExit( void )
 void
 BaseUserPolicy::checkPeriodic( void )
 {
-	float old_run_time;
+	double old_run_time;
 	this->updateJobTime( &old_run_time );
 
+#ifdef USE_NON_MUTATING_USERPOLICY
+	int action = this->user_policy.AnalyzePolicy( *(this->job_ad), PERIODIC_ONLY );
+#else
 	int action = this->user_policy.AnalyzePolicy( PERIODIC_ONLY );
+#endif
 
 	this->restoreJobTime( old_run_time );
 
@@ -157,13 +168,13 @@ BaseUserPolicy::checkPeriodic( void )
  * @param old_run_time - we will put the job's old run time in this
  **/
 void
-BaseUserPolicy::updateJobTime( float *old_run_time )
+BaseUserPolicy::updateJobTime( double *old_run_time )
 {
 	if ( ! this->job_ad ) {
 		return;
 	}
 
-	float previous_run_time, total_run_time;
+	double previous_run_time=0.0;
 	time_t now = time(NULL);
 
 	job_ad->LookupFloat( ATTR_JOB_REMOTE_WALL_CLOCK, previous_run_time );
@@ -175,7 +186,7 @@ BaseUserPolicy::updateJobTime( float *old_run_time )
 		//
 	int bday = this->getJobBirthday( );
 	
-	total_run_time = previous_run_time;
+	double total_run_time = previous_run_time;
 	if ( old_run_time ) {
 		*old_run_time = previous_run_time;
 	}
@@ -183,9 +194,7 @@ BaseUserPolicy::updateJobTime( float *old_run_time )
 		total_run_time += (now - bday);
 	}
 	
-	MyString buf;
-	buf.formatstr( "%s = %f", ATTR_JOB_REMOTE_WALL_CLOCK, total_run_time );
-	this->job_ad->Insert( buf.Value() );
+	this->job_ad->Assign(ATTR_JOB_REMOTE_WALL_CLOCK, total_run_time);
 }
 
 /**
@@ -195,13 +204,11 @@ BaseUserPolicy::updateJobTime( float *old_run_time )
  * @param old_run_time - the run time to put back into the ad
  **/
 void
-BaseUserPolicy::restoreJobTime( float old_run_time )
+BaseUserPolicy::restoreJobTime( double old_run_time )
 {
 	if ( ! this->job_ad ) {
 		return;
 	}
 
-	MyString buf;
-	buf.formatstr( "%s = %f", ATTR_JOB_REMOTE_WALL_CLOCK, old_run_time );
-	this->job_ad->Insert( buf.Value() );
+	this->job_ad->Assign(ATTR_JOB_REMOTE_WALL_CLOCK, old_run_time);
 }

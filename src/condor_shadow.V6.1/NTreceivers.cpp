@@ -28,6 +28,10 @@
 #include "baseshadow.h"
 #include "remoteresource.h"
 #include "directory.h"
+#include "secure_file.h"
+#include "zkm_base64.h"
+#include "directory_util.h"
+
 
 #if defined(Solaris)
 #include <sys/statvfs.h>
@@ -48,9 +52,6 @@ static bool write_access(const char * filename ) {
 
 static int stat_string( char *line, struct stat *info )
 {
-#ifdef WIN32
-	return 0;
-#else
 	return sprintf(line,"%lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 		(long long) info->st_dev,
 		(long long) info->st_ino,
@@ -60,13 +61,17 @@ static int stat_string( char *line, struct stat *info )
 		(long long) info->st_gid,
 		(long long) info->st_rdev,
 		(long long) info->st_size,
+#ifdef WIN32
+		(long long) 0, // use 0 as a placeholder
+		(long long) 0, // use 0 as a placeholder
+#else
 		(long long) info->st_blksize,
 		(long long) info->st_blocks,
+#endif
 		(long long) info->st_atime,
 		(long long) info->st_mtime,
 		(long long) info->st_ctime
 	);
-#endif
 }
 
 #if defined(Solaris)
@@ -125,6 +130,7 @@ static const char * shadow_syscall_name(int condor_sysnum)
         case CONDOR_set_job_attr: return "set_job_attr";
         case CONDOR_constrain: return "constrain";
         case CONDOR_get_sec_session_info: return "get_sec_session_info";
+		case CONDOR_dprintf_stats: return "dprintf_stats";
 #ifdef WIN32
 #else
         case CONDOR_pread: return "pread";
@@ -156,6 +162,8 @@ static const char * shadow_syscall_name(int condor_sysnum)
         case CONDOR_lchown: return "lchown";
         case CONDOR_truncate: return "truncate";
         case CONDOR_utime: return "utime";
+        case CONDOR_getcreds: return "getcreds";
+        case CONDOR_get_delegated_proxy: return "get_delegated_proxy";
 	}
 	return "unknown";
 }
@@ -189,8 +197,11 @@ do_REMOTE_syscall()
             syscall number because the starter went away
             because we *asked* it to go away. Don't be shocked
             and surprised if the startd/starter actually did
-            what we asked when we deactivated the claim */
-       if ( thisRemoteResource->wasClaimDeactivated() ) {
+            what we asked when we deactivated the claim.
+            Or the starter went away by itself after telling us
+            it's ready to do so (via a job_exit syscall). */
+       if ( thisRemoteResource->wasClaimDeactivated() ||
+            thisRemoteResource->gotJobExit() ) {
            return -1;
        }
 
@@ -199,9 +210,7 @@ do_REMOTE_syscall()
 				// reconnect.  happy day! :)
 			dprintf( D_ALWAYS, "%s\n", err_msg.Value() );
 
-			const char* txt = "Socket between submit and execute hosts "
-				"closed unexpectedly";
-			Shadow->logDisconnectedEvent( txt ); 
+			Shadow->resourceDisconnected(thisRemoteResource);
 
 			if (!Shadow->shouldAttemptReconnect(thisRemoteResource)) {
 					dprintf(D_ALWAYS, "This job cannot reconnect to starter, so job exiting\n");
@@ -761,6 +770,7 @@ do_REMOTE_syscall()
 			result = ( syscall_sock->code( terrno ) );
 			ASSERT( result );
 		}
+		free( path );
 		result = ( syscall_sock->end_of_message() );
 		ASSERT( result );
 		return 0;
@@ -1255,7 +1265,8 @@ case CONDOR_getfile:
 		fd = safe_open_wrapper_follow( path, O_RDONLY | _O_BINARY );
 		if(fd >= 0) {
 			struct stat info;
-			stat(path, &info);
+			int rc = stat(path, &info);
+			ASSERT(rc)
 			length = info.st_size;
 			buf = (void *)malloc( (unsigned)length );
 			ASSERT( buf );
@@ -1282,6 +1293,7 @@ case CONDOR_getfile:
 		}
 		free( (char *)path );
 		free( buf );
+		close(fd);
 		result = ( syscall_sock->end_of_message() );
 		ASSERT( result );
 		return 0;
@@ -1317,7 +1329,10 @@ case CONDOR_putfile:
 		ASSERT( result );
 		free((char*)path);
 
-        if (length <= 0) return 0;
+        if (length <= 0) {
+			if (fd >= 0) close(fd);
+			return 0;
+		}
 		
 		int num = -1;
 		if(fd >= 0) {
@@ -1358,33 +1373,38 @@ case CONDOR_getlongdir:
 
 		errno = 0;
 		rval = -1;
-		MyString msg, check;
+		std::string msg, check;
 		const char *next;
 		Directory directory(path);
 		struct stat stat_buf;
 		char line[1024];
+		memset( line, 0, sizeof(line) );
 		
 		// Get directory's contents
-		while((next = directory.Next())) {
-			dprintf(D_ALWAYS, "next: %s\n", next);
-			msg.formatstr_cat("%s\n", next);
-			check.formatstr("%s%c%s", path, DIR_DELIM_CHAR, next);
-			rval = stat(check.Value(), &stat_buf);
-			terrno = (condor_errno_t)errno;
-			if(rval == -1) {
-				break;
+		if(directory.Rewind()) {
+			rval = 0;
+			while((next = directory.Next())) {
+				dprintf(D_ALWAYS, "next: %s\n", next);
+				msg += next;
+				msg += "\n";
+				formatstr(check, "%s%c%s", path, DIR_DELIM_CHAR, next);
+				rval = stat(check.c_str(), &stat_buf);
+				terrno = (condor_errno_t)errno;
+				if(rval == -1) {
+					break;
+				}
+				if(stat_string(line, &stat_buf) < 0) {
+					rval = -1;
+					break;
+				}
+				msg += line;
 			}
-			if(stat_string(line, &stat_buf) < 0) {
-				rval = -1;
-				break;
+			if(rval >= 0) {
+				msg += "\n";	// Needed to signify end of data
+				rval = msg.length();
 			}
-			msg.formatstr_cat("%s", line);
 		}
 		terrno = (condor_errno_t)errno;
-		if(msg.Length() > 0) {
-			msg.formatstr_cat("\n");	// Needed to signify end of data
-			rval = msg.Length();
-		}
 		dprintf( D_SYSCALLS, "\trval = %d, errno = %d\n", rval, terrno );
 
 		syscall_sock->encode();
@@ -1395,7 +1415,7 @@ case CONDOR_getlongdir:
 			ASSERT( result );
 		}
 		else {
-			result = ( syscall_sock->put(msg.Value()) );
+			result = ( syscall_sock->put(msg) );
 			ASSERT( result );
 		}
 		free((char*)path);
@@ -1413,22 +1433,25 @@ case CONDOR_getdir:
 
 		errno = 0;
 		rval = -1;
-		MyString msg;
+		std::string msg;
 		const char *next;
 		Directory directory(path);
 
 		// Get directory's contents
-		while((next = directory.Next())) {
-			msg.formatstr_cat("%s", next);
-			msg.formatstr_cat("\n");
+		if(directory.Rewind()) {
+			while((next = directory.Next())) {
+				msg += next;
+				msg += "\n";
+			}
+			msg += "\n";	// Needed to signify end of data
+			rval = (int)msg.length();
 		}
 		terrno = (condor_errno_t)errno;
-		if(msg.Length() > 0) {
-			msg.formatstr_cat("\n");	// Needed to signify end of data
-			rval = msg.Length();
-		}
 		dprintf( D_SYSCALLS, "\trval = %d, errno = %d\n", rval, terrno );
 
+		// NOTE: Older starters treated rval==0 as an error.
+		//   Any successful reply should have a value greater than 0
+		//   (at least 1 for the terminating "\n").
 		syscall_sock->encode();
 		result = ( syscall_sock->code(rval) );
 		ASSERT( result );
@@ -1437,7 +1460,7 @@ case CONDOR_getdir:
 			ASSERT( result );
 		}
 		else {
-			result = ( syscall_sock->put(msg.Value()) );
+			result = ( syscall_sock->put(msg) );
 			ASSERT( result );
 		}
 		free((char*)path);
@@ -1549,6 +1572,7 @@ case CONDOR_getdir:
 #endif
 		terrno = (condor_errno_t)errno;
 		char line[1024];
+		memset( line, 0, sizeof(line) );
 		if(rval == 0) {
 			if(statfs_string(line, &statfs_buf) < 0) {
 				rval = -1;
@@ -1770,6 +1794,7 @@ case CONDOR_getdir:
 		rval = lstat(path, &stat_buf);
 		terrno = (condor_errno_t)errno;
 		char line[1024];
+		memset( line, 0, sizeof(line) );
 		if(rval == 0) {
 			if(stat_string(line, &stat_buf) < 0) {
 				rval = -1;
@@ -1812,6 +1837,7 @@ case CONDOR_getdir:
 #endif
 		terrno = (condor_errno_t)errno;
 		char line[1024];
+		memset( line, 0, sizeof(line) );
 		if(rval == 0) {
 			if(statfs_string(line, &statfs_buf) < 0) {
 				rval = -1;
@@ -1949,6 +1975,7 @@ case CONDOR_getdir:
 		rval = fstat(fd, &stat_buf);
 		terrno = (condor_errno_t)errno;
 		char line[1024];
+		memset( line, 0, sizeof(line) );
 		if(rval == 0) {
 			if(stat_string(line, &stat_buf) < 0) {
 				rval = -1;
@@ -1985,6 +2012,7 @@ case CONDOR_getdir:
 		rval = stat(path, &stat_buf);
 		terrno = (condor_errno_t)errno;
 		char line[1024];
+		memset( line, 0, sizeof(line) );
 		if(rval == 0) {
 			if(stat_string(line, &stat_buf) < 0) {
 				rval = -1;
@@ -2104,6 +2132,175 @@ case CONDOR_getdir:
 		ASSERT( result );
 		return 0;
 	}
+	case CONDOR_dprintf_stats:
+	{
+		char *message = NULL;
+
+		result = ( syscall_sock->code(message) );
+		ASSERT( result );
+
+		result = ( syscall_sock->end_of_message() );
+		ASSERT( result );
+
+		dprintf(D_STATS, "%s", message);
+		rval = 0; // don't check return value from dprintf
+		free(message);
+
+		syscall_sock->encode();
+		result = ( syscall_sock->code(rval) );
+		ASSERT( result );
+
+
+		result = ( syscall_sock->end_of_message() );
+		ASSERT( result );
+		return 0;
+	}
+	case CONDOR_getcreds:
+	{
+		dprintf(D_SECURITY, "ENTERING getcreds syscall\n");
+
+		// read string.  ignored for now, just present for future compatibility.
+		result = ( syscall_sock->code(path) );
+		ASSERT( result );
+		dprintf( D_SECURITY|D_FULLDEBUG, "  path = %s\n", path );
+		result = ( syscall_sock->end_of_message() );
+		ASSERT( result );
+
+		// send response
+		syscall_sock->encode();
+
+		std::string user;
+		int cluster_id, proc_id;
+		ClassAd* ad;
+		pseudo_get_job_ad(ad);
+		ad->LookupInteger("ClusterId", cluster_id);
+		ad->LookupInteger("ProcId", proc_id);
+		ad->LookupString("Owner", user);
+
+		bool trust_cred_dir = param_boolean("TRUST_CREDENTIAL_DIRECTORY", false);
+
+		auto_free_ptr cred_dir(param("SEC_CREDENTIAL_DIRECTORY_OAUTH"));
+		if (!cred_dir) {
+			dprintf(D_ALWAYS, "ERROR: CONDOR_getcreds doesn't have SEC_CREDENTIAL_DIRECTORY_OAUTH defined.\n");
+			return -1;
+		}
+		MyString cred_dir_name;
+		dircat(cred_dir, user.c_str(), cred_dir_name);
+
+		// what we want to do is send only the ".use" creds, and only
+		// the ones required for this job.  we will need to get that
+		// list of names from the Job Ad.
+		std::string services_needed;
+		ad->LookupString("OAuthServicesNeeded", services_needed);
+		dprintf( D_SECURITY, "CONDOR_getcreds: for job ID %i.%i sending OAuth creds from %s for services %s\n", cluster_id, proc_id, cred_dir_name.c_str(), services_needed.c_str());
+
+		bool had_error = false;
+		StringList services_list(services_needed.c_str());
+		services_list.rewind();
+		char *curr;
+		while((curr = services_list.next())) {
+			MyString fname,fullname;
+			fname.formatstr("%s.use", curr);
+
+			// change the '*' to an '_'.  These are stored that way
+			// so that the original service name can be cleanly
+			// separate if needed.  we don't care, so just change
+			// them all up front.
+			fname.replaceString("*", "_");
+
+			fullname.formatstr("%s%c%s", cred_dir_name.c_str(), DIR_DELIM_CHAR, fname.Value());
+
+			dprintf(D_SECURITY, "CONDOR_getcreds: sending %s (from service name %s).\n", fullname.Value(), curr);
+			// read the file (fourth argument "true" means as_root)
+			unsigned char *buf = 0;
+			size_t len = 0;
+			const bool as_root = true;
+			const int verify_mode = trust_cred_dir ? 0 : SECURE_FILE_VERIFY_ALL;
+			bool rc = read_secure_file(fullname.Value(), (void**)(&buf), &len, as_root, verify_mode);
+			if(!rc) {
+				dprintf( D_ALWAYS, "CONDOR_getcreds: ERROR reading contents of %s\n", fullname.Value() );
+				had_error = true;
+				break;
+			}
+			std::string b64 = Base64::zkm_base64_encode(buf, len);
+			free(buf);
+
+			ClassAd ad;
+			ad.Assign("Service", fname.Value());
+			ad.Assign("Data", b64);
+
+			int more_ads = 1;
+			result = ( syscall_sock->code(more_ads) );
+			ASSERT( result );
+			result = ( putClassAd(syscall_sock, ad) );
+			ASSERT( result );
+			dprintf( D_SECURITY|D_FULLDEBUG, "CONDOR_getcreds: sent ad:\n" );
+			dPrintAd(D_SECURITY|D_FULLDEBUG, ad);
+		}
+
+		int last_command = 0;
+		if (had_error) {
+			last_command = -1;
+		}
+
+		// transmit our success or failure
+		dprintf( D_SECURITY|D_FULLDEBUG, "CONDOR_getcreds: finishing send with value %i\n", last_command );
+
+		result = ( syscall_sock->code(last_command) );
+		ASSERT( result );
+		result = ( syscall_sock->end_of_message() );
+		ASSERT( result );
+
+		// return our success or failure
+		return last_command;
+	}
+
+	case CONDOR_get_delegated_proxy:
+	{
+		dprintf( D_SECURITY, "ENTERING CONDOR_get_delegated_proxy syscall\n" );
+
+		std::string rpc_proxy_source_path;
+		ClassAd* job_ad;
+		filesize_t bytes;
+		std::string job_ad_proxy_source_path;
+		time_t job_ad_proxy_expiration;
+		time_t rpc_proxy_expiration;
+		time_t proxy_expiration;
+
+		pseudo_get_job_ad( job_ad );
+
+		// Read proxy file location from the job ad
+		job_ad->LookupString( ATTR_X509_USER_PROXY, job_ad_proxy_source_path );
+		dprintf( D_SECURITY|D_FULLDEBUG, "CONDOR_get_delegated_proxy: job_ad_proxy_source_path = %s\n", job_ad_proxy_source_path.c_str() );
+
+		// Read path to proxy file via RPC, but ignore it for now
+		// TODO: Compare this to the path read in from the job ad. Return failure if they are different.
+		result = ( syscall_sock->code( rpc_proxy_source_path ) );
+		ASSERT( result );
+
+		// Proxy expiration time is the lesser value of: expiration time passed 
+		// via the RPC call, and the time returned from the job ad
+		result = ( syscall_sock->code( rpc_proxy_expiration ) );
+		ASSERT( result );
+		job_ad_proxy_expiration = GetDesiredDelegatedJobCredentialExpiration( job_ad );
+		proxy_expiration = ( job_ad_proxy_expiration < rpc_proxy_expiration ) ? job_ad_proxy_expiration : rpc_proxy_expiration;
+		dprintf( D_SECURITY|D_FULLDEBUG, "CONDOR_get_delegated_proxy: proxy_expiration = %lu\n", proxy_expiration );
+
+		// Wait for the end_of_message signal
+		result = ( syscall_sock->end_of_message() );
+		ASSERT( result );
+
+		// Switch to send/write mode and call the globus x509 delegation
+		syscall_sock->encode();
+		int put_x509_rc = syscall_sock->put_x509_delegation( &bytes, job_ad_proxy_source_path.c_str(), proxy_expiration, NULL );
+		dprintf( D_SECURITY|D_FULLDEBUG, "CONDOR_get_delegated_proxy: finishing send with value %i\n", put_x509_rc );
+
+		// End of message, cleanup and return
+		result = ( syscall_sock->end_of_message() );
+		ASSERT( result );
+		return put_x509_rc;
+	}
+
 	default:
 	{
 		dprintf(D_ALWAYS, "ERROR: unknown syscall %d received\n", condor_sysnum );

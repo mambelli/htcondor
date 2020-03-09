@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -120,6 +121,9 @@ foreach $name (@outfiles) {
 		runcmd("rm -f $name");
 	}
 }
+
+# Remove any existing rescue DAGs.
+runcmd("rm -f job_dagman_jobstate_log.dag.rescue*");
 
 $abnormal = sub 
 {

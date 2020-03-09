@@ -58,7 +58,7 @@ public:
 	*/
 	virtual bool msgReady();
 
-	virtual stream_type type() { return Stream::safe_sock; }
+	virtual stream_type type() const { return Stream::safe_sock; }
 
 	/** Connect to a host on a port
         @param port the port to connect to, ignorred if s includes port
@@ -67,13 +67,15 @@ public:
     **/
 	virtual int connect(char const *s, int port=0, bool do_not_block = false);
 
+	virtual int close();
+
 	virtual int do_reverse_connect(char const *ccb_contact,bool nonblocking);
 
 	virtual void cancel_reverse_connect();
-	virtual int do_shared_port_local_connect( char const *shared_port_id, bool nonblocking );
+	virtual int do_shared_port_local_connect( char const *shared_port_id, bool nonblocking,char const *sharedPortIP );
 
 	/// my IP address, string version (e.g. "128.105.101.17")
-	virtual const char* my_ip_str();
+	virtual const char* my_ip_str() const;
 
 	//
 	inline int connect(char const *h, char *s) { return connect(h,getportbyserv(s));}
@@ -101,7 +103,7 @@ public:
 	// Methods
 	void init();	/* shared initialization method */
 
-    const char * isIncomingDataMD5ed();
+    const char * isIncomingDataHashed();
     const char * isIncomingDataEncrypted();
 
 #ifdef DEBUG
@@ -113,6 +115,7 @@ public:
 	// interface no longer supported
 	int attach_to_file_desc(int);
 #endif
+	static int recvQueueDepth(int port);
 	
 
 	//	byte operations
@@ -124,6 +127,10 @@ public:
 	virtual int get_ptr(void *&, char);
 	///
 	virtual int peek(char &);
+
+	// serialize and deserialize
+	const char * serialize(const char *);
+	char * serialize() const;
 
 //	PRIVATE INTERFACE TO SAFE SOCKS
 //
@@ -141,8 +148,6 @@ protected:
 
 	enum safesock_state { safesock_none, safesock_listen };
 
-	char * serialize(char *);
-	char * serialize() const;
 	inline bool same(const _condorMsgID msgA,
 					 const _condorMsgID msgB)
 	{
@@ -162,7 +167,6 @@ protected:
 	_condorInMsg *_longMsg;
     Condor_MD_MAC * mdChecker_;
 	int _tOutBtwPkts;
-	char* _fqu;  // fully qualified username
 	int m_udp_network_mtu;
 	int m_udp_loopback_mtu;
 

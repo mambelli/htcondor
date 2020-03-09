@@ -23,7 +23,7 @@
 //---------------------------------------------------
 
 #include "collector.h"
-#include "Set.h"
+#include <set>
 #include "HashTable.h"
 #include "extArray.h"
 
@@ -87,9 +87,9 @@ public:
 	void Exit();             // main__shutdown_fast
 	void Shutdown();         // main_shutdown_graceful
 
-	static int ReceiveHistoryQuery(Service*, int, Stream*);
+	static int ReceiveHistoryQuery(int, Stream*);
 	static int HandleQuery(Stream*, int cmd, int FromDate, int ToDate, int Options, MyString Arg);
-	static int SendListReply(Stream*,const MyString& FileName, int FromDate, int ToDatei, Set<MyString>& Names);
+	static int SendListReply(Stream*,const MyString& FileName, int FromDate, int ToDatei, std::set<std::string>& Names);
 	static int SendDataReply(Stream*,const MyString& FileName, int FromDate, int ToDate, int Options, const MyString& Arg);
 
 	static void WriteHistory();
