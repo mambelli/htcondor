@@ -27,7 +27,6 @@
 
 #include "my_hostname.h"
 #include "internet.h"
-#include "condor_string.h"  // for strnewp
 #include "condor_attributes.h"
 #include "classad_command_util.h"
 #include "directory.h"
@@ -174,7 +173,7 @@ JICLocal::allJobsGone( void )
 		// Since there's no shadow to tell us to go away, we have to
 		// exit ourselves.
 	dprintf( D_ALWAYS, "All jobs have exited... starter exiting\n" );
-	Starter->StarterExit( 0 );
+	Starter->StarterExit( STARTER_EXIT_NORMAL );
 }
 
 
@@ -187,6 +186,38 @@ JICLocal::reconnect( ReliSock* s, ClassAd* /*ad*/ )
 	return FALSE;
 }
 
+void 
+JICLocal::disconnect()
+{
+		// Someday this might mean something, for now it doesn't.
+	dprintf(D_ALWAYS, "Starter using JICLocal does not support disconnect\n");
+	return;
+}
+
+bool
+JICLocal::periodicJobUpdate( ClassAd* update_ad, bool insure_update )
+{
+	dprintf( D_FULLDEBUG, "Entering JICLocal::peridocJobUpdate()\n" );
+
+	ClassAd local_ad;
+	ClassAd* ad;
+	if( update_ad ) {
+			// we already have the update info, so don't bother trying
+			// to publish another one.
+		ad = update_ad;
+	} else {
+		ad = &local_ad;
+		if( ! publishUpdateAd(ad) ) {
+			dprintf( D_FULLDEBUG, "JICLocal::periodicJobUpdate(): "
+			         "Didn't find any info to update!\n" );
+			return false;
+		}
+	}
+	bool r1, r2;
+	r1 = writeUpdateAdFile(ad);
+	r2 = JobInfoCommunicator::periodicJobUpdate(ad, insure_update);
+	return (r1 && r2);
+}
 
 void
 JICLocal::notifyJobPreSpawn( void )
@@ -316,10 +347,6 @@ JICLocal::initUserPriv( void )
 		dprintf( D_ALWAYS, "ERROR: Uid for \"%s\" not found in "
 				 "passwd database for a local job\n", owner ); 
 	} else {
-		CondorPrivSepHelper* psh = Starter->condorPrivSepHelper();
-		if (psh != NULL) {
-			psh->initialize_user(owner);
-		}
 		rval = true;
 		dprintf( D_FULLDEBUG, "Initialized user_priv as \"%s\"\n", 
 				 owner );
@@ -386,11 +413,7 @@ JICLocal::initJobInfo( void )
 	}
 
 	if( Starter->isGridshell() ) { 
-		MyString iwd_str = ATTR_JOB_IWD;
-		iwd_str += "=\"";
-		iwd_str += Starter->origCwd();
-		iwd_str += '"';
-		job_ad->Insert( iwd_str.Value() );
+		job_ad->Assign( ATTR_JOB_IWD, Starter->origCwd() );
 	}
 	job_ad->LookupString( ATTR_JOB_IWD, &job_iwd );
 	if( ! job_iwd ) {
@@ -405,14 +428,9 @@ JICLocal::initJobInfo( void )
 			// add the job's iwd to the job_cmd, so exec will work. 
 		dprintf( D_FULLDEBUG, "warning: %s not specified as full path, "
 				 "prepending job's IWD (%s)\n", ATTR_JOB_CMD, job_iwd );
-		MyString job_cmd;
-		job_cmd += ATTR_JOB_CMD;
-		job_cmd += "=\"";
-		job_cmd += job_iwd;
-		job_cmd += DIR_DELIM_CHAR;
-		job_cmd += orig_job_name;
-		job_cmd += '"';
-		job_ad->Insert( job_cmd.Value() );
+		std::string job_cmd;
+		formatstr( job_cmd, "%s%c%s", job_iwd, DIR_DELIM_CHAR, orig_job_name );
+		job_ad->Assign( ATTR_JOB_CMD, job_cmd );
 	}
 		
 		// now that we have the real iwd we'll be using, we can

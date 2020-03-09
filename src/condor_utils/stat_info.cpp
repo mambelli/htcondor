@@ -22,7 +22,6 @@
 #include "condor_constants.h"
 #include "condor_debug.h"
 #include "stat_info.h"
-#include "condor_string.h"
 #include "status_string.h"
 #include "condor_config.h"
 #include "stat_wrapper.h"
@@ -33,9 +32,9 @@
 
 StatInfo::StatInfo( const char *path )
 {
-	char *s, *last = NULL;
-	fullpath = strnewp( path );
-	dirpath = strnewp( path );
+	char *s, *last = NULL, *trail_slash = NULL, chslash;
+	fullpath = path ? strdup( path ) : NULL;
+	dirpath = path ? strdup( path ) : NULL;
 
 		// Since we've got our own copy of the full path now sitting
 		// in dirpath, we can find the last directory delimiter, make
@@ -43,25 +42,36 @@ StatInfo::StatInfo( const char *path )
 		// NULL in the first character after the delim character so
 		// that the dirpath always contains the directory delim.
 	for( s = dirpath; s && *s != '\0'; s++ ) {
-        if( *s == '\\' || *s == '/' ) {
+		if( *s == '\\' || *s == '/' ) {
 			last = s;
-        }
-    }
+		}
+	}
 	if( last != NULL && last[1] ) {
-		filename = strnewp( &last[1] ); 
+		filename = strdup( &last[1] );
 		last[1] = '\0';
 	} else {
 		filename = NULL;
+		if (last != NULL) {
+			// we only get here if the input path ended with a dir separator
+			// we can't stat that on windows, and *nix does't care, so we remove it.
+			trail_slash = &fullpath[last - dirpath];
+		}
 	}
+	// remove trailing slash before we stat, and then put it back after. this fixes #4747
+	// why do we put it back?  because things crash if we don't and this is a stable series fix.
+	if (trail_slash) { chslash = *trail_slash; *trail_slash = 0; }
 	stat_file( fullpath );
+	if (trail_slash) { *trail_slash = chslash; }
 }
 
 StatInfo::StatInfo( const char *param_dirpath,
 					const char *param_filename )
 {
-	this->filename = strnewp( param_filename );
+	this->filename = strdup( param_filename );
 	this->dirpath = make_dirpath( param_dirpath );
-	fullpath = dircat( param_dirpath, param_filename );
+	MyString buf;
+	dircat( param_dirpath, param_filename, buf );
+	fullpath = strdup( buf.Value() );
 	stat_file( fullpath );
 }
 
@@ -80,9 +90,11 @@ StatInfo::StatInfo( const char* dirpath, const char* filename,
 					time_t time_modify, filesize_t fsize,
 					bool is_dir, bool is_symlink )
 {
-	this->dirpath = strnewp( dirpath );
-	this->filename = strnewp( filename );
-	fullpath = dircat( dirpath, filename );
+	this->dirpath = strdup( dirpath );
+	this->filename = strdup( filename );
+	MyString buf;
+	dircat( dirpath, filename, buf);
+	fullpath = strdup( buf.Value() );
 	si_error = SIGood;
 	si_errno = 0;
 	access_time = time_access;
@@ -98,9 +110,9 @@ StatInfo::StatInfo( const char* dirpath, const char* filename,
 
 StatInfo::~StatInfo( void )
 {
-	if ( filename ) delete [] filename;
-	if ( dirpath )  delete [] dirpath;
-	if ( fullpath ) delete [] fullpath;
+	if ( filename ) free( filename );
+	if ( dirpath )  free( dirpath );
+	if ( fullpath ) free( fullpath );
 }
 
 
@@ -115,18 +127,30 @@ StatInfo::~StatInfo( void )
 void
 StatInfo::stat_file( const char *path )
 {
+	bool do_stat = true;
+	bool saw_symlink = false;
+
 		// Initialize
 	init( );
 
 		// Ok, run stat
 	StatWrapper statbuf;
-	int status = statbuf.Stat( path, StatWrapper::STATOP_STAT );
+	int status = 0;
 
 # if (! defined WIN32)
-	if ( !status ) {
-		status = statbuf.Stat( StatWrapper::STATOP_LSTAT );
+	// Start with an lstat() on unix
+	status = statbuf.Stat( path, true );
+	if ( status == 0 ) {
+		saw_symlink = S_ISLNK( statbuf.GetBuf()->st_mode );
 	}
+	// If lstat() resulted in a symlink, then we need to
+	// follow up with a stat().
+	do_stat = saw_symlink;
 # endif
+
+	if ( do_stat ) {
+		status = statbuf.Stat( path, false );
+	}
 
 		// How'd it go?
 	if ( status ) {
@@ -136,7 +160,21 @@ StatInfo::stat_file( const char *path )
 		if ( EACCES == si_errno ) {
 				// permission denied, try as condor
 			priv_state priv = set_condor_priv();
-			status = statbuf.Retry( );
+
+			do_stat = true;
+			// If our previous lstat() revealed a symlink, then we
+			// can skip straight to a stat() with our new priv-state.
+			if ( !saw_symlink ) {
+				status = statbuf.Stat( path, true );
+				if ( status == 0 ) {
+					saw_symlink = S_ISLNK( statbuf.GetBuf()->st_mode );
+				}
+				do_stat = saw_symlink;
+			}
+			if ( do_stat ) {
+				status = statbuf.Stat( path, false );
+			}
+
 			set_priv( priv );
 
 			if( status < 0 ) {
@@ -160,6 +198,7 @@ StatInfo::stat_file( const char *path )
 
 	init( &statbuf );
 
+	m_isSymlink = saw_symlink;
 }
 void
 StatInfo::stat_file( int fd )
@@ -180,7 +219,7 @@ StatInfo::stat_file( int fd )
 		if ( EACCES == si_errno ) {
 				// permission denied, try as condor
 			priv_state priv = set_condor_priv();
-			status = statbuf.Retry( );
+			status = statbuf.Stat( );
 			set_priv( priv );
 
 			if( status < 0 ) {
@@ -219,23 +258,14 @@ StatInfo::init( StatWrapper *statbuf )
 		m_isDirectory = false;
 		m_isExecutable = false;
 		m_isSymlink = false;
+		m_isDomainSocket = false;
 		valid = false;
 	}
 	else
 	{
 		// the do_stat succeeded
-		const StatStructType *sb;
-		const StatStructType *lsb;
-
-		sb = statbuf->GetBuf( StatWrapper::STATOP_STAT );
-		if ( !sb ) {
-			sb = statbuf->GetBuf( StatWrapper::STATOP_FSTAT );
-		}
-		if ( !sb ) {
-			sb = statbuf->GetBuf( StatWrapper::STATOP_LAST );
-		}
+		const StatStructType *sb = statbuf->GetBuf();
 		ASSERT(sb);
-		lsb = statbuf->GetBuf( StatWrapper::STATOP_LSTAT );
 
 		si_error = SIGood;
 		access_time = sb->st_atime;
@@ -249,7 +279,8 @@ StatInfo::init( StatWrapper *statbuf )
 		// On Unix, if any execute bit is set (user, group, other), we
 		// consider it to be executable.
 		m_isExecutable = ((sb->st_mode & (S_IXUSR|S_IXGRP|S_IXOTH)) != 0 );
-		m_isSymlink = lsb && S_ISLNK(lsb->st_mode);
+		m_isSymlink = S_ISLNK(sb->st_mode);
+		m_isDomainSocket = (S_ISSOCK( sb->st_mode ) == 1);
 		owner = sb->st_uid;
 		group = sb->st_gid;
 # else
@@ -266,15 +297,15 @@ StatInfo::make_dirpath( const char* dir )
 	ASSERT(dir);
 
 	char* rval;
-	int dirlen = strlen(dir);
+	int dirlen = (int)strlen(dir);
 	if( dir[dirlen - 1] == DIR_DELIM_CHAR ) {
 			// We've already got the delim, just return a copy of what
 			// we were passed in:
-		rval = new char[dirlen + 1];
+		rval = (char *)malloc(dirlen + 1);
 		sprintf( rval, "%s", dir );
 	} else {
 			// We need to include the delim character.
-		rval = new char[dirlen + 2];
+		rval = (char *)malloc(dirlen + 2);
 		sprintf( rval, "%s%c", dir, DIR_DELIM_CHAR );
 	}
 	return rval;

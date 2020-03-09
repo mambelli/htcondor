@@ -38,8 +38,6 @@ meaningful.  The Sinful string for the "main" address is ideal.  This would
 ideally be the first address in the list of sinful strings found in
 ATTR_PUBLIC_NETWORK_IP_ADDR.
 
-The addr MUST be 31 or fewer bytes.  A sinful string does the job.
-
 What you use doesn't matter, _so long as you are consistent_.  If you pass
 different addr strings for the same host, you'll get multiple connections.  So
 long as you always use the same attribute, you'll be fine.
@@ -61,9 +59,12 @@ public:
 
 	void clearCache( void );
 	void invalidateSock( const char* );
+	void invalidateSock(const std::string &sockAddr) {invalidateSock(sockAddr.c_str());}
 
 	ReliSock*	findReliSock( const char* addr );
+	ReliSock*	findReliSock(const std::string &addr ) {return findReliSock(addr.c_str());}
 	void		addReliSock( const char* addr, ReliSock* rsock );
+	void		addReliSock( const std::string &addr, ReliSock* rsock ) {addReliSock(addr.c_str(), rsock);}
 
 	bool	isFull( void );
 	int		size( void );

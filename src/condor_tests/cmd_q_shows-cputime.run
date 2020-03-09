@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -46,7 +47,7 @@ my $GetClusterId = sub {
 
 my $on_submit = sub {
 	my %info = @_;
-	my $cmd = "condor_q -cputime ";
+	my $cmd = "condor_q -cputime -nobatch";
 
 	print "Running $cmd - ";
 	my $cmdstatus = CondorTest::runCondorTool($cmd,\@adarray,2);

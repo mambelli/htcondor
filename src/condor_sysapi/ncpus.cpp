@@ -27,10 +27,6 @@
 /* Calculate how many cpus a machine has using the various method each OS
 	allows us */
 
-#ifdef HPUX
-#include <sys/pstat.h>
-#endif
-
 #if defined(Darwin) || defined(CONDOR_FREEBSD)
 #include <sys/sysctl.h>
 #endif
@@ -44,6 +40,20 @@ static void ncpus_linux( int *num_cpus,int *num_hyperthread_cpus );
 typedef BOOL (WINAPI *LPFN_GLPI)(
     PSYSTEM_LOGICAL_PROCESSOR_INFORMATION, 
     PDWORD);
+// The version if winnt.h that ships with Vs9 doesn't define SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+// so this code won't build.  We use the define for PROCESSOR_ARCHITECTURE_NEUTRAL which is nearby
+// in the modern winnt.h as a way of detecting the missing structure definition and commenting out
+// the relevant code.
+#ifdef PROCESSOR_ARCHITECTURE_NEUTRAL
+#define HAS_SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+typedef BOOL (WINAPI *LPFN_GLPIX)(
+	DWORD, // RelationshipType
+	PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, // Buffer
+	PDWORD); // ReturnedLength
+#else
+#pragma message("WARNING: PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX not defined in winnt.h - using WinXP compatible code to detect CPU cores.")
+#pragma message("WARNING: This version of HTCondor may not correct detect > 16 CPUS.")
+#endif
 #endif
 
 #ifdef WIN32
@@ -88,16 +98,6 @@ sysapi_detect_cpu_cores(int *num_cpus,int *num_hyperthread_cpus)
 	}
 	if( num_cpus ) *num_cpus = cpus;
 	if( num_hyperthread_cpus ) *num_hyperthread_cpus = cpus;
-#elif defined(HPUX)
-	struct pst_dynamic d;
-	if ( pstat_getdynamic ( &d, sizeof(d), (size_t)1, 0) != -1 ) {
-		if( num_cpus ) *num_cpus = d.psd_proc_cnt;
-		if( num_hyperthread_cpus ) *num_hyperthread_cpus = d.psd_proc_cnt;
-	}
-	else {
-		if( num_cpus ) *num_cpus = 0;
-		if( num_hyperthread_cpus ) *num_hyperthread_cpus = 0;
-	}
 #elif defined(Solaris)
 	int cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
 	if( num_cpus ) *num_cpus = cpus;
@@ -106,13 +106,58 @@ sysapi_detect_cpu_cores(int *num_cpus,int *num_hyperthread_cpus)
 		int coreCount = 0;
 		int logicalCoreCount = 0;
 
+		#ifdef HAS_SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+		LPFN_GLPIX glpix = NULL;
+		#endif
 		LPFN_GLPI glpi = NULL;
 		HMODULE hmod = GetModuleHandle(TEXT("kernel32"));
 		if (hmod) {
-			glpi = (LPFN_GLPI) GetProcAddress(hmod, "GetLogicalProcessorInformation");
+		#ifdef HAS_SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+			glpix = (LPFN_GLPIX) GetProcAddress(hmod, "GetLogicalProcessorInformationEx");
+			if ( ! glpix)
+		#endif
+				glpi = (LPFN_GLPI) GetProcAddress(hmod, "GetLogicalProcessorInformation");
 		}
+		#ifdef HAS_SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+		if (glpix)
+		{
+			// this code for Win7 or later.
+
+			// call once to determine buffer size.
+			DWORD cbInfo = 0;
+			glpix(RelationProcessorCore, NULL, &cbInfo);
+			if (!cbInfo || cbInfo > 10*1024*1024) { // 10Mb is way more than we ever expect to need...
+				EXCEPT("Error: Failed to determine space for SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX : %d needed", cbInfo);
+			}
+			PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX infoBuf = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)malloc(cbInfo);
+			if ( ! glpix(RelationProcessorCore, infoBuf, &cbInfo)) {
+				EXCEPT("Error: Failed to call GetLogicalProcessorInformationEx: %d", GetLastError());
+			}
+
+			// got the processor info, now we decode it.
+			// the return value is a set of structures that have a Size field telling us how
+			// far to the next structure.
+			PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX ph = infoBuf;
+			for (char * pi = (char*)infoBuf; pi < (char*)infoBuf + cbInfo; pi += ph->Size) {
+				ph = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)pi;
+				ASSERT(ph->Relationship == RelationProcessorCore);
+				coreCount++;
+				if (ph->Processor.Flags & LTP_PC_SMT) {
+					for (unsigned ix = 0; ix < ph->Processor.GroupCount; ++ix) {
+						logicalCoreCount += CountSetBits(ph->Processor.GroupMask[ix].Mask);
+					}
+				} else {
+					// TJ: is this right? or should we be counting set bits to determine number of cores here?
+					logicalCoreCount += 1;
+				}
+			}
+			free(infoBuf);
+		}
+		else
+		#endif
 		if (glpi)
 		{
+			// this code for pre-win7
 			DWORD returnLength = 0;
 			int byteOffset = 0;
 			PSYSTEM_LOGICAL_PROCESSOR_INFORMATION buffer = NULL;
@@ -130,18 +175,18 @@ sysapi_detect_cpu_cores(int *num_cpus,int *num_hyperthread_cpus)
 							free(buffer);
 						buffer = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION)malloc(returnLength);
 						if(!buffer)
-							EXCEPT("Error: Failed to allocate space for SYSTEM_LOGICAL_PROCESSOR_INFORMATION\n");
+							EXCEPT("Error: Failed to allocate space for SYSTEM_LOGICAL_PROCESSOR_INFORMATION");
 					}
 					else
 					{
-						EXCEPT("Error: Failed to call GetLogicalProcessorInformation: %d\n", GetLastError());
+						EXCEPT("Error: Failed to call GetLogicalProcessorInformation: %d", GetLastError());
 					}
 				}
 				else
 				{
 					done = true;
 					if (!buffer)
-						EXCEPT("Error: Failed to get SYSTEM_LOGICAL_PROCESSOR_INFORMATION\n");
+						EXCEPT("Error: Failed to get SYSTEM_LOGICAL_PROCESSOR_INFORMATION");
 				}
 			}
 
@@ -179,11 +224,7 @@ sysapi_detect_cpu_cores(int *num_cpus,int *num_hyperthread_cpus)
 
 #elif defined(LINUX)
 	ncpus_linux(num_cpus,num_hyperthread_cpus );
-#elif defined(AIX)
-	int cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if( num_cpus ) *num_cpus = cpus;
-	if( num_hyperthread_cpus ) *num_hyperthread_cpus = cpus;
-#elif defined(Darwin) || defined(CONDOR_FREEBSD)
+#elif defined(CONDOR_FREEBSD)
 	int mib[2], cpus;
 	size_t len;
 	mib[0] = CTL_HW;
@@ -192,6 +233,17 @@ sysapi_detect_cpu_cores(int *num_cpus,int *num_hyperthread_cpus)
 	sysctl(mib, 2, &cpus, &len, NULL, 0);
 	if( num_cpus ) *num_cpus = cpus;
 	if( num_hyperthread_cpus ) *num_hyperthread_cpus = cpus;
+#elif defined(Darwin)
+	int cpus;
+	size_t len = sizeof(cpus);
+	if( num_cpus ) {
+		sysctlbyname("hw.physicalcpu_max", &cpus, &len, NULL, 0);
+		*num_cpus = cpus;
+	}
+	if( num_hyperthread_cpus ) {
+		sysctlbyname("hw.logicalcpu_max", &cpus, &len, NULL, 0);
+		*num_hyperthread_cpus = cpus;
+	}
 #else
 # error DO NOT KNOW HOW TO COMPUTE NUMBER OF CPUS ON THIS PLATFORM!
 #endif
@@ -370,7 +422,11 @@ read_proc_cpuinfo( CpuInfo	*cpuinfo )
 			free( array );
 			return -1;
 		}
-		fseek( fp, _SysapiProcCpuinfo.offset, SEEK_SET );
+		int ret = fseek( fp, _SysapiProcCpuinfo.offset, SEEK_SET );
+		if (ret < 0) {
+			free( array );
+			return -1;
+		}
 		dprintf( D_LOAD,
 				 "Reading from %s, offset %ld\n",
 				 _SysapiProcCpuinfo.file, _SysapiProcCpuinfo.offset );
@@ -564,7 +620,7 @@ read_proc_cpuinfo( CpuInfo	*cpuinfo )
 	
 /* For intel-ish CPUs, count the # of CPUs using the physical/core IDs */
 static int
-linux_count_cpus_id( CpuInfo *cpuinfo, bool count_hthreads )
+linux_count_cpus_id( CpuInfo *cpuinfo )
 {
 	int			pnum;					/* Current processor # */
 
@@ -628,9 +684,6 @@ linux_count_cpus_id( CpuInfo *cpuinfo, bool count_hthreads )
 				match_count++;
 				prev_match = tproc;
 				cpuinfo->num_hthreads++;
-				if ( count_hthreads ) {
-					cpuinfo->num_cpus++;
-				}
 
 				dprintf( D_LOAD | D_VERBOSE,
 						 "Comparing P#%-3d and P#%-3d: "
@@ -655,7 +708,7 @@ linux_count_cpus_id( CpuInfo *cpuinfo, bool count_hthreads )
 	
 /* For intel-ish CPUS, count the # of CPUs using siblings */
 static int
-linux_count_cpus_siblings( CpuInfo *cpuinfo, bool count_hthreads )
+linux_count_cpus_siblings( CpuInfo *cpuinfo )
 {
 	int		pnum;				/* Current processor # */
 	int		np_siblings = 0;	/* Non-primary siblings */
@@ -676,11 +729,7 @@ linux_count_cpus_siblings( CpuInfo *cpuinfo, bool count_hthreads )
 		if ( np_siblings > 1 ) {
 			dprintf( D_FULLDEBUG,
 					 "Processor %d: %d siblings (np_siblings %d >  0) [%s]\n",
-					 pnum, proc->siblings, np_siblings,
-					 count_hthreads ? "adding" : "not adding" );
-			if ( count_hthreads ) {
-				cpuinfo->num_cpus++;
-			}
+					 pnum, proc->siblings, np_siblings, "not adding" );
 			cpuinfo->num_hthreads++;
 			np_siblings--;
 		}
@@ -697,7 +746,7 @@ linux_count_cpus_siblings( CpuInfo *cpuinfo, bool count_hthreads )
 	
 /* For intel-ish CPUS, let's look at the number of processor records */
 static int
-linux_count_cpus( CpuInfo *cpuinfo, bool count_hthreads )
+linux_count_cpus( CpuInfo *cpuinfo )
 {
 	const	char	*ana_type = "";
 
@@ -722,7 +771,7 @@ linux_count_cpus( CpuInfo *cpuinfo, bool count_hthreads )
 	if (  ( cpuinfo->flag_ht ) &&
 		  ( cpuinfo->num_cpus <= 0 ) &&
 		  ( cpuinfo->have_physical_id || cpuinfo->have_core_id )  ) {
-		linux_count_cpus_id( cpuinfo, count_hthreads );
+		linux_count_cpus_id( cpuinfo );
 		ana_type = "IDs";
 	}
 
@@ -730,7 +779,7 @@ linux_count_cpus( CpuInfo *cpuinfo, bool count_hthreads )
 	if (  ( cpuinfo->num_cpus <= 0 ) &&
 		  ( cpuinfo->flag_ht ) &&
 		  ( cpuinfo->have_siblings )  ) {
-		linux_count_cpus_siblings( cpuinfo, count_hthreads );
+		linux_count_cpus_siblings( cpuinfo );
 		ana_type = "siblings";
 	}
 
@@ -771,7 +820,7 @@ ncpus_linux(int *num_cpus,int *num_hyperthread_cpus)
 	}
 	/* Otherwise, count the CPUs */
 	else {
-		linux_count_cpus( &cpuinfo, _sysapi_count_hyperthread_cpus );
+		linux_count_cpus( &cpuinfo );
 	}
 
 	/* Free up the processors array */

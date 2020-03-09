@@ -39,6 +39,7 @@
 #include "vm_gahp_request.h"
 #include "../condor_vm-gahp/vmgahp_error_codes.h"
 #include "vm_univ_utils.h"
+#include "condor_daemon_client.h"
 
 extern CStarter *Starter;
 
@@ -69,6 +70,11 @@ VMProc::VMProc(ClassAd *jobAd) : OsProc(jobAd)
 	m_status_error_count = 0;
 	m_vm_cputime = 0;
 	m_vm_utilization = -1.0;
+
+	m_vm_max_memory = 0;
+	m_vm_memory = 0;
+
+	m_vm_last_ckpt_time = 0;
 
 	//Find the interval of sending vm status command to vmgahp server
 	m_vmstatus_interval = param_integer( "VM_STATUS_INTERVAL", 
@@ -145,6 +151,52 @@ VMProc::cleanup()
 	m_is_vacate_ckpt = false;
 }
 
+
+bool handleFTL( const char * reason ) {
+	if( reason != NULL ) {
+		dprintf( D_ALWAYS, "Failed to launch VM universe job (%s).\n", reason );
+
+		std::string errorString;
+		formatstr( errorString, "An internal error prevented HTCondor "
+			"from starting the VM.  This job will be rescheduled.  "
+			"(%s).\n", reason );
+		Starter->jic->notifyStarterError( errorString.c_str(), false, 0, 0 );
+		Starter->jic->notifyJobExit( -1, JOB_SHOULD_REQUEUE, NULL );
+	}
+
+	//
+	// If we failed to launch the job (as opposed to aborted the takeoff
+	// because there was something wrong with the payload), we also need
+	// to force the startd to advertise this fact so other jobs can avoid
+	// this machine.
+	//
+	DCStartd startd( (const char * const)NULL, (const char * const)NULL );
+	if( ! startd.locate() ) {
+		dprintf( D_ALWAYS | D_FAILURE, "Unable to locate startd: %s\n", startd.error() );
+		return false;
+	}
+
+	//
+	// The startd will update the list 'OfflineUniverses' for us.
+	//
+	ClassAd update;
+	if( reason != NULL ) {
+		update.Assign( "HasVM", false );
+		update.Assign( "VMOfflineReason", reason );
+	} else {
+		update.Assign( "HasVM", true );
+	}
+
+	ClassAd reply;
+	if( ! startd.updateMachineAd( & update, & reply ) ) {
+		dprintf( D_ALWAYS | D_FAILURE, "Unable to update machine ad: %s\n", startd.error() );
+		return false;
+	}
+
+	return true;
+}
+
+
 int
 VMProc::StartJob()
 {
@@ -153,7 +205,7 @@ VMProc::StartJob()
 
 	// set up a FamilyInfo structure to register a family
 	// with the ProcD in its call to DaemonCore::Create_Process
-	
+
 	FamilyInfo fi;
 
 	// take snapshots at no more than 15 seconds in between, by default
@@ -189,15 +241,9 @@ VMProc::StartJob()
 		return false;
 	}
 
-	// // // // // // 
-	// Get IWD 
-	// // // // // // 
-	//const char* job_iwd = Starter->jic->jobRemoteIWD();
-	//dprintf( D_ALWAYS, "IWD: %s\n", job_iwd );
-
-	// // // // // // 
-	// Environment 
-	// // // // // // 
+	// // // // // //
+	// Environment
+	// // // // // //
 	// Now, instantiate an Env object so we can manipulate the
 	// environment as needed.
 	Env job_env;
@@ -222,9 +268,9 @@ VMProc::StartJob()
 	// the mainjob's env...
 	Starter->PublishToEnv( &job_env );
 
-	// // // // // // 
+	// // // // // //
 	// Misc + Exec
-	// // // // // // 
+	// // // // // //
 
 	// compute job's renice value by evaluating the machine's
 	// JOB_RENICE_INCREMENT in the context of the job ad...
@@ -232,16 +278,14 @@ VMProc::StartJob()
     char* ptmp = param( "JOB_RENICE_INCREMENT" );
 	if( ptmp ) {
 			// insert renice expr into our copy of the job ad
-		MyString reniceAttr = "Renice = ";
-		reniceAttr += ptmp;
-		if( !JobAd->Insert( reniceAttr.Value() ) ) {
+		if( !JobAd->AssignExpr( "Renice", ptmp ) ) {
 			dprintf( D_ALWAYS, "ERROR: failed to insert JOB_RENICE_INCREMENT "
 				"into job ad, Aborting OsProc::StartJob...\n" );
 			free( ptmp );
 			return 0;
 		}
 			// evaluate
-		if( JobAd->EvalInteger( "Renice", NULL, nice_inc ) ) {
+		if( JobAd->LookupInteger( "Renice", nice_inc ) ) {
 			dprintf( D_ALWAYS, "Renice expr \"%s\" evaluated to %d\n",
 					 ptmp, nice_inc );
 		} else {
@@ -271,26 +315,26 @@ VMProc::StartJob()
 	}
 
 	// Get job name
-	MyString vm_job_name;
+	std::string vm_job_name;
 	if( JobAd->LookupString( ATTR_JOB_CMD, vm_job_name) != 1 ) {
 		err_msg.formatstr("%s cannot be found in job classAd.", ATTR_JOB_CMD);
 		dprintf(D_ALWAYS, "%s\n", err_msg.Value());
-		Starter->jic->notifyStarterError( err_msg.Value(), true, 
+		Starter->jic->notifyStarterError( err_msg.Value(), true,
 				CONDOR_HOLD_CODE_FailedToCreateProcess, 0);
 		return false;
 	}
 	m_job_name = vm_job_name;
 
 	// vm_type should be from ClassAd
-	MyString vm_type_name;
+	std::string vm_type_name;
 	if( JobAd->LookupString( ATTR_JOB_VM_TYPE, vm_type_name) != 1 ) {
 		err_msg.formatstr("%s cannot be found in job classAd.", ATTR_JOB_VM_TYPE);
 		dprintf(D_ALWAYS, "%s\n", err_msg.Value());
-		Starter->jic->notifyStarterError( err_msg.Value(), true, 
+		Starter->jic->notifyStarterError( err_msg.Value(), true,
 				CONDOR_HOLD_CODE_FailedToCreateProcess, 0);
 		return false;
 	}
-	vm_type_name.lower_case();
+	lower_case(vm_type_name);
 	m_vm_type = vm_type_name;
 
 	// get vm checkpoint flag from ClassAd
@@ -299,15 +343,9 @@ VMProc::StartJob()
 
 	// If there exists MAC or IP address for a checkpointed VM,
 	// we use them as initial values.
-	MyString string_value;
-	if( JobAd->LookupString(ATTR_VM_CKPT_MAC, string_value) == 1 ) {
-		m_vm_mac = string_value;
-	}
+	JobAd->LookupString(ATTR_VM_CKPT_MAC, m_vm_mac);
 	/*
-	string_value = "";
-	if( JobAd->LookupString(ATTR_VM_CKPT_IP, string_value) == 1 ) {
-		m_vm_ip = string_value;
-	}
+	JobAd->LookupString(ATTR_VM_CKPT_IP, m_vm_ip);
 	*/
 
 	// For Xen and KVM jobs, the vm-gahp issues libvirt commands as root
@@ -329,18 +367,18 @@ VMProc::StartJob()
 	}
 
 	ClassAd recovery_ad = *JobAd;
-	MyString vm_name;
+	std::string vm_name;
 	if ( strcasecmp( m_vm_type.Value(), CONDOR_VM_UNIVERSE_KVM ) == MATCH ||
 		 strcasecmp( m_vm_type.Value(), CONDOR_VM_UNIVERSE_XEN ) == MATCH ) {
 		ASSERT( create_name_for_VM( JobAd, vm_name ) );
 	} else {
 		vm_name = Starter->GetWorkingDir();
 	}
-	recovery_ad.Assign( "JobVMId", vm_name.Value() );
+	recovery_ad.Assign( "JobVMId", vm_name );
 	Starter->WriteRecoveryFile( &recovery_ad );
 
 	// //
-	// Now everything is ready to start a vmgahp server 
+	// Now everything is ready to start a vmgahp server
 	// //
 	dprintf( D_ALWAYS, "About to start new VM\n");
 	Starter->jic->notifyJobPreSpawn();
@@ -352,7 +390,7 @@ VMProc::StartJob()
 	ASSERT(m_vmgahp);
 
 	m_vmgahp->start_err_msg = "";
-	if( m_vmgahp->startUp(&job_env, Starter->GetWorkingDir(), nice_inc, 
+	if( m_vmgahp->startUp(&job_env, Starter->GetWorkingDir(), nice_inc,
 				&fi) == false ) {
 		JobPid = -1;
 		err_msg = "Failed to start vm-gahp server";
@@ -365,7 +403,7 @@ VMProc::StartJob()
 		Starter->jic->notifyStarterError( err_msg.Value(), true, 0, 0);
 
 		delete m_vmgahp;
-		m_vmgahp = NULL; 
+		m_vmgahp = NULL;
 		return false;
 	}
 
@@ -382,74 +420,247 @@ VMProc::StartJob()
 	new_req->setTimeout(m_vmoperation_timeout + 120);
 
 	int p_result;
-	p_result = new_req->vmStart(m_vm_type.Value(), Starter->GetWorkingDir());
+	if( param_integer( "VMU_TESTING" ) == 1 ) {
+		switch( rand() % 6 ) {
+			case 0:
+				p_result = VMGAHP_REQ_COMMAND_PENDING;
+				break;
+			case 1:
+			default:
+				p_result = new_req->vmStart( m_vm_type.Value(), Starter->GetWorkingDir() );
+				break;
+			case 2:
+				p_result = VMGAHP_REQ_COMMAND_TIMED_OUT;
+				break;
+			case 3:
+				p_result = VMGAHP_REQ_COMMAND_NOT_SUPPORTED;
+				break;
+			case 4:
+				p_result = VMGAHP_REQ_VMTYPE_NOT_SUPPORTED;
+				break;
+			case 5:
+				p_result = VMGAHP_REQ_COMMAND_ERROR;
+				break;
+		}
+	} else {
+		p_result = new_req->vmStart( m_vm_type.Value(), Starter->GetWorkingDir() );
+	}
 
-	// Because req is blocking mode, result should be VMGAHP_REQ_COMMAND_DONE
-	if(p_result != VMGAHP_REQ_COMMAND_DONE) {
-		err_msg = "Failed to create a new VM";
-		dprintf(D_ALWAYS, "%s\n", err_msg.Value());
+
+	//
+	// Distinguish between failures that are HTCondor's fault (bugs), failures
+	// that are the user's fault (disk image is not in the specified format?),
+	// and failures that are the fault of the machine (libvirt is wedged).
+	//
+
+	//
+	// In this and subsequent result code lists, a trailing
+	// 	* (C) means [HT]Condor's fault
+	// 	* (U) mean user's fault
+	//	* and (M) mean machine's fault.
+	//	* (U?) means that the user screwed up but HTCondor could or should
+	//		have noticed before the bad data got all the way to the VM GAHP.
+	//	* (?) means that we don't what caused the failure.
+	//
+	// VMGahpRequest::vmStart() can return the following results:
+	//
+	// Failures:
+	// 		VMGAHP_REQ_COMMAND_ERROR (C) is an internal logic error.
+	// 		VMGAHP_REQ_COMMAND_NOT_SUPPORTED (C) is nonsensical.
+	// 		VMGAHP_REQ_VMTYPE_NOT_SUPPORTED (C) means a match-making failure.
+	// 		VMGAHP_REQ_COMMAND_PENDING (C) is logically impossible.
+	// 		VMGAHP_REQ_COMMAND_TIMED_OUT (?)
+	//
+	// Successes:
+	// 		VMGAHP_REQ_COMMAND_DONE
+	//
+
+	//
+	// We assume, for now, that a request timing out is a machine problem.
+	//
+	if( p_result != VMGAHP_REQ_COMMAND_DONE ) {
 		m_vmgahp->printSystemErrorMsg();
+		// reportErrorToStartd() forces the startd to re-run its VM universe
+		// check(s).  This may result in the startd and the starter disagreeing
+		// about whether the VM universe is working, so don't do it.
+		// reportErrorToStartd();
 
-		reportErrorToStartd();
-		Starter->jic->notifyStarterError( err_msg.Value(), true, 0, 0);
+		handleFTL( VMGAHP_REQ_RETURN_TABLE[ p_result ] );
 
 		delete new_req;
 		delete m_vmgahp;
 		m_vmgahp = NULL;
-		// To make sure that vmgahp server exits
-		//daemonCore->Send_Signal(JobPid, SIGKILL);
-		daemonCore->Kill_Family(JobPid);
+
+		// Make sure the VM GAHP is dead.
+		daemonCore->Kill_Family( JobPid );
+
 		return false;
 	}
 
-	if( new_req->checkResult(err_msg) == false ) {
-		dprintf(D_ALWAYS, "%s\n", err_msg.Value());
-		m_vmgahp->printSystemErrorMsg();
 
-		if( !strcmp(err_msg.Value(), VMGAHP_ERR_INTERNAL) ||
-			!strcmp(err_msg.Value(), VMGAHP_ERR_CRITICAL) )  {
-			reportErrorToStartd();
+	if( param_integer( "VMU_TESTING" ) == 2 ) {
+		// A newly-constructed request can not have a valid result.
+		new_req = new VMGahpRequest( new_req->getVMGahpServer() );
+	}
+
+	//
+	// I've split checkResult() into two parts: the first checks that the
+	// result is valid, and the second its value.  An invalid result is
+	// obviously a (C)-type error.
+	//
+	if( ! new_req->hasValidResult() ) {
+		m_vmgahp->printSystemErrorMsg();
+		// reportErrorToStartd() forces the startd to re-run its VM universe
+		// check(s).  This may result in the startd and the starter disagreeing
+		// about whether the VM universe is working, so don't do it.
+		// reportErrorToStartd();
+
+		handleFTL( VMGAHP_ERR_INTERNAL );
+
+		delete new_req;
+		delete m_vmgahp;
+		m_vmgahp = NULL;
+
+		// Make sure the VM GAHP is dead.
+		daemonCore->Kill_Family( JobPid );
+
+		return false;
+	}
+
+	//
+	// The GAHP can return the error strings listed below.
+	//
+	// VMGAHP_ERR_NO_JOBCLASSAD_INFO (C)
+	// VMGAHP_ERR_NO_SUPPORTED_VM_TYPE (C)
+	//
+	// from CreateConfigFile():
+	//		from parseCommonParamFromClassAd()
+	//			VMGAHP_ERR_JOBCLASSAD_NO_VM_MEMORY_PARAM (U?)
+	//			VMGAHP_ERR_JOBCLASSAD_TOO_MUCH_MEMORY_REQUEST (C)
+	//			VMGAHP_ERR_JOBCLASSAD_MISMATCHED_NETWORKING (C)
+	//			VMGAHP_ERR_JOBCLASSAD_MISMATCHED_NETWORKING_TYPE (C)
+	//			VMGAHP_ERR_CRITICAL (C)
+	//			VMGAHP_ERR_JOBCLASSAD_MISMATCHED_HARDWARE_VT (C)
+	//			VMGAHP_ERR_CANNOT_CREATE_ARG_FILE (M)
+	//
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_NO_KERNEL_PARAM (U?)
+	//		VMGAHP_ERR_CRITICAL (M)
+	//		VMGAHP_ERR_JOBCLASSAD_MISMATCHED_HARDWARE_VT (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_KERNEL_NOT_FOUND (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_INITRD_NOT_FOUND (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_NO_ROOT_DEVICE_PARAM (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_NO_DISK_PARAM (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_INVALID_DISK_PARAM (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_XEN_MISMATCHED_CHECKPOINT (U?)
+	//
+	//		VMGAHP_ERR_JOBCLASSAD_KVM_NO_DISK_PARAM (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_KVM_INVALID_DISK_PARAM (U?)
+	//		VMGAHP_ERR_JOBCLASSAD_KVM_MISMATCHED_CHECKPOINT (U?)
+	//
+	//		VMGAHP_ERR_JOBCLASSAD_NO_VMWARE_VMX_PARAM (U?)
+	//		VMGAHP_ERR_INTERNAL (M)
+	//		VMGAHP_ERR_CRITICAL (M)
+	//
+	// from Start():
+	//		VMGAHP_ERR_INTERNAL (C)
+	//		VMGAHP_ERR_VM_INVALID_OPERATION (C)
+	//		VMGAHP_ERR_CRITICAL (C)
+	//		from condor_vm_vmware:
+	//			"Can't create vm with $vmconfig" (?)
+	//			"vmconfig $vmconfig does not exist" (C)
+	//			"vmconfig $vmconfig is not readable" (C)
+	//		VMGAHP_ERR_BAD_IMAGE (U)
+	//
+
+	Gahp_Args * result = new_req->getResult();
+	int resultNo = (int)strtol( result->argv[1], (char **)NULL, 10 );
+
+	if( param_integer( "VMU_TESTING" ) == 3 ) {
+		resultNo = 1;
+		result->reset();
+		result->add_arg( strdup( "x" ) );
+		result->add_arg( strdup( "y" ) );
+		// These two were somewhat arbitrarily chosen, but it'd take more
+		// time than it's worth to create the exhaustive list to randomly
+		// select from.
+		if( rand() % 2 == 0 ) {
+			result->add_arg( strdup( "VMGAHP_ERR_JOBCLASSAD_XEN_MISMATCHED_CHECKPOINT" ) );
+		} else {
+			result->add_arg( strdup( "VMGAHP_ERR_JOBCLASSAD_MISMATCHED_NETWORKING" ) );
+		}
+	}
+
+	//
+	// We assume, for now, that the unknown failures aren't the user's fault.
+	// We also, for now, don't distinguish between machine and Condor faults.
+	//
+	if( resultNo == 0 ) {
+		m_vm_id = (int)strtol( result->argv[2], (char **)NULL, 10 );
+
+		// A success with an invalid virtual machine ID is clearly a (C) error.
+		if( m_vm_id <= 0 ) {
+			handleFTL( VMGAHP_ERR_INTERNAL );
+			return false;
+		}
+	} else {
+		char * errorString = strdup( result->argv[2] );
+		if( strcmp( NULLSTRING, errorString ) == 0 ) {
+			free( errorString );
+			errorString = strdup( VMGAHP_ERR_INTERNAL );
 		}
 
-		Starter->jic->notifyStarterError( err_msg.Value(), true, 
-				CONDOR_HOLD_CODE_FailedToCreateProcess, 0);
-
-		delete new_req;
-		delete m_vmgahp;
-		m_vmgahp = NULL;
-		// To make sure that vmgahp server exits
-		//daemonCore->Send_Signal(JobPid, SIGKILL);
-		daemonCore->Kill_Family(JobPid);
-		return false;
-	}
-
-	Gahp_Args *result_args;
-	result_args = new_req->getResult();
-
-	// Set virtual machine id
-	m_vm_id = (int)strtol(result_args->argv[2], (char **)NULL, 10);
-	if( m_vm_id <= 0 ) {
-		m_vm_id = 0;
-		dprintf(D_ALWAYS, "Received invalid virtual machine id from vm-gahp\n");
 		m_vmgahp->printSystemErrorMsg();
 
-		reportErrorToStartd();
-		Starter->jic->notifyStarterError( "VMGahp internal error", true, 0, 0);
-
 		delete new_req;
 		delete m_vmgahp;
 		m_vmgahp = NULL;
-		// To make sure that vmgahp server exits
-		//daemonCore->Send_Signal(JobPid, SIGKILL);
-		daemonCore->Kill_Family(JobPid);
+		daemonCore->Kill_Family( JobPid );
+
+		const char * const holdingErrors[] = {
+			"VMGAHP_ERR_JOBCLASSAD_NO_VM_MEMORY_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_NO_KERNEL_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_MISMATCHED_HARDWARE_VT",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_KERNEL_NOT_FOUND",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_INITRD_NOT_FOUND",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_NO_ROOT_DEVICE_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_NO_DISK_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_INVALID_DISK_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_XEN_MISMATCHED_CHECKPOINT",
+			"VMGAHP_ERR_JOBCLASSAD_KVM_NO_DISK_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_KVM_INVALID_DISK_PARAM",
+			"VMGAHP_ERR_JOBCLASSAD_KVM_MISMATCHED_CHECKPOINT",
+			"VMGAHP_ERR_JOBCLASSAD_NO_VMWARE_VMX_PARAM",
+			"VMGAHP_ERR_BAD_IMAGE"
+			};
+		unsigned holdingErrorCount = sizeof( holdingErrors ) / sizeof(  const char * const );
+		for( unsigned i = 0; i < holdingErrorCount; ++i ) {
+			if( strcmp( holdingErrors[i], errorString ) == 0 ) {
+				dprintf( D_ALWAYS, "Job failed to launch, potentially because of a user's mistake. (%s)  Putting the job on hold.\n", errorString );
+
+				std::string holdReason;
+				formatstr( holdReason, "%s", errorString );
+				// Using i for the hold reason subcode is entirely arbitrary,
+				// but may assist in writing periodic release expressions,
+				// which I understand to be the point.
+				Starter->jic->notifyStarterError( holdReason.c_str(), true, CONDOR_HOLD_CODE_FailedToCreateProcess, i );
+
+				free( errorString );
+				return false;
+			}
+		}
+
+		handleFTL( errorString );
+		free( errorString );
 		return false;
 	}
+
+
 	delete new_req;
 	new_req = NULL;
 
 	m_vmgahp->setVMid(m_vm_id);
 
-	// We give considerable time(30 secs) to bring 
+	// We give considerable time(30 secs) to bring
 	// the just created VM into a fully compliant state
 	sleep(30);
 
@@ -478,8 +689,11 @@ VMProc::StartJob()
 			"VMProc::CheckStatus", this);
 
 	// Set job_start_time in user_proc.h
-	job_start_time.getTime();
+	condor_gettimestamp( job_start_time );
 	dprintf( D_ALWAYS, "StartJob for VM succeeded\n");
+
+	// If we do manage to launch, clear the FTL attributes.
+	handleFTL( NULL );
 	return true;
 }
 
@@ -548,6 +762,12 @@ VMProc::process_vm_status_result(Gahp_Args *result_args)
 		}else if ( !strcasecmp(tmp_name.Value(),VMGAHP_STATUS_COMMAND_CPUUTILIZATION) ) {
 		      /* This is here for vm's which are spun via libvirt*/
 		      m_vm_utilization = (float)strtod(tmp_value.Value(), (char **)NULL);
+		} else if ( !strcasecmp( tmp_name.Value(), VMGAHP_STATUS_COMMAND_MEMORY ) ) {
+			// This comes from the GAHP in kbytes.
+			m_vm_memory = strtoul( tmp_value.Value(), (char **)NULL, 10 );
+		} else if ( !strcasecmp( tmp_name.Value(), VMGAHP_STATUS_COMMAND_MAX_MEMORY ) ) {
+			// This comes from the GAHP in kbytes.
+			m_vm_max_memory = strtoul( tmp_value.Value(), (char **)NULL, 10 );
 		}
 	}
 
@@ -904,8 +1124,6 @@ VMProc::ShutdownGraceful()
 		return true;
 	}
 
-	bool delete_working_files = true;
-
 	if( m_vm_checkpoint ) {
 		// We need to do checkpoint before vacating.
 		// The reason we call checkpoint explicitly here
@@ -922,7 +1140,6 @@ VMProc::ShutdownGraceful()
 			// This means the checkpoint succeeded but file transfer failed.
 			// We will not delete files in the working directory so that
 			// file transfer will be retried
-			delete_working_files = false;
 			dprintf(D_ALWAYS, "Vacating checkpoint succeeded but "
 					"file transfer failed\n");
 		}
@@ -935,26 +1152,6 @@ VMProc::ShutdownGraceful()
 	m_is_soft_suspended = false;
 	is_checkpointed = false;
 	requested_exit = true;
-
-	// destroy vmgahp server
-	if( m_vmgahp->cleanup() == false ) {
-		//daemonCore->Send_Signal(JobPid, SIGKILL);
-		daemonCore->Kill_Family(JobPid);
-
-		// To make sure that the process dealing with a VM exits,
-		killProcessForVM();
-	}
-
-	// final cleanup.. 
-	cleanup();
-
-	// Because we already performed checkpoint, 
-	// we don't need to keep files in the working directory.
-	// So file transfer will not be called again.
-	if( delete_working_files ) {
-		Directory working_dir( Starter->GetWorkingDir(), PRIV_USER );
-		working_dir.Remove_Entire_Directory();
-	}
 
 	return false;	// return false says shutdown is pending	
 }
@@ -1141,7 +1338,7 @@ VMProc::CkptDone(bool success)
 		// File uploading succeeded
 		// update checkpoint counter and last ckpt timestamp
 		m_vm_ckpt_count++;
-		m_vm_last_ckpt_time.getTime();
+		m_vm_last_ckpt_time = time(NULL);
 	}
 
 	if( m_is_vacate_ckpt ) {
@@ -1225,11 +1422,8 @@ VMProc::PublishUpdateAd( ClassAd* ad )
 		ad->Assign(ATTR_JOB_REMOTE_SYS_CPU, sys_time );
 		ad->Assign(ATTR_JOB_REMOTE_USER_CPU, user_time );
 		ad->Assign(ATTR_JOB_VM_CPU_UTILIZATION, m_vm_utilization);
-		// For KVM, we can probably do better for by asking (the procd?) about
-		// the kvm/qemu process.  It's not clear that using that process's
-		// sys time would actualle be useful.
-		ad->Assign(ATTR_IMAGE_SIZE, (int)0);
-		ad->Assign(ATTR_RESIDENT_SET_SIZE, (int)0);
+		ad->Assign( ATTR_IMAGE_SIZE, m_vm_max_memory );
+		ad->Assign( ATTR_RESIDENT_SET_SIZE, m_vm_memory );
 	}else {
 		// Update usage of process for VM
 		long sys_time = 0;
@@ -1258,11 +1452,11 @@ VMProc::PublishUpdateAd( ClassAd* ad )
 	}
 
 	if( m_vm_checkpoint ) {
-		if( m_vm_mac.IsEmpty() == false ) {
+		if( m_vm_mac.empty() == false ) {
 			// Update MAC addresss of VM
 			ad->Assign(ATTR_VM_CKPT_MAC, m_vm_mac);
 		}
-		if( m_vm_ip.IsEmpty() == false ) {
+		if( m_vm_ip.empty() == false ) {
 			// Update IP addresss of VM
 			ad->Assign(ATTR_VM_CKPT_IP, m_vm_ip);
 		}
@@ -1295,7 +1489,7 @@ VMProc::reportErrorToStartd()
 		return false;
 	}
 
-	char* addr = startd.addr();
+	const char* addr = startd.addr();
 	if( !addr ) {
 		dprintf(D_ALWAYS,"Can't find the address of local startd\n");
 		return false;
@@ -1320,20 +1514,12 @@ VMProc::reportErrorToStartd()
 	}
 
 	// Send pid of this starter
-	MyString s_pid;
-	s_pid += (int)daemonCore->getpid();
-
-	char *buffer = strdup(s_pid.Value());
-	ASSERT(buffer);
-
-	ssock.code(buffer);
+	ssock.put( IntToStr( (int)daemonCore->getpid() ) );
 
 	if( !ssock.end_of_message() ) {
 		dprintf( D_FULLDEBUG, "Failed to send EOM to local startd %s\n", addr);
-		free(buffer);
 		return false;
 	}
-	free(buffer);
 
 	sleep(1);
 	return true;
@@ -1349,7 +1535,7 @@ VMProc::reportVMInfoToStartd(int cmd, const char *value)
 		return false;
 	}
 
-	char* addr = startd.addr();
+	const char* addr = startd.addr();
 	if( !addr ) {
 		dprintf(D_ALWAYS,"Can't find the address of local startd\n");
 		return false;
@@ -1373,26 +1559,15 @@ VMProc::reportVMInfoToStartd(int cmd, const char *value)
 	}
 
 	// Send the pid of this starter
-	MyString s_pid;
-	s_pid += (int)daemonCore->getpid();
-
-	char *starter_pid = strdup(s_pid.Value());
-	ASSERT(starter_pid);
-	ssock.code(starter_pid);
+	ssock.put( IntToStr( (int)daemonCore->getpid() ) );
 
 	// Send vm info 
-	char *vm_value = strdup(value);
-	ASSERT(vm_value);
-	ssock.code(vm_value);
+	ssock.put(value);
 
 	if( !ssock.end_of_message() ) {
 		dprintf( D_FULLDEBUG, "Failed to send EOM to local startd %s\n", addr);
-		free(starter_pid);
-		free(vm_value);
 		return false;
 	}
-	free(starter_pid);
-	free(vm_value);
 
 	sleep(1);
 	return true;
@@ -1435,8 +1610,7 @@ VMProc::setVMPID(int vm_pid)
 	// Get initial usage of the process	
 	updateUsageOfVM();
 
-	MyString pid_string;
-	pid_string += (int)m_vm_pid;
+	MyString pid_string = IntToStr( (int)m_vm_pid );
 
 	// Report this PID to local startd
 	reportVMInfoToStartd(VM_UNIV_VMPID, pid_string.Value());
@@ -1445,35 +1619,35 @@ VMProc::setVMPID(int vm_pid)
 void
 VMProc::setVMMAC(const char* mac)
 {
-	if( !strcasecmp(m_vm_mac.Value(), mac) ) {
+	if( !strcasecmp(m_vm_mac.c_str(), mac) ) {
 		// MAC for VM doesn't change
 		return;
 	}
 
 	dprintf(D_FULLDEBUG,"MAC for VM is changed from [%s] to [%s]\n", 
-			m_vm_mac.Value(), mac);
+			m_vm_mac.c_str(), mac);
 
 	m_vm_mac = mac;
 
 	// Report this MAC to local startd
-	reportVMInfoToStartd(VM_UNIV_GUEST_MAC, m_vm_mac.Value());
+	reportVMInfoToStartd(VM_UNIV_GUEST_MAC, m_vm_mac.c_str());
 }
 
 void
 VMProc::setVMIP(const char* ip)
 {
-	if( !strcasecmp(m_vm_ip.Value(), ip) ) {
+	if( !strcasecmp(m_vm_ip.c_str(), ip) ) {
 		// IP for VM doesn't change
 		return;
 	}
 
 	dprintf(D_FULLDEBUG,"IP for VM is changed from [%s] to [%s]\n", 
-			m_vm_ip.Value(), ip);
+			m_vm_ip.c_str(), ip);
 
 	m_vm_ip = ip;
 
 	// Report this IP to local startd
-	reportVMInfoToStartd(VM_UNIV_GUEST_IP, m_vm_ip.Value());
+	reportVMInfoToStartd(VM_UNIV_GUEST_IP, m_vm_ip.c_str());
 }
 
 void

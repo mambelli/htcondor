@@ -28,8 +28,10 @@
 
 #include "exit.h"
 
+#include "authentication.h"
 #include "condor_daemon_core.h"
 #include "util_lib_proto.h"
+#include "qmgmt.h"
 #include "condor_qmgr.h"
 #include "scheduler.h"
 #include "dedicated_scheduler.h"
@@ -39,6 +41,8 @@
 #include "condor_netdb.h"
 #include "subsystem_info.h"
 #include "ipv6_hostname.h"
+#include "credmon_interface.h"
+#include "directory_util.h"
 
 #if defined(HAVE_DLOPEN)
 #include "ScheddPlugin.h"
@@ -49,8 +53,7 @@ extern "C"
 {
 	int		ReadLog(char*);
 }
-extern	void	mark_jobs_idle();
-extern  int     clear_autocluster_id( ClassAd *job );
+
 
 char*          Spool = NULL;
 char*          Name = NULL;
@@ -83,6 +86,9 @@ main_init(int argc, char* argv[])
 		switch(ptr[0][1])
 		{
 		  case 'n':
+			if (Name) {
+				free(Name);
+			}
 			Name = build_valid_daemon_name( *(++ptr) );
 			break;
 		  default:
@@ -107,6 +113,24 @@ main_init(int argc, char* argv[])
 	ClassAdLogPluginManager::EarlyInitialize();
 #endif
 
+
+	// if using the SEC_CREDENTIAL_DIRECTORY_KRB, confirm we are "up-to-date".
+	// at the moment, we take an "all-or-nothing" approach.  ultimately, this
+	// should be per-user, and the SchedD should start normally and run jobs
+	// for users who DO have valid credentials, and simply holding on to jobs
+	// in idle state for users who do NOT have valid credentials.
+	//
+	auto_free_ptr cred_dir_krb(param("SEC_CREDENTIAL_DIRECTORY_KRB"));
+	if (cred_dir_krb) {
+		dprintf(D_ALWAYS, "SEC_CREDENTIAL_DIRECTORY_KRB is %s, will wait up to 10 minutes for user credentials to be updated before continuing.\n", cred_dir_krb.ptr());
+
+		// we tried, we give up.
+		if ( ! credmon_poll_for_completion(credmon_type_KRB, cred_dir_krb, 600)) {
+			EXCEPT("User credentials unavailable after 10 minutes");
+		}
+	}
+	// User creds good to go, let's start this thing up!
+
 		// Initialize all the modules
 	scheduler.Init();
 	scheduler.Register();
@@ -125,11 +149,10 @@ main_init(int argc, char* argv[])
 		// Make a backup of the job queue?
 	if ( param_boolean_crufty("SCHEDD_BACKUP_SPOOL", false) ) {
 			MyString hostname;
-			UtcTime now(true);
 			hostname = get_local_hostname();
 			MyString		job_queue_backup;
 			job_queue_backup.formatstr( "%s/job_queue.bak.%s.%ld",
-									  Spool, hostname.Value(), now.seconds() );
+			                            Spool, hostname.Value(), (long)time(NULL) );
 			if ( copy_file( job_queue_name.Value(), job_queue_backup.Value() ) ) {
 				dprintf( D_ALWAYS, "Failed to backup spool to '%s'\n",
 						 job_queue_backup.Value() );
@@ -142,20 +165,7 @@ main_init(int argc, char* argv[])
 	int max_historical_logs = param_integer( "MAX_JOB_QUEUE_LOG_ROTATIONS", DEFAULT_MAX_JOB_QUEUE_LOG_ROTATIONS );
 
 	InitJobQueue(job_queue_name.Value(),max_historical_logs);
-	mark_jobs_idle();
-
-		// The below must happen _after_ InitJobQueue is called.
-	if ( scheduler.autocluster.config() ) {
-		// clear out auto cluster id attributes
-		WalkJobQueue( (int(*)(ClassAd *))clear_autocluster_id );
-	}
-	
-		//
-		// Update the SchedDInterval attributes in jobs if they
-		// have it defined. This will be for JobDeferral and
-		// CronTab jobs
-		//
-	WalkJobQueue( (int(*)(ClassAd *))::updateSchedDInterval );
+	PostInitJobQueue();
 
 		// Initialize the dedicated scheduler stuff
 	dedicated_scheduler.initialize();

@@ -21,9 +21,8 @@
 #include "condor_common.h"
 #include "token_cache.h"
 
-token_cache::token_cache() {
-	current_age = 1;
-	TokenTable = new TokenHashTable(10, MyStringHash);
+token_cache::token_cache() : TokenTable(NULL), current_age(1), dummy(0) {
+	TokenTable = new TokenHashTable(hashFunction);
 }
 
 token_cache::~token_cache() {
@@ -138,9 +137,7 @@ MyString
 token_cache::cacheToString() {
 	token_cache_entry *ent = NULL;
 	MyString index;
-	static MyString cache_string;
-
-	cache_string = "";
+	MyString cache_string;
 
 	TokenTable->startIterations();
 	while ( TokenTable->iterate(index, ent) ) {

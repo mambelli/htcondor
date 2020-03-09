@@ -30,7 +30,20 @@
 #include "throttle_by_category.h"
 #include "read_multiple_logs.h"
 #include "CondorError.h"
-#include <set>
+#include "stringSpace.h"
+
+#include <deque>
+#include <forward_list>
+#include <algorithm>
+
+ // define this to build with the old memory hoggy behavior of 3 complete sets of edges per job.
+//#define MEMORY_HOG
+
+#ifdef MEMORY_HOG
+ #include <set>
+#else
+ #include <set>
+#endif
 
 class ThrottleByCategory;
 class Dag;
@@ -42,11 +55,17 @@ class DagmanMetrics;
 #include "debug.h"
 #include "script.h"
 
-#define JOB_ERROR_TEXT_MAXLEN 128
 
 typedef int JobID_t;
+#define NO_ID -1
 
-/**  The job class represents a job in the DAG and its state in the Condor
+#ifdef MEMORY_HOG
+#else
+  typedef int EdgeID_t;
+  #define NO_EDGE_ID -1
+#endif
+
+/**  The job class represents a job in the DAG and its state in the HTCondor
      system.  A job is given a name, a CondorID, and three queues.  The
      parents queue is a list of parent jobs that this one depends on.  That
      queue never changes once set.  The waiting queue is the same as the
@@ -55,11 +74,11 @@ typedef int JobID_t;
      Once set, this queue never changes.<p>
 
      From DAGMan's point of view, a job has six basic states in the
-     Condor system (refer to the Job::status_t enumeration).  It
+     HTCondor system (refer to the Job::status_t enumeration).  It
      starts out as READY, meaning that it has not yet been submitted.
      If the job has a PRE script defined it changes to PRERUN while
      that script executes.  The job's state changes to SUBMITTED once
-     in the Condor system.  If it completes successfully and the job
+     in the HTCondor system.  If it completes successfully and the job
      has a POST script defined it changes to POSTRUN while that script
      executes, otherwise if it completes successfully it is DONE, or
      is in the ERROR state if it completes abnormally.  Note that final
@@ -75,15 +94,8 @@ typedef int JobID_t;
      queue) are put on the DAG's ready list.  */
 class Job {
   public:
-
-        // possible kinds of job (e.g., Condor, Stork, etc.)
-        // NOTE: must be kept in sync with _job_type_strings[]
-        // NOTE: must be kept in sync with enum Log_source
-	typedef enum {
-		TYPE_CONDOR,
-		TYPE_STORK,
-	 } job_type_t;
   
+#ifdef DEAD_CODE
     /** Enumeration for specifying which queue for Add() and Remove().
         If you change this enum, you *must* also update queue_t_names
     */
@@ -127,6 +139,31 @@ class Job {
 		@return number of children
 	*/
 	int NumChildren() const;
+#else
+	// true when node has no parents at this time
+	bool NoParents() const {
+	#ifdef MEMORY_HOG
+		return _parents.empty();
+	#else
+		// Once we are done with AdjustEdges this should agree
+		// but some code checks for parents during parse time (see the splice code)
+		// so we check _numparents (set at parse time) and also _parent (set by AdjustEdges)
+		return _parent == NO_ID && _numparents == 0;
+	#endif
+	}
+
+	// true when node has no children at this time
+	bool NoChildren() const {
+	#ifdef MEMORY_HOG
+		return _children.empty();
+	#else
+		return _child == NO_ID;
+	#endif
+	}
+
+	// returns the number of children.  NOTE: this is not guaranteed to be fast!
+	int CountChildren() const;
+#endif
 
     /** The Status of a Job
         If you update this enum, you *must* also update status_t_names
@@ -149,24 +186,31 @@ class Job {
         way you would use the queue_t_names array.
     */
 	// WARNING!  status_t and status_t_names must be kept in sync!!
-    static const char * status_t_names[];
+	static const char * status_t_names[];
 
 	// explanation text for errors
-	char error_text[JOB_ERROR_TEXT_MAXLEN];
+	MyString error_text;
 
 	static int NOOP_NODE_PROCID;
   
     /** Constructor
-        @param jobType Type of job in dag file.
         @param jobName Name of job in dag file.  String is deep copied.
 		@param directory Directory to run the node in, "" if current
 		       directory.  String is deep copied.
         @param cmdFile Path to condor cmd file.  String is deep copied.
     */
-    Job( const job_type_t jobType, const char* jobName,
+    Job( const char* jobName,
 				const char* directory, const char* cmdFile ); 
   
     ~Job();
+
+		/** Clean up memory that's no longer needed once a node has
+			finished.  (Note that this doesn't mean that the Job object
+			is not valid -- it just cleans up some temporary memory.)
+			Also check that we got a consistent set of events for the
+			metrics.
+		*/
+	void Cleanup();
 
 	void PrefixName(const MyString &prefix);
 	inline const char* GetJobName() const { return _jobName; }
@@ -177,13 +221,11 @@ class Job {
 	inline int GetRetries() const { return retries; }
 	const char* GetPreScriptName() const;
 	const char* GetPostScriptName() const;
-	const char* JobTypeString() const;
-	job_type_t JobType() const;
+	static const char* JobTypeString() { return "HTCondor"; }
 
-	bool AddPreScript( const char *cmd, MyString &whynot );
+	bool AddScript( bool post, const char *cmd, int defer_status,
+				time_t defer_time, MyString &whynot );
 	bool AddPreSkip( int exitCode, MyString &whynot );
-	bool AddPostScript( const char *cmd, MyString &whynot );
-	bool AddScript( bool post, const char *cmd, MyString &whynot );
 
 	void SetFinal(bool value) { _final = value; }
 	bool GetFinal() const { return _final; }
@@ -193,7 +235,9 @@ class Job {
 	Script * _scriptPre;
 	Script * _scriptPost;
 
-    ///
+
+#ifdef DEAD_CODE
+	///
     inline std::set<JobID_t> & GetQueueRef (const queue_t queue) {
         return _queues[queue];
     }
@@ -206,28 +250,13 @@ class Job {
     */
     bool Add( const queue_t queue, const JobID_t jobID );
 
-    /** Returns true if this job is ready for submission.
-        @return true if job is submittable, false if not
-    */
-    inline bool CanSubmit () const {
-        return (IsEmpty(Job::Q_WAITING) && _Status == STATUS_READY);
-    }
-
-    /** Remove a job from one of the queues.  Removes the job with ID
+	/** Remove a job from one of the queues.  Removes the job with ID
         jobID from the parents, children, or waiting queue of this job.
         @param jobID ID of the job to be removed.  Should not be this job's ID
         @param queue The queue to add the job to
         @return true: success, false: failure (jobID not found in queue)
     */
     bool Remove (const queue_t queue, const JobID_t jobID);
-
-	/** Check whether the submit file for this job has a log file
-	    defined.
-		@param usingDefault is true if DAGman is watching the
-			default node log
-		@return true iff the submit file defines a log file
-	*/
-	bool CheckForLogFile(bool usingDefault) const;
 
     /** Returns true if a queue is empty (has no jobs)
         @param queue Selects which queue to look at
@@ -237,10 +266,43 @@ class Job {
         return _queues[queue].empty();
     }
 
+	// returns true if the job is waiting for other jobs to finish
+	inline bool IsWaiting() const {
+		return ! IsEmpty(Q_WAITING);
+	}
+#else
+	// returns true if the job is waiting for other jobs to finish
+ #ifdef MEMORY_HOG
+	bool IsWaiting() const { return ! _waiting.empty(); }
+ #else
+ 	bool IsWaiting() const { return (_parent != NO_ID) && ! _parents_done; };
+ #endif
+	// remove this parent from the waiting collection, and ! IsWaiting
+	bool ParentComplete(Job * parent);
+	// append parent node names into the given buffer using the given printf format string
+	int PrintParents(std::string & buf, size_t bufmax, const Dag* dag, const char * fmt) const;
+	// append child node names into the given buffer using the given printf format string
+	int PrintChildren(std::string & buf, size_t bufmax, const Dag* dag, const char * fmt) const;
+
+	// append child node names to the given file using the given printf format string
+	//int PrintChildren(FILE* fp, const Dag* dag, const char * fmt) const;
+
+	// visit child nodes calling the given function for each
+	int VisitChildren(Dag& dag, int(*fn)(Dag& dag, Job* me, Job* child, void* args), void* args);
+
+	// notify children of parent completion, and call the optional callback for each
+	// child that is no longer waiting
+	int NotifyChildren(Dag& dag, bool(*fn)(Dag& dag, Job* child));
+#endif
+	/** Returns true if this job is ready for submission.
+		@return true if job is submittable, false if not
+	*/
+	inline bool CanSubmit() const { return (_Status == STATUS_READY) && ! IsWaiting(); }
+
     /** Returns the node's current status
         @return the node's current status
     */
-	status_t GetStatus() const;
+	inline status_t GetStatus() const { return _Status; }
 
     /** Returns the node's current status string
         @return address of a string describing the node's current status
@@ -252,57 +314,96 @@ class Job {
     */
 	bool SetStatus( status_t newStatus );
 
-		/** Get whether this job is idle.
-		    @return true if job is idle, false otherwise.
-		*/
-	bool GetIsIdle() const { return _isIdle; }
+	/** Get whether the specified proc is idle.
+		@param proc The proc for which we're getting idle status
+		@return true iff the specified proc is idle; false otherwise
+	*/
+	bool GetProcIsIdle( int proc );
 
-		/** Set whether this job is idle.
-		    @param true if job is idle, false otherwise.
-		*/
-	void SetIsIdle(bool isIdle) { _isIdle = isIdle; }
+	/** Set whether the specified proc is idle.
+		@param proc The proc for which we're setting idle status
+		@param isIdle True iff the specified proc is idle; false otherwise
+	*/
+	void SetProcIsIdle( int proc, bool isIdle );
 
 		/** Is the specified node a child of this node?
 			@param child Pointer to the node to check for childhood.
 			@return true: specified node is our child, false: otherwise
 		*/
 	bool HasChild( Job* child );
+
 		/** Is the specified node a parent of this node?
 			@param child Pointer to the node to check for parenthood.
 			@return true: specified node is our parent, false: otherwise
 		*/
 	bool HasParent( Job* parent );
 
+#ifdef DEAD_CODE
 	bool RemoveChild( Job* child );
 	bool RemoveChild( Job* child, MyString &whynot );
 	bool RemoveParent( Job* parent, MyString &whynot );
 	bool RemoveDependency( queue_t queue, JobID_t job );
 	bool RemoveDependency( queue_t queue, JobID_t job, MyString &whynot );
- 
+#endif
+
     /** Dump the contents of this Job to stdout for debugging purposes.
 		@param the current DAG (used to translate node ID to node object)
 	*/
     void Dump ( const Dag *dag ) const;
   
+#if 0 // not used -- wenger 2015-02-17
     /** Print the identification info for this Job to stdout.
         @param condorID If true, also print the job's CondorID
      */
     void Print (bool condorID = false) const;
+#endif
   
 		// double-check internal data structures for consistency
 	bool SanityCheck() const;
 
+	bool CanAddParent(Job* parent, MyString &whynot);
+	bool CanAddChild(Job* child, MyString &whynot);
+	// check to see if we can add this as a child, and it allows us as a parent..
+	bool CanAddChildren(std::forward_list<Job*> & children, MyString &whynot);
+#ifdef DEAD_CODE
 	bool AddParent( Job* parent );
 	bool AddParent( Job* parent, MyString &whynot );
-	bool CanAddParent( Job* parent, MyString &whynot );
 
 	bool AddChild( Job* child );
 	bool AddChild( Job* child, MyString &whynot );
-	bool CanAddChild( Job* child, MyString &whynot );
+#else
+	// insert a SORTED list of UNIQUE children.
+	// the caller is responsible for calling sort() and unique() on the list if needed
+	// before passing it to this function
+	bool AddChildren(std::forward_list<Job*> & children, MyString &whynot);
+
+	bool AddVar(const char * name, const char * value, const char* filename, int lineno);
+	void ShrinkVars() { /*varsFromDag.shrink_to_fit();*/ }
+	bool HasVars() { return ! varsFromDag.empty(); }
+	int PrintVars(std::string &vars);
+
+	// called after the DAG has been parsed to build the parent and waiting edge lists
+	void BeginAdjustEdges(Dag* dag);
+	void AdjustEdges(Dag* dag);
+	void FinalizeAdjustEdges(Dag* dag);
+#endif
 
 		// should be called when the job terminates
 	bool TerminateSuccess();
 	bool TerminateFailure();
+
+		/** Should this node abort the DAG?
+        	@return true: node should abort the DAG; false node should
+				not abort the DAG
+		*/
+	bool DoAbort() { return have_abort_dag_val &&
+				( retval == abort_dag_val ); }
+
+		/** Should we retry this node (if it failed)?
+			@return true: retry the node; false: don't retry
+		*/
+	bool DoRetry() { return !DoAbort() &&
+				( GetRetries() < GetRetryMax() ); }
 
     /** Returns true if the node's pre script, batch job, or post
         script are currently submitted or running.
@@ -323,17 +424,19 @@ class Job {
 	ThrottleByCategory::ThrottleInfo *GetThrottleInfo() {
 			return _throttleInfo; }
 	
+#ifdef DEAD_CODE // dead. we let submit handle $(JOB) expansions now.
 	/** Interpolate any vars values with $(JOB) with the name of the job
 		@return void
 	*/
 	void ResolveVarsInterpolations(void);
+#endif
 
 	/** Add a prefix to the Directory setting for this job. If the prefix
 		is ".", then do nothing.
 		@param prefix: the prefix to be joined to the directory using "/"
 		@return void
 	*/
-	void PrefixDirectory(MyString &prefix);
+	void PrefixDirectory( MyString &prefix );
 
 	/** Set the DAG file (if any) for this node.  (This is set for nested
 			DAGs defined with the "SUBDAG" keyword.)
@@ -348,42 +451,6 @@ class Job {
 	const char *GetDagFile() const {
 		return _dagFile;
 	}
-
-	/** Monitor this node's Condor or Stork log file with the
-		multiple log reader.  (Must be called before this node's
-		job is submitted.)
-		@param logReader: the multiple log reader
-		@param recovery: whether we're in recovery mode
-		@param defaultNodeLog: the default log file to be used if the
-			node's submit file doesn't define a log file
-		@return true if successful, false if failed
-	*/
-	bool MonitorLogFile( ReadMultipleUserLogs &condorLogReader,
-				ReadMultipleUserLogs &storkLogReader, bool nfsIsError,
-				bool recovery, const char *defaultNodeLog, bool usingDefault );
-
-	/** Unmonitor this node's Condor or Stork log file with the
-		multiple log reader.  (Must be called after everything is done
-		for this node.)
-		@param logReader: the multiple log reader
-		@return true if successful, false if failed
-	*/
-	bool UnmonitorLogFile( ReadMultipleUserLogs &logReader,
-				ReadMultipleUserLogs &storkLogReader );
-
-		// Whether this node is using the default node log file.
-	bool UsingDefaultLog() const { return _useDefaultLog; }
-
-	/** Get the log file for this node.
-		@return the name of this node's log file.
-	*/
-	const char *GetLogFile() const { return _logFile; }
-
-	/** Get whether this node's log file is XML (versus "standard"
-		format).
-		@return true iff the log file is XML.
-	*/
-	bool GetLogFileIsXml() const { return _logFileIsXml; }
 
 	/** Get the jobstate.log job tag for this node.
 		@return The job tag (can be "local"; if no tag is specified,
@@ -419,7 +486,6 @@ class Job {
 		@return the last event time.
 	*/
 	time_t GetLastEventTime() { return _lastEventTime; }
-	void FixPriority(Dag& dag);
 
 	bool HasPreSkip() const { return _preskip != PRE_SKIP_INVALID; }
 	int GetPreSkip() const;
@@ -463,21 +529,32 @@ public:
 	
     // special return code indicating that a node shouldn't be retried
     int retry_abort_val; // UNLESS-EXIT
-    // indicates whether retry_abort_val has been set
-    bool have_retry_abort_val;
 
 		// Special return code indicating that the entire DAG should be
 		// aborted.
 	int abort_dag_val;
 
-		// Indicates whether abort_dag_val was set.
-	bool have_abort_dag_val;
-
 		// The exit code that this DAG will return on abort.
 	int abort_dag_return_val;
 
+	//DFS ordering of the node
+	int _dfsOrder;
+
+/// bool variables are collected together to reduce memory usage of the Job class
+
+	//Node has been visited by DFS order
+	bool _visited;
+
+	// indicates whether retry_abort_val has been set
+	bool have_retry_abort_val;
+		// Indicates whether abort_dag_val was set.
+	bool have_abort_dag_val;
+
 		// Indicates whether abort_dag_return_val was set.
 	bool have_abort_dag_return_val;
+
+		// Indicates if this is a cluster job or not
+	bool is_cluster;
 
 	// somewhat kludgey, but this indicates to Dag::TerminateJob()
 	// whether Dag::_numJobsDone has been incremented for this node
@@ -486,28 +563,45 @@ public:
 	// unless/until node is STATUS_DONE
 	bool countedAsDone;
 
-    //Node has been visited by DFS order
-	bool _visited; 
-	
-	//DFS ordering of the node
-	int _dfsOrder; 
+private:
+		// Whether this is a noop job (shouldn't actually be submitted
+		// to HTCondor).
+	bool _noop;
+		// whether this is a final job
+	bool _final;
+public:
 
+#ifdef DEAD_CODE
 	struct NodeVar {
 		MyString _name;
 		MyString _value;
 	};
 
 	List<NodeVar> *varsFromDag;
+#else
+	struct NodeVar {
+		const char * _name; // stringspace string, not owned by this struct
+		const char * _value; // stringspace string, not owned by this struct
+		NodeVar(const char * n, const char * v) : _name(n), _value(v) {}
+	};
+	std::forward_list<NodeVar> varsFromDag;
+#endif
 
 		// Count of the number of job procs currently in the batch system
 		// queue for this node.
 	int _queuedNodeJobProcs;
 
-		// Whether the _nodePriority value is meaningful.
-	bool _hasNodePriority;
+		// Count of the number of overall procs submitted for this job
+	int _numSubmittedProcs;
 
 		// Node priority.  Higher number is better priority (submit first).
-	int _nodePriority;
+		// Explicit priority is the priority actually set in the DAG
+		// file (0 if not set).
+	int _explicitPriority;
+		// Effective priority is the priority at which we're going to
+		// actually submit the job (explicit priority adjusted
+		// according to the DAG priority algorithm).
+	int _effectivePriority;
 
 		// The number of times this job has been held.  (Note: the current
 		// implementation counts holds for all procs in a multi-proc cluster
@@ -518,7 +612,6 @@ public:
 		// (Note: we may need to track the hold state of each proc in a
 		// cluster separately to correctly deal with multi-proc clusters.)
 	int _jobProcsOnHold;
-	bool UseDefaultLog() const { return append_default_log; }
 
 		/** Mark a job with ProcId == proc as being on hold
  			Returns false if the job is already on hold
@@ -531,37 +624,29 @@ public:
 		*/
 	bool Release(int proc);
 
+	static const char * dedup_str(const char* str) { return stringSpace.strdup_dedup(str); }
+
 private:
-		/** Clean up memory that's no longer needed once a node has
-			finished.  (Note that this doesn't mean that the Job object
-			is not valid -- it just cleans up some temporary memory.)
-			Also check that we got a consistent set of events for the
-			metrics.
-		*/
-	void Cleanup();
+	// private methods for use by AdjustEdges
+	void AdjustEdges_AddParentToChild(Dag* dag, JobID_t child_id, Job* parent);
 
-		/** _onHold[proc] is nonzero if the condor job 
- 			with ProcId == proc is on hold, and zero
-			otherwise
-		*/
-	std::vector<unsigned char> _onHold;	
+	// propagate parent completion to the children as part of AdjustEdges.
+	// NOT USED at present because bootstrap assumes that none of the children
+	// have been marked ready when the dag has finished loading.
+	//void AdjustEdges_NotifyChild(Dag* dag, JobID_t child_id, Job* parent);
 
-		// Mark this node as failed because of an error in monitoring
-		// the log file.
-  	void LogMonitorFailed();
-
-        // strings for job_type_t (e.g., "Condor, "Stork", etc.)
-    static const char* _job_type_names[];
-
-		// type of job (e.g., Condor, Stork, etc.)
-	job_type_t _jobType;
+        // StringSpace class de-dups _directory and _cmdFile strings, since
+        // these two string may be repeated thousands of times in a large DAG
+    static StringSpace stringSpace;
 
 		// Directory to cd to before running the job or the PRE and POST
 		// scripts.
-	char * _directory;
+        // Do not malloc or free! _directory is managed in a StringSpace!
+	const char * _directory;
 
-    // filename of condor submit file
-    char * _cmdFile;
+        // filename of condor submit file
+        // Do not malloc or free! _directory is managed in a StringSpace!
+    const char * _cmdFile;
 
 	// Filename of DAG file (only for nested DAGs specified with "SUBDAG",
 	// otherwise NULL).
@@ -571,7 +656,8 @@ private:
     char* _jobName;
 
     /** */ status_t _Status;
-  
+
+#ifdef DEAD_CODE
     /*  Job queues
 	    NOTE: indexed by queue_t
 
@@ -591,6 +677,27 @@ private:
     */ 
 	
 	std::set<JobID_t> _queues[3];
+#else
+  #ifdef MEMORY_HOG
+	std::set<JobID_t> _parents;
+	std::set<JobID_t> _waiting;
+	std::set<JobID_t> _children;
+  #else
+	// these may be job ids when there is a single dependency
+	// they will be edge ids when there are multiple dependencies
+	JobID_t _parent;
+	JobID_t _child;
+	// we count the parents as we add the child edges
+	// then in AdjustEdges, we build the parent lists from the child lists
+	// this allows us to allocate the vectors for parent and waiting up front
+	int _numparents;
+
+	bool _multiple_parents;	 // true when _parent is a EdgeID rather than a JobID
+	bool _multiple_children; // true when _child is an EdgeID rather than a JobID
+	bool _parents_done;      // set to true when all of the parents of this node are done
+	bool _spare;
+  #endif
+#endif
 
     /*	The ID of this job.  This serves as a primary key for Jobs, where each
 		Job's ID is unique from all the rest 
@@ -602,35 +709,6 @@ private:
     */
     static JobID_t _jobID_counter;
 
-		// True if the node job has been submitted and is idle.
-	bool _isIdle;
-
-		// This node's category; points to an object "owned" by the
-		// ThrottleByCategory object.
-	ThrottleByCategory::ThrottleInfo *_throttleInfo;
-
-		// Whether this node's log file is currently being monitored.
-	bool _logIsMonitored;
-
-		// Whether this node uses the default user log file.
-	bool _useDefaultLog;
-
-		// The log file for this job -- it will be assigned the default
-		// log file name if no log file is specified in the submit file.
-	char *_logFile;
-
-		// Whether the log file is XML.
-	bool _logFileIsXml;
-
-
-		// Whether this is a noop job (shouldn't actually be submitted
-		// to Condor).
-	bool _noop;
-
-		// The job tag for this node ("-" if nothing is specified;
-		// can also be "local").
-	char *_jobTag;
-
 		// The jobstate.log sequence number for this node (used if we are
 		// writing the jobstate.log file for Pegasus or others to read).
 	int _jobstateSeqNum;
@@ -639,9 +717,6 @@ private:
 		// that, when we run a rescue DAG, we pick up the sequence numbers
 		// from where we left off when we originally ran the DAG.
 	static int _nextJobstateSeqNum;
-
-		// The time of the most recent event related to this job.
-	time_t _lastEventTime;
 
 		// Skip the rest of the node (and consider it successful) if the
 		// PRE script exits with this value.  (-1 means undefined.)
@@ -653,16 +728,25 @@ private:
 		PRE_SKIP_MAX = 0xff
 	};
 
-	// whether this is a final job
-	bool _final;
-	bool append_default_log;
+		// The time of the most recent event related to this job.
+	time_t _lastEventTime;
+
+		// This node's category; points to an object "owned" by the
+		// ThrottleByCategory object.
+	ThrottleByCategory::ThrottleInfo *_throttleInfo;
+
+		// The job tag for this node ("-" if nothing is specified;
+		// can also be "local").
+	char *_jobTag;
 
 		//
-		// For metrics reporting.
+		// bit flags for _gotEvents
 		//
 	enum {
 		EXEC_MASK = 0x1,
-		ABORT_TERM_MASK = 0x2
+		ABORT_TERM_MASK = 0x2,
+		IDLE_MASK = 0x4, // set when proc is idle, formerly a separate _isIdle vector
+		HOLD_MASK = 0x8, // set when proc is held, formerly a separate _onHold vector
 	};
 
 		// _gotEvents[proc] & EXEC_MASK is true iff we've gotten an
@@ -670,13 +754,200 @@ private:
 		// is true iff we've gotten an aborted or terminated event
 		// for proc.
 	std::vector<unsigned char> _gotEvents;	
+
+#ifdef DEAD_CODE // dead, these are now flags in _gotEvents[proc]
+		// _isIdle[proc] is true iff proc is currently idle, held, etc.
+		// (in the queue but not running)
+	std::vector<unsigned char> _isIdle;	
+
+	/** _onHold[proc] is nonzero if the condor job
+		with ProcId == proc is on hold, and zero
+		otherwise
+	*/
+	std::vector<unsigned char> _onHold;
+#endif
+
+	/** Print the list of which procs are idle/not idle for this node
+	 *  (for debugging).
+	*/
+	void PrintProcIsIdle();
 };
 
+struct SortJobsById
+{
+	bool operator ()(const Job* a, const Job* b) {
+		return a->GetJobID() < b->GetJobID();
+	}
+	//bool operator ()(const Job & a, const Job & b) { return a.GetJobID() < b.GetJobID(); }
+};
+
+struct EqualJobsById
+{
+	bool operator ()(const Job* a, const Job* b) {
+		return a->GetJobID() == b->GetJobID();
+	}
+	// bool operator ()(const Job & a, const Job & b) { return a.GetJobID() == b.GetJobID(); }
+};
+
+#ifdef MEMORY_HOG
+#else
+
+// This class holds multiple JobId entries in a sorted vector, use it to hold
+// either the parent or child list for a Job node.
+//
+// The collection of all Edge data structures is owned by the static _edgeTable
+// member of this class, which can be used to lookup a Edge by id;
+// An EdgeID is essentially an index into this table.
+//
+// An edge cannot be freed individually once allocated, but it can be resized.
+//
+class Edge {
+protected:
+	Edge() {};
+	Edge(std::vector<JobID_t> & in) : _ary(in) {};
+public:
+	~Edge() {};
+
+	std::vector<JobID_t> _ary; // sorted array  of jobid's, either parent or child edge list
+	//std::set<JobID_t> _check; // used to double check the correctness of the edge list.
+	bool Add(JobID_t id) {
+		//_check.insert(id);
+		auto it = std::lower_bound(_ary.begin(), _ary.end(), id);
+		if ((it != _ary.end()) && (*it == id)) {
+			return false;
+		}
+		_ary.insert(it, id);
+		return true;
+	}
+	inline size_t size() {
+		return _ary.size();
+	}
+	inline bool empty() {
+		return _ary.empty();
+	}
+
+	// this table holds all of the allocated edges, stored by EdgeId (which is the index into the table)
+	static std::deque<Edge*> _edgeTable;
+
+	static Edge * ById(EdgeID_t id) {
+		if (id >= 0 && id < (EdgeID_t)_edgeTable.size())
+			return _edgeTable.at(id);
+		return NULL;
+	}
+	// create a new, empty edge returning it's ID
+	static EdgeID_t NewEdge(Edge* & edge) {
+		EdgeID_t id = (EdgeID_t)_edgeTable.size();
+		edge = new Edge();
+		_edgeTable.push_back(edge);
+		return id;
+	}
+	// create an edge as a copy of an existing edge, returning the new EdgeID
+	static EdgeID_t NewCopy(EdgeID_t id) {
+		Edge* from = ById(id);
+		if ( ! from) return NO_ID;
+		id = (EdgeID_t)_edgeTable.size();
+		Edge* edge = new Edge(from->_ary);
+		_edgeTable.push_back(edge);
+		return id;
+	}
+
+	// helper method for job methods. When called this will look at incoming multi flag
+	// and id flag.  If multi is true, then id is actually an EdgeID.  If it is false
+	// then it is a JobID and an Edge needs to be allocated. 
+	// 
+	// On exit, multi will be true.  id will be the Id of the Edge (possibly newly created)
+	// and first_id will be the former value of id IFF it was a JobID and not an EdgeID.
+	// in most cases the caller will want to insert first_id into the Edge if it is not NO_ID
+	//
+	static Edge* PromoteToMultiple(JobID_t & id, bool & multi, JobID_t & first_id) {
+		Edge* edge = NULL;
+		if (multi && (id != NO_ID)) {
+			first_id = NO_ID; // already multiple so no need to save id as first_id
+			edge = ById(id);
+		} else {
+			first_id = id; // we are promoting so save id as first id
+			id = NewEdge(edge);
+			multi = true;
+		}
+		return edge;
+	}
+};
+
+// Add a waiting count and bit array to the Edge array.
+// The _wait bit array should be the same size as the Edge::_ary
+// it's entries correspond to the entries in the Edge:_ary
+// because of this. inserting or appending entries in the _ary will
+// invalidate both the _wait and _num_waiting fields.
+// this structure should only be initialized after the _ary is fully populated
+//
+class WaitEdge : public Edge {
+protected:
+	WaitEdge(int num) : Edge() {
+		_ary.reserve(num);
+		_wait.resize(num, true);
+		_num_waiting = num;
+	};
+	std::vector<bool> _wait;  // a bit vector where true=waiting, the same size and order as _ary
+	int _num_waiting;         // the number of true bits in the _wait vector
+public:
+	~WaitEdge() {};
+
+	static EdgeID_t NewWaitEdge(int num) {
+		EdgeID_t id = (EdgeID_t)_edgeTable.size();
+		WaitEdge * edge = new WaitEdge(num);
+		_edgeTable.push_back(edge);
+		return id;
+	}
+
+	static WaitEdge * ById(EdgeID_t id) {
+		if (id >= 0 && id < (EdgeID_t)_edgeTable.size())
+			return static_cast<WaitEdge*>(_edgeTable.at(id));
+		return NULL;
+	}
+
+	int Waiting() { return _num_waiting; }
+
+	void MarkAllWaiting() {
+		_num_waiting = (int)_wait.size();
+		_wait.clear();
+		_wait.resize(_num_waiting, true);
+	}
+
+	bool MarkDone(JobID_t id, bool & already_done) {
+		auto it = std::lower_bound(_ary.begin(), _ary.end(), id);
+		if ((it != _ary.end()) && (*it == id)) {
+			size_t index = it - _ary.begin();
+			already_done = true;
+			if (_wait[index]) {
+				_wait[index] = false;
+				already_done = false;
+				_num_waiting -= 1;
+			}
+			return true;
+		}
+		return false;
+	}
+
+};
+
+
+#endif
+
+// return true if a collection has more than a single item in it
+template<class T> bool more_than_one(T & lst)
+{
+	auto it = lst.cbegin();
+	return (it != lst.cend()) && (++it != lst.cend());
+}
+
+
+#if 0 // not used -- wenger 2015-02-17
 /** A wrapper function for Job::Print which allows a NULL job pointer.
     @param job Pointer to job object, if NULL then "(UNKNOWN)" is printed
     @param condorID If true, also print the job's CondorID
 */
 void job_print (Job * job, bool condorID = false);
+#endif
 
 
 #endif /* ifndef JOB_H */

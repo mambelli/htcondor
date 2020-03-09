@@ -32,11 +32,11 @@ ScriptQ::ScriptQ( Dag* dag ) :
 	_dag = dag;
 	_numScriptsRunning = 0;
 
-    _scriptPidTable = new HashTable<int,Script*>( 127, &hashFuncInt );
-    _waitingQueue = new Queue<Script*>();
+    _scriptPidTable = new HashTable<int,Script*>( &hashFuncInt );
+    _waitingQueue = new std::queue<Script*>();
 
     if( _scriptPidTable == NULL || _waitingQueue == NULL ) {
-        EXCEPT( "ERROR: out of memory!\n");
+        EXCEPT( "ERROR: out of memory!");
     }
 
  	// register daemonCore reaper for PRE/POST script completion
@@ -57,6 +57,7 @@ ScriptQ::~ScriptQ()
 int
 ScriptQ::Run( Script *script )
 {
+	//TEMP -- should ScriptQ object know whether it's pre or post?
 	const char *prefix = script->_post ? "POST" : "PRE";
 
 	bool deferScript = false;
@@ -74,6 +75,8 @@ ScriptQ::Run( Script *script )
 
 		// Defer the script if we've hit the max PRE/POST scripts
 		// running limit.
+		//TEMP -- the scriptQ object should really know the max scripts
+		// limit, instead of getting it from the Dag object.  wenger 2015-03-18
 	int maxScripts =
 		script->_post ? _dag->_maxPostScripts : _dag->_maxPreScripts;
 	if ( maxScripts != 0 && _numScriptsRunning >= maxScripts ) {
@@ -86,7 +89,7 @@ ScriptQ::Run( Script *script )
 
 	if ( deferScript ) {
 		_scriptDeferredCount++;
-		_waitingQueue->enqueue( script );
+		_waitingQueue->push( script );
 		return 0;
 	}
 
@@ -97,7 +100,7 @@ ScriptQ::Run( Script *script )
 	if( int pid = script->BackgroundRun( _scriptReaperId,
 				_dag->_dagStatus, _dag->NumNodesFailed() ) ) {
 		_numScriptsRunning++;
-		_scriptPidTable->insert( pid, script );
+		ASSERT( _scriptPidTable->insert( pid, script ) == 0 );
 		debug_printf( DEBUG_DEBUG_1, "\tspawned pid %d: %s\n", pid,
 					  script->_cmd );
 		return 1;
@@ -114,38 +117,47 @@ ScriptQ::Run( Script *script )
 	// wenger 2007-11-08
 	const int returnVal = 1<<8;
 	if( ! script->_post ) {
-		_dag->PreScriptReaper( script->GetNodeName(), returnVal );
+		_dag->PreScriptReaper( script->GetNode(), returnVal );
 	} else {
-		_dag->PostScriptReaper( script->GetNodeName(), returnVal );
+		_dag->PostScriptReaper( script->GetNode(), returnVal );
 	}
 
 	return 0;
 }
 
 int
-ScriptQ::RunWaitingScript()
-{
-	Script *script = NULL;
-
-	if( !_waitingQueue->IsEmpty() ) {
-		_waitingQueue->dequeue( script );
-		ASSERT( script != NULL );
-		return Run( script );
-	}
-
-	return 0;
-}
-
-int
-ScriptQ::RunAllWaitingScripts()
+ScriptQ::RunWaitingScripts( bool justOne )
 {
 	int scriptsRun = 0;
+	time_t now = time( NULL );
 
-	while ( RunWaitingScript() > 0 ) {
-		scriptsRun++;
+	int lastScriptNum = _waitingQueue->size();
+	for ( int curScriptNum = 0; curScriptNum < lastScriptNum;
+				++curScriptNum ) {
+		Script *script;
+		script = _waitingQueue->front();
+		_waitingQueue->pop();
+		ASSERT( script != NULL );
+		if ( script->_nextRunTime != 0 && script->_nextRunTime > now ) {
+				// Deferral time is not yet up -- put it back into the queue.
+			_waitingQueue->push( script );
+		} else {
+				// Try to run the script.  Note:  Run() takes care of
+				// checking for halted state and maxpre/maxpost.
+			if ( Run( script ) ) {
+				++scriptsRun;
+				if ( justOne ) {
+					break;
+				}
+			} else {
+					// We're halted or we hit maxpre/maxpost, so don't
+					// try to run any more scripts.
+				break;
+			}
+		}
 	}
 
-	debug_printf( DEBUG_DEBUG_1, "Ran %d scripts\n", scriptsRun );
+	debug_printf( DEBUG_DEBUG_1, "Started %d deferred scripts\n", scriptsRun );
 	return scriptsRun;
 }
 
@@ -160,7 +172,7 @@ ScriptQ::ScriptReaper( int pid, int status )
 {
 	Script* script = NULL;
 
-	// get the Job* that corresponds to this pid
+	// get the Script* that corresponds to this pid
 	_scriptPidTable->lookup( pid, script );
 	ASSERT( script != NULL );
 
@@ -171,17 +183,30 @@ ScriptQ::ScriptReaper( int pid, int status )
 		EXCEPT( "Reaper pid (%d) does not match expected script pid (%d)!",
 					pid, script->_pid );
 	}
-	script->_done = TRUE;
 
-	// call appropriate DAG reaper
-	if( ! script->_post ) {
-		_dag->PreScriptReaper( script->GetNodeName(), status );
+	// Check to see if we should re-run this later.
+	if ( script->_deferStatus != SCRIPT_DEFER_STATUS_NONE &&
+				WEXITSTATUS( status ) == script->_deferStatus ) {
+		++_scriptDeferredCount;
+		script->_nextRunTime = time( NULL ) + script->_deferTime;
+		_waitingQueue->push( script );
+		const char *prefix = script->_post ? "POST" : "PRE";
+		debug_printf( DEBUG_NORMAL, "Deferring %s script of node %s for %ld seconds (exit status was %d)...\n",
+					prefix, script->GetNodeName(), script->_deferTime,
+					script->_deferStatus );
 	} else {
-		_dag->PostScriptReaper( script->GetNodeName(), status );
+		script->_done = TRUE;
+
+		// call appropriate DAG reaper
+		if( ! script->_post ) {
+			_dag->PreScriptReaper( script->GetNode(), status );
+		} else {
+			_dag->PostScriptReaper( script->GetNode(), status );
+		}
 	}
 
 	// if there's another script waiting to run, run it now
-	RunWaitingScript();
+	RunWaitingScripts( true );
 
 	return 1;
 }

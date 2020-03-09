@@ -26,7 +26,7 @@
 #include "condor_uid.h"
 #include "hibernator.tools.h"
 #include "path_utils.h"
-#include "../condor_daemon_core.V6/condor_daemon_core.h"
+#include <condor_daemon_core.h>
 
 /***************************************************************
  * UserDefinedToolsHibernator class
@@ -185,7 +185,7 @@ void UserDefinedToolsHibernator::configure ()
 				D_FULLDEBUG,
 				"UserDefinedToolsHibernator::configure: the executable "
 				"(%s) defined in the configuration file is invalid.\n",
-				m_tool_paths[i] );
+				name.Value());
 
 		}
 	}
@@ -231,6 +231,7 @@ UserDefinedToolsHibernator::enterState ( HibernatorBase::SLEEP_STATE state ) con
 		m_tool_args[index], 
 		PRIV_CONDOR_FINAL,
 		m_reaper_id, 
+		FALSE, 
 		FALSE, 
 		NULL, 
 		NULL, 

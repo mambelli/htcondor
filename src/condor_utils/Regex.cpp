@@ -114,7 +114,8 @@ Regex::match(const MyString & string,
 
 	if (NULL != groups) {
 		for (int i = 0; i < rc; i++) {
-			(*groups)[i] = string.Substr(ovector[i * 2], ovector[i * 2 + 1] - 1);
+			(*groups)[i] = string.substr(ovector[i * 2],
+			                             ovector[i * 2 + 1] - ovector[i * 2]);
 		}
 	}
 
@@ -134,6 +135,16 @@ Regex::isInitialized( )
 	return ( this->re != NULL );
 }
 
+size_t
+Regex::mem_used()
+{
+	if ( ! re) return 0;
+
+	size_t size = 0;
+	pcre_fullinfo(re, NULL, PCRE_INFO_SIZE, &size);
+	return size;
+}
+
 pcre *
 Regex::clone_re(pcre * re)
 {
@@ -141,7 +152,7 @@ Regex::clone_re(pcre * re)
 		return NULL;
 	}
 
-	size_t size;
+	size_t size = 0;
 	pcre_fullinfo(re, NULL, PCRE_INFO_SIZE, &size);
 
 	pcre * newre = (pcre *) pcre_malloc(size * sizeof(char));

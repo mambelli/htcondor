@@ -25,7 +25,6 @@
 #include "condor_config.h"
 #include "internet.h"
 #include "condor_rw.h"
-#include "condor_socket_types.h"
 #include "condor_md.h"
 #include "selector.h"
 #include "ccb_client.h"
@@ -43,6 +42,8 @@
 void
 ReliSock::init()
 {
+	m_auth_in_progress = false;
+	m_authob = NULL;
 	m_has_backlog = false;
 	m_read_would_block = false;
 	m_non_blocking = false;
@@ -53,8 +54,9 @@ ReliSock::init()
 	_special_state = relisock_none;
 	is_client = 0;
 	hostAddr = NULL;
-	snd_msg.buf.reset();                                                    
-	rcv_msg.buf.reset();   
+	statsBuf = NULL;
+	snd_msg.reset();
+	rcv_msg.reset();
 	rcv_msg.init_parent(this);
 	snd_msg.init_parent(this);
 	m_target_shared_port_id = NULL;
@@ -87,9 +89,17 @@ ReliSock::CloneStream()
 ReliSock::~ReliSock()
 {
 	close();
+	if ( m_authob ) {
+		delete m_authob;
+		m_authob = NULL;
+	}
 	if ( hostAddr ) {
 		free( hostAddr );
 		hostAddr = NULL;
+	}
+	if (statsBuf) {
+		free(statsBuf);
+		statsBuf = NULL;
 	}
 	if( m_target_shared_port_id ) {
 		free( m_target_shared_port_id );
@@ -97,6 +107,16 @@ ReliSock::~ReliSock()
 	}
 }
 
+int
+ReliSock::close()
+{
+	// Purge send and receive buffers at the relisock level
+	snd_msg.reset();
+	rcv_msg.reset();
+
+	// then invoke close() in parent class to close fd etc
+	return Sock::close();
+}
 
 int 
 ReliSock::listen()
@@ -144,15 +164,6 @@ int ReliSock::listen(condor_protocol proto, int port)
 	return listen();
 }
 
-/// FALSE means this is an incoming connection
-int ReliSock::listen(char *s)
-{
-	if (!bind(false, s))
-		return FALSE;
-	return listen();
-}
-
-
 int 
 ReliSock::accept( ReliSock	&c )
 {
@@ -193,7 +204,7 @@ ReliSock::accept( ReliSock	&c )
 
 	}
 
-	c.assign(c_sock);
+	c.assignSocket(c_sock);
 	c.enter_connected_state("ACCEPT");
 	c.decode();
 
@@ -268,7 +279,7 @@ ReliSock::connect( char	const *host, int port, bool non_blocking_flag )
 }
 
 int 
-ReliSock::put_line_raw( char *buffer )
+ReliSock::put_line_raw( const char *buffer )
 {
 	int result;
 	int length = strlen(buffer);
@@ -312,16 +323,16 @@ ReliSock::get_bytes_raw( char *buffer, int length )
 }
 
 int 
-ReliSock::put_bytes_nobuffer( char *buffer, int length, int send_size )
+ReliSock::put_bytes_nobuffer( const char *buffer, int length, int send_size )
 {
 	int i, result, l_out;
 	int pagesize = 65536;  // Optimize large writes to be page sized.
-	char * cur;
+	const char * cur;
 	unsigned char * buf = NULL;
         
 	// First, encrypt the data if necessary
 	if (get_encryption()) {
-		if (!wrap((unsigned char *) buffer, length,  buf , l_out)) { 
+		if (!wrap((const unsigned char *) buffer, length,  buf , l_out)) {
 			dprintf(D_SECURITY, "Encryption failed\n");
 			goto error;
 		}
@@ -564,7 +575,7 @@ ReliSock::peek_end_of_message()
 	return false;
 }
 
-const char * ReliSock :: isIncomingDataMD5ed()
+const char * ReliSock :: isIncomingDataHashed()
 {
     return NULL;    // For now
 }
@@ -572,14 +583,13 @@ const char * ReliSock :: isIncomingDataMD5ed()
 int 
 ReliSock::put_bytes(const void *data, int sz)
 {
-	int		tw=0, header_size = isOutgoing_MD5_on() ? MAX_HEADER_SIZE:NORMAL_HEADER_SIZE;
-	int		nw, l_out;
-        unsigned char * dta = NULL;
-
         // Check to see if we need to encrypt
         // Okay, this is a bug! H.W. 9/25/2001
+
         if (get_encryption()) {
-            if (!wrap((unsigned char *)const_cast<void*>(data), sz, dta , l_out)) { 
+        	unsigned char * dta = NULL;
+			int l_out;
+            if (!wrap((const unsigned char *)(data), sz, dta , l_out)) {
                 dprintf(D_SECURITY, "Encryption failed\n");
 				if (dta != NULL)
 				{
@@ -588,14 +598,23 @@ ReliSock::put_bytes(const void *data, int sz)
 				}
                 return -1;  // encryption failed!
             }
+			int r = put_bytes_after_encryption(dta, sz); // l_out instead?
+			free(dta);
+			return r;
         }
         else {
-            if((dta = (unsigned char *) malloc(sz)) != 0)
-		memcpy(dta, data, sz);
+			// The bytes aren't encrypted at all, just pass through
+			return put_bytes_after_encryption(data, sz);
         }
+}
 
+int 
+ReliSock::put_bytes_after_encryption(const void *dta, int sz) {
 	ignore_next_encode_eom = FALSE;
 
+	int		nw;
+	int 	tw = 0;
+	int		header_size = isOutgoing_Hash_on() ? MAX_HEADER_SIZE:NORMAL_HEADER_SIZE;
 	for(nw=0;;) {
 		
 		if (snd_msg.buf.full()) {
@@ -603,15 +622,10 @@ ReliSock::put_bytes(const void *data, int sz)
 			// This would block and the user asked us to work non-buffered - force the
 			// buffer to grow to hold the data for now.
 			if (retval == 3) {
-				nw += snd_msg.buf.put_force(&((char *)dta)[nw], sz-nw);
+				nw += snd_msg.buf.put_force(&((const char *)dta)[nw], sz-nw);
 				m_has_backlog = true;
 				break;
 			} else if (!retval) {
-				if (dta != NULL)
-				{
-					free(dta);
-					dta = NULL;
-				}
 				return FALSE;
 			}
 		}
@@ -620,9 +634,7 @@ ReliSock::put_bytes(const void *data, int sz)
 			snd_msg.buf.seek(header_size);
 		}
 		
-		if (dta && (tw = snd_msg.buf.put_max(&((char *)dta)[nw], sz-nw)) < 0) {
-			free(dta);
-		dta = NULL;
+		if (dta && (tw = snd_msg.buf.put_max(&((const char *)dta)[nw], sz-nw)) < 0) {
 			return -1;
 		}
 		
@@ -633,12 +645,6 @@ ReliSock::put_bytes(const void *data, int sz)
 	}
 	if (nw > 0) {
 		_bytes_sent += nw;
-	}
-
-	if (dta != NULL)
-	{
-		free(dta);
-		dta = NULL;
 	}
 
 	return nw;
@@ -728,7 +734,8 @@ ReliSock::RcvMsg :: RcvMsg() :
 	m_remaining_read_length(0),
 	m_end(0),
 	m_tmp(NULL),
-	ready(0)
+	ready(0),
+	m_closed(false)
 {
 	memset( m_partial_cksum, 0, sizeof(m_partial_cksum) );
 }
@@ -736,6 +743,11 @@ ReliSock::RcvMsg :: RcvMsg() :
 ReliSock::RcvMsg::~RcvMsg()
 {
     delete mdChecker_;
+}
+
+void ReliSock::RcvMsg::reset()
+{
+	buf.reset();
 }
 
 int ReliSock::RcvMsg::rcv_packet( char const *peer_description, SOCKET _sock, int _timeout)
@@ -779,6 +791,7 @@ int ReliSock::RcvMsg::rcv_packet( char const *peer_description, SOCKET _sock, in
 	}
 	if ( retval == -2 ) {	// -2 means peer just closed the socket
 		dprintf(D_FULLDEBUG,"IO: EOF reading packet header\n");
+		m_closed = true;
 		return FALSE;
 	}
 
@@ -865,6 +878,14 @@ ReliSock::SndMsg::SndMsg() :
 ReliSock::SndMsg::~SndMsg() 
 {
     delete mdChecker_;
+	delete m_out_buf;
+}
+
+void ReliSock::SndMsg::reset()
+{
+	buf.reset();
+	delete m_out_buf;
+	m_out_buf = NULL;
 }
 
 int ReliSock::SndMsg::finish_packet(const char *peer_description, int sock, int timeout)
@@ -982,52 +1003,54 @@ ReliSock::attach_to_file_desc( int fd )
 
 	_sock = fd;
 	_state = sock_connect;
+
+	int accepting = 0;
+	socklen_t l = sizeof(accepting);
+
+	if ((getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &l) == 0) && (l == sizeof(accepting)))
+	{
+		if (accepting == 1)
+		{
+			_state = sock_special;
+			_special_state = relisock_listen;
+		}
+	}
+
 	timeout(0);	// make certain in blocking mode
 	return TRUE;
 }
 #endif
 
 Stream::stream_type 
-ReliSock::type() 
+ReliSock::type() const
 { 
 	return Stream::reli_sock; 
 }
 
-char * 
+char *
 ReliSock::serialize() const
 {
-	// here we want to save our state into a buffer
+	MyString state;
 
-	// first, get the state from our parent class
 	char * parent_state = Sock::serialize();
-    // now concatenate our state
-	char * outbuf = new char[50];
-    memset(outbuf, 0, 50);
-	sprintf(outbuf,"%d*%s*",_special_state,_who.to_sinful().Value());
-	strcat(parent_state,outbuf);
-
-    // Serialize crypto stuff
 	char * crypto = serializeCryptoInfo();
-    strcat(parent_state, crypto);
-    strcat(parent_state, "*");
+	char * md = serializeMdInfo();
 
-    // serialize MD info
-    char * md = serializeMdInfo();
-    strcat(parent_state, md);
-    strcat(parent_state, "*");
+	formatstr( state, "%s%d*%s*%s*%s*", parent_state, _special_state, _who.to_sinful().Value(), crypto, md );
 
-	delete []outbuf;
-    delete []crypto;
-    delete []md;
-	return( parent_state );
+	delete[] parent_state;
+	delete[] crypto;
+	delete[] md;
+
+	return state.detach_buffer();
 }
 
-char * 
-ReliSock::serialize(char *buf)
+const char *
+ReliSock::serialize(const char *buf)
 {
 	char * sinful_string = NULL;
 	char fqu[256];
-	char *ptmp, * ptr = NULL;
+	const char *ptmp, * ptr = NULL;
 	int len = 0;
 
     ASSERT(buf);
@@ -1135,7 +1158,7 @@ ReliSock::prepare_for_nobuffering(stream_coding direction)
 
 int ReliSock::perform_authenticate(bool with_key, KeyInfo *& key, 
 								   const char* methods, CondorError* errstack,
-								   int auth_timeout, char **method_used)
+								   int auth_timeout, bool non_blocking, char **method_used)
 {
 	int in_encode_mode;
 	int result;
@@ -1145,16 +1168,22 @@ int ReliSock::perform_authenticate(bool with_key, KeyInfo *& key,
 	}
 
     if (!triedAuthentication()) {
-		Authentication authob(this);
+		if (m_authob) {delete m_authob;}
+		m_authob = new Authentication(this);
 		setTriedAuthentication(true);
 			// store if we are in encode or decode mode
 		in_encode_mode = is_encode();
 
 			// actually perform the authentication
 		if ( with_key ) {
-			result = authob.authenticate( hostAddr, key, methods, errstack, auth_timeout );
+			result = m_authob->authenticate( hostAddr, key, methods, errstack, auth_timeout, non_blocking );
 		} else {
-			result = authob.authenticate( hostAddr, methods, errstack, auth_timeout );
+			result = m_authob->authenticate( hostAddr, methods, errstack, auth_timeout, non_blocking );
+		}
+		_should_try_token_request = m_authob->shouldTryTokenRequest();
+
+		if ( result == 2 ) {
+			m_auth_in_progress = true;
 		}
 			// restore stream mode (either encode or decode)
 		if ( in_encode_mode && is_decode() ) {
@@ -1165,16 +1194,9 @@ int ReliSock::perform_authenticate(bool with_key, KeyInfo *& key,
 			}
 		}
 
-		setFullyQualifiedUser(authob.getFullyQualifiedUser());
-
-		if( authob.getMethodUsed() ) {
-			setAuthenticationMethodUsed(authob.getMethodUsed());
-			if( method_used ) {
-				*method_used = strdup(authob.getMethodUsed());
-			}
-		}
-		if ( authob.getFQAuthenticatedName() ) {
-			setAuthenticatedName( authob.getFQAuthenticatedName() );
+		if (!m_auth_in_progress) {
+			int result2 = authenticate_continue(errstack, non_blocking, method_used);
+			return result ? result2 : 0;
 		}
 		return result;
     }
@@ -1183,61 +1205,101 @@ int ReliSock::perform_authenticate(bool with_key, KeyInfo *& key,
     }
 }
 
-int ReliSock::authenticate(KeyInfo *& key, const char* methods, CondorError* errstack, int auth_timeout, char **method_used)
+int ReliSock::authenticate_continue(CondorError* errstack, bool non_blocking, char **method_used)
 {
-	return perform_authenticate(true,key,methods,errstack,auth_timeout,method_used);
+	int result = 1;
+	if( m_auth_in_progress )
+	{
+		result = m_authob->authenticate_continue(errstack, non_blocking);
+		_should_try_token_request = m_authob->shouldTryTokenRequest();
+		if (result == 2) {
+			return result;
+		}
+	}
+	m_auth_in_progress = false;
+
+	setFullyQualifiedUser(m_authob->getFullyQualifiedUser());
+
+	if( m_authob->getMethodUsed() ) {
+		setAuthenticationMethodUsed(m_authob->getMethodUsed());
+		if( method_used ) {
+			*method_used = strdup(m_authob->getMethodUsed());
+		}
+	}
+	if ( m_authob->getFQAuthenticatedName() ) {
+		setAuthenticatedName( m_authob->getFQAuthenticatedName() );
+	}
+	delete m_authob;
+	m_authob = NULL;
+	return result;
+}
+
+int ReliSock::authenticate(KeyInfo *& key, const char* methods, CondorError* errstack, int auth_timeout, bool non_blocking, char **method_used)
+{
+	return perform_authenticate(true,key,methods,errstack,auth_timeout,non_blocking,method_used);
 }
 
 int 
-ReliSock::authenticate(const char* methods, CondorError* errstack,int auth_timeout ) 
+ReliSock::authenticate(const char* methods, CondorError* errstack, int auth_timeout, bool non_blocking) 
 {
 	KeyInfo *key = NULL;
-	return perform_authenticate(false,key,methods,errstack,auth_timeout,NULL);
+	return perform_authenticate(false,key,methods,errstack,auth_timeout,non_blocking,NULL);
 }
 
 bool
-ReliSock::connect_socketpair(ReliSock &sock,bool use_standard_interface)
-{
-	ReliSock tmp_srv;
-
-	if( use_standard_interface ) {
-		if( !bind(false) ) {
-			dprintf(D_ALWAYS, "connect_socketpair: failed in bind()\n");
-			return false;
-		}
-	}
-	else if( !bind_to_loopback(false) ) {
-		dprintf(D_ALWAYS, "connect_socketpair: failed in bind_to_loopback()\n");
+ReliSock::connect_socketpair_impl( ReliSock & sock, condor_protocol proto, bool isLoopback ) {
+	ReliSock tmp;
+	if( ! tmp.bind( proto, false, 0, isLoopback ) ) {
+		dprintf( D_ALWAYS, "connect_socketpair(): failed to bind() that.\n" );
 		return false;
 	}
 
-	if( use_standard_interface ) {
-		if( !tmp_srv.bind(false) ) {
-			dprintf(D_ALWAYS, "connect_socketpair: failed in tmp_srv.bind()\n");
-			return false;
-		}
-	}
-	else if( !tmp_srv.bind_to_loopback(false) ) {
-		dprintf(D_ALWAYS, "connect_socketpair: failed in tmp_srv.bind_to_loopback()\n");
+	if( !tmp.listen() ) {
+		dprintf( D_ALWAYS, "connect_socketpair(): failed to listen() on that.\n" );
 		return false;
 	}
 
-	if( !tmp_srv.listen() ) {
-		dprintf(D_ALWAYS, "connect_socketpair: failed in tmp_srv.listen()\n");
+	if( ! bind( proto, false, 0, isLoopback ) ) {
+		dprintf( D_ALWAYS, "connect_socketpair(): failed to bind() this.\n" );
 		return false;
 	}
 
-	if( !connect(tmp_srv.my_ip_str(),tmp_srv.get_port()) ) {
-		dprintf(D_ALWAYS, "connect_socketpair: failed in tmp_srv.get_port()\n");
+	if( !connect( tmp.my_ip_str(), tmp.get_port() ) ) {
+		dprintf( D_ALWAYS, "connect_socketpair(): failed to connect() to that.\n" );
 		return false;
 	}
 
-	if( !tmp_srv.accept( sock ) ) {
-		dprintf(D_ALWAYS, "connect_socketpair: failed in tmp_srv.accept()\n");
+	tmp.timeout( 1 );
+	if( ! tmp.accept( sock ) ) {
+		dprintf( D_ALWAYS, "connect_socketpair(): failed to accept() that.\n" );
 		return false;
 	}
 
 	return true;
+}
+
+bool
+ReliSock::connect_socketpair( ReliSock & sock, char const * asIfConnectingTo ) {
+	condor_sockaddr aictAddr;
+	if( ! aictAddr.from_ip_string( asIfConnectingTo ) ) {
+		dprintf( D_ALWAYS, "connect_socketpair(): '%s' not a valid IP string.\n", asIfConnectingTo );
+		return false;
+	}
+
+	return connect_socketpair_impl( sock, aictAddr.get_protocol(), aictAddr.is_loopback() );
+}
+
+bool
+ReliSock::connect_socketpair( ReliSock & sock ) {
+	condor_protocol proto = CP_IPV4;
+	bool ipV4Allowed = ! param_false( "ENABLE_IPV4" );
+	bool ipV6Allowed = ! param_false( "ENABLE_IPV6" );
+
+	if( ipV6Allowed && (! ipV4Allowed) ) {
+		proto = CP_IPV6;
+	}
+
+	return connect_socketpair_impl( sock, proto, true );
 }
 
 void
@@ -1260,7 +1322,7 @@ ReliSock::exit_reverse_connecting_state(ReliSock *sock)
 	_state = sock_virgin;
 
 	if( sock ) {
-		int assign_rc = assign(sock->get_file_desc());
+		int assign_rc = assignCCBSocket(sock->get_file_desc());
 		ASSERT( assign_rc );
 		isClient(true);
 		if( sock->_state == sock_connect ) {
@@ -1273,6 +1335,79 @@ ReliSock::exit_reverse_connecting_state(ReliSock *sock)
 		sock->close();
 	}
 	m_ccb_client = NULL;
+}
+
+/*
+ * Use the Linux-specific TCP_INFO getsockopt to return a human readable
+ * string describing low-level tcp statistics
+ *
+ */
+char *
+ReliSock::get_statistics() {
+#ifndef LINUX
+	return 0;
+#else
+			// 20 entries, each with 16 bytes of text and up to 10 bytes numeric
+	int maxSize = 20 * (16 + 10);
+	if (statsBuf == 0) {
+		statsBuf = (char *)malloc(maxSize + 1); // dtor frees this
+		statsBuf[0] = '\0';
+	}
+
+	struct tcp_info ti;
+	socklen_t tcp_info_len = sizeof(struct tcp_info);
+
+	int ret = getsockopt(this->get_file_desc(), SOL_TCP, TCP_INFO, &ti, &tcp_info_len);
+	if (ret != 0) {
+			// maybe the sock was closed?  Return the last value, if any.
+		return statsBuf;
+	}
+
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 6)
+	snprintf(statsBuf, maxSize,
+		"rto: %d "
+		"ato: %d "
+		"snd_mss: %d "
+		"rcv_mss: %d "
+		"unacked: %d "
+		"sacked: %d "
+		"lost: %d "
+		"retrans: %d "
+		"fackets: %d "
+		"pmtu: %d "
+		"rcv_ssthresh: %d "
+		"rtt: %d "
+		"snd_ssthresh: %d "
+		"snd_cwnd: %d "
+		"advmss: %d "
+		"reordering: %d "
+		"rcv_rtt: %d "
+		"rcv_space: %d "
+		"total_retrans: %d ",
+		
+		ti.tcpi_rto,
+		ti.tcpi_ato,
+		ti.tcpi_snd_mss,
+		ti.tcpi_rcv_mss,
+		ti.tcpi_unacked,
+		ti.tcpi_sacked,
+		ti.tcpi_lost,
+		ti.tcpi_retrans,
+		ti.tcpi_fackets,
+		ti.tcpi_pmtu,
+		ti.tcpi_rcv_ssthresh,
+		ti.tcpi_rtt,
+		ti.tcpi_snd_ssthresh,
+		ti.tcpi_snd_cwnd,
+		ti.tcpi_advmss,
+		ti.tcpi_reordering,
+		ti.tcpi_rcv_rtt,
+		ti.tcpi_rcv_space,
+		ti.tcpi_total_retrans);
+#endif
+		
+	return statsBuf;
+#endif
 }
 
 void
@@ -1289,5 +1424,19 @@ ReliSock::setTargetSharedPortID( char const *id )
 
 bool
 ReliSock::msgReady() {
+	while (!rcv_msg.ready)
+	{
+		// NOTE: 'true' here indicates non-blocking.
+		BlockingModeGuard sentry(this, true);
+		int retval = handle_incoming_packet();
+		if (retval == 2) {
+			dprintf(D_NETWORK, "msgReady would have blocked.\n");
+			m_read_would_block = true;
+			return false;
+		} else if (retval == 0) {
+			// No data is available
+			return false;
+		}
+	}
 	return rcv_msg.ready;
 }

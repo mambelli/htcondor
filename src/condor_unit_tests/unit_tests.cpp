@@ -38,12 +38,7 @@ void print_usage(void);
 bool FTEST_host_in_domain(void);
 bool FTEST_getHostFromAddr(void);
 bool FTEST_getPortFromAddr(void);
-bool FTEST_is_ipaddr(void);
 bool FTEST_is_valid_sinful(void);
-bool FTEST_is_valid_network(void);
-bool FTEST_sin_to_string(void);
-bool FTEST_string_to_ip(void);
-bool FTEST_string_to_sin(void);
 bool FTEST_string_to_port(void);
 bool FTEST_strupr(void);
 bool FTEST_strlwr(void);
@@ -52,6 +47,8 @@ bool FTEST_dirname(void);
 bool FTEST_fullpath(void);
 bool FTEST_flatten_and_inline(void);
 bool FTEST_stl_string_utils(void);
+bool FTEST_your_string(void);
+bool FTEST_tokener(void);
 bool OTEST_HashTable(void);
 bool OTEST_MyString(void);
 bool OTEST_StringList(void);
@@ -65,6 +62,7 @@ bool OTEST_Directory(void);
 bool OTEST_TmpDir(void);
 bool OTEST_StatInfo(void);
 bool OTEST_condor_sockaddr();
+bool OTEST_ranger();
 
 	// function map that maps testing function names to testing functions
 const static struct {
@@ -74,12 +72,7 @@ const static struct {
 	map(FTEST_host_in_domain),
 	map(FTEST_getHostFromAddr),
 	map(FTEST_getPortFromAddr),
-	map(FTEST_is_ipaddr),
 	map(FTEST_is_valid_sinful),
-	map(FTEST_is_valid_network),
-	map(FTEST_sin_to_string),
-	map(FTEST_string_to_ip),
-	map(FTEST_string_to_sin),
 	map(FTEST_string_to_port),
 	map(FTEST_strupr),
 	map(FTEST_strlwr),
@@ -88,6 +81,8 @@ const static struct {
 	map(FTEST_fullpath),
 	map(FTEST_flatten_and_inline),
 	map(FTEST_stl_string_utils),
+	map(FTEST_your_string),
+	map(FTEST_tokener),
 	{"start of objects", NULL},	//placeholder to separate functions and objects
 	map(OTEST_HashTable),
 	map(OTEST_MyString),
@@ -102,6 +97,7 @@ const static struct {
 	map(OTEST_TmpDir),
 	map(OTEST_StatInfo),
 	map(OTEST_condor_sockaddr),
+	map(OTEST_ranger),
 };
 int function_map_num_elems = sizeof(function_map) / sizeof(function_map[0]);
 
@@ -267,5 +263,12 @@ void print_usage(void) {
 		"-f: Only show output for tests that fail\n\t"
 		"-p: Only show output for tests that pass\n\t"
 		"-y: Only show summary\n\t"
-		"-h, --help: Print this out\n");
+		"-h, --help: Print this out\n"
+		"\nTest names are:\n"
+		);
+
+	for (size_t ii = 0; ii < sizeof(function_map)/sizeof(function_map[0]); ii++)
+	{
+		if (function_map[ii].name) { printf("\t%s\n", function_map[ii].name); }
+	}
 }

@@ -21,11 +21,8 @@
 #include "condor_common.h"
 #include "condor_attributes.h"
 #include "condor_debug.h"
-#include "condor_string.h"	// for strnewp and friends
-#include "../condor_daemon_core.V6/condor_daemon_core.h"
+#include "condor_daemon_core.h"
 #include "basename.h"
-#include "nullfile.h"
-#include "filename_tools.h"
 
 #ifdef WIN32
 #else
@@ -50,7 +47,6 @@ using namespace std;
 #define GM_PROBE_JOB					9
 #define GM_SAVE_INSTANCE_NAME			10
 #define GM_SEEK_INSTANCE_ID				11
-#define GM_CANCEL_CHECK					12
 
 static const char *GMStateNames[] = {
 	"GM_INIT",
@@ -65,7 +61,6 @@ static const char *GMStateNames[] = {
 	"GM_PROBE_JOB",
 	"GM_SAVE_INSTANCE_NAME",
 	"GM_SEEK_INSTANCE_ID",
-	"GM_CANCEL_CHECK",
 };
 
 #define GCE_INSTANCE_PROVISIONING		"PROVISIONING"
@@ -86,6 +81,12 @@ void GCEJobInit()
 
 void GCEJobReconfig()
 {
+    int gct = param_integer( "GRIDMANAGER_GAHP_CALL_TIMEOUT", 10 * 60 );
+	GCEJob::setGahpCallTimeout( gct );
+
+	int cfrc = param_integer("GRIDMANAGER_CONNECT_FAILURE_RETRY_COUNT", 3);
+	GCEJob::setConnectFailureRetry( cfrc );
+
 	// Tell all the resource objects to deal with their new config values
 	GCEResource *next_resource;
 
@@ -123,13 +124,13 @@ int GCEJob::gahpCallTimeout = 600;
 int GCEJob::submitInterval = 300;
 int GCEJob::maxConnectFailures = 3;
 int GCEJob::funcRetryInterval = 15;
-int GCEJob::pendingWaitTime = 15;
 int GCEJob::maxRetryTimes = 3;
 
 GCEJob::GCEJob( ClassAd *classad ) :
 	BaseJob( classad ),
-	m_was_job_completion( false ),
+	m_preemptible( false ),
 	m_retry_times( 0 ),
+	m_failure_injection(NULL),
 	probeNow( false )
 {
 	string error_string = "";
@@ -151,11 +152,7 @@ GCEJob::GCEJob( ClassAd *classad ) :
 
 	// check the auth_file
 	jobAd->LookupString( ATTR_GCE_AUTH_FILE, m_authFile );
-
-	if ( m_authFile.empty() ) {
-		error_string = "Auth file not defined";
-		goto error_exit;
-	}
+	jobAd->LookupString( ATTR_GCE_ACCOUNT, m_account );
 
 	// Check for failure injections.
 	m_failure_injection = getenv( "GM_FAILURE_INJECTION" );
@@ -172,8 +169,31 @@ GCEJob::GCEJob( ClassAd *classad ) :
 
 	jobAd->LookupString( ATTR_GCE_METADATA, m_metadata );
 
+	jobAd->LookupBool( ATTR_GCE_PREEMPTIBLE, m_preemptible );
+
+	jobAd->LookupString( ATTR_GCE_JSON_FILE, m_jsonFile );
+
 	// get VM machine type
 	jobAd->LookupString( ATTR_GCE_MACHINE_TYPE, m_machineType );
+
+	// get labels
+	std::string buffer;
+	if( jobAd->LookupString( ATTR_CLOUD_LABEL_NAMES, buffer ) ) {
+		char * labelName = NULL;
+		StringList labelNames( buffer.c_str() );
+
+		labelNames.rewind();
+		while( (labelName = labelNames.next()) ) {
+			std::string labelAttr(ATTR_CLOUD_LABEL_PREFIX);
+			labelAttr += labelName;
+
+			// Labels don't have to have values.
+			std::string labelValue;
+			jobAd->LookupString( labelAttr, labelValue );
+
+            m_labels.push_back( std::make_pair( labelName, labelValue ) );
+		}
+	}
 
 	// In GM_HOLD, we assume HoldReason to be set only if we set it, so make
 	// sure it's unset when we start (unless the job is already held).
@@ -269,7 +289,8 @@ GCEJob::GCEJob( ClassAd *classad ) :
 		GCEResource::FindOrCreateResource( m_serviceUrl.c_str(),
 										   m_project.c_str(),
 										   m_zone.c_str(),
-										   m_authFile.c_str() );
+										   m_authFile.c_str(),
+										   m_account.c_str() );
 	myResource->RegisterJob( this );
 
 	value.clear();
@@ -324,7 +345,7 @@ GCEJob::GCEJob( ClassAd *classad ) :
  error_exit:
 	gmState = GM_HOLD;
 	if ( !error_string.empty() ) {
-		jobAd->Assign( ATTR_HOLD_REASON, error_string.c_str() );
+		jobAd->Assign( ATTR_HOLD_REASON, error_string );
 	}
 
 	return;
@@ -335,7 +356,7 @@ GCEJob::~GCEJob()
 	if ( myResource ) {
 		myResource->UnregisterJob( this );
 		if( ! m_instanceId.empty() ) {
-			myResource->jobsByInstanceID.remove( HashKey( m_instanceId.c_str() ) );
+			myResource->jobsByInstanceID.remove( m_instanceId );
 		}
 	}
 	delete gahp;
@@ -354,8 +375,6 @@ void GCEJob::doEvaluateState()
 	bool reevaluate_state = true;
 	time_t now = time(NULL);
 
-	bool attr_exists;
-	bool attr_dirty;
 	int rc;
 	std::string gahp_error_code;
 
@@ -377,17 +396,18 @@ void GCEJob::doEvaluateState()
 		gahp_error_code = "";
 
 		// JEF: Crash the gridmanager if requested by the job
-		int should_crash = 0;
+		bool should_crash = false;
 		jobAd->Assign( "GMState", gmState );
-		jobAd->SetDirtyFlag( "GMState", false );
+		jobAd->MarkAttributeClean( "GMState" );
 
-		if ( jobAd->EvalBool( "CrashGM", NULL, should_crash ) && should_crash ) {
+		if ( jobAd->LookupBool( "CrashGM", should_crash ) && should_crash ) {
 			EXCEPT( "Crashing gridmanager at the request of job %d.%d",
 					procID.cluster, procID.proc );
 		}
 
 		reevaluate_state = false;
 		old_gm_state = gmState;
+		ASSERT ( gahp != NULL || gmState == GM_HOLD || gmState == GM_DELETE );
 
 		switch ( gmState )
 		{
@@ -398,8 +418,7 @@ void GCEJob::doEvaluateState()
 				// constructor is called while we're connected to the schedd).
 
 				// JEF: Save GMSession to the schedd if needed
-				jobAd->GetDirtyFlag( "GMSession", &attr_exists, &attr_dirty );
-				if ( attr_exists && attr_dirty ) {
+				if ( jobAd->IsAttributeDirty( "GMSession" ) ) {
 					requestScheddUpdate( this, true );
 					break;
 				}
@@ -433,57 +452,28 @@ void GCEJob::doEvaluateState()
 					}
 				}
 
-				// If we're not doing recovery, start with GM_CLEAR_REQUEST.
-				gmState = GM_CLEAR_REQUEST;
-
-				if( ! m_instanceName.empty() ) {
-
-					// Because we have the instance name, we know that
-					// we still have the SSH keypair from the previous
-					// execution of GM_SAVE_INSTANCE_NAME.  We can therefore
-					// jump directly to GM_START_VM, where (using the
-					// instance name), we will call RunInstances()
-					// idempotently.
-					gmState = GM_START_VM;
-
-					// As an optimization, if we already have the instance
-					// ID, we can jump directly to GM_SUBMITTED.  This
-					// also allows us to avoid logging the submission and
-					// execution events twice.
-					//
-					// FIXME: If a job were removed before we begin
-					// recovery, would the execute event be logged twice?
-					if (!m_instanceId.empty()) {
-						submitLogged = true;
-						if ( condorState == RUNNING || condorState == COMPLETED ) {
-							executeLogged = true;
-						}
-						// Do NOT set probeNow; if we're recovering from
-						// a queue with 5000 jobs, we'd hit the service
-						// with 5000 status update requests, which is
-						// precisely what we're trying to avoid.
-						gmState = GM_SUBMITTED;
-					} else if( condorState == REMOVED ) {
-						// We don't know if the corresponding instance
-						// exists or not. And if we're creating the
-						// ssh keypair, we don't know if that exists.
-						// Rather than unconditionally
-						// create it (in GM_START_VM), check to see if
-						// exists first.  While this may be more efficient,
-						// the real benefit is that invalid jobs won't
-						// stay on hold when the user removes them
-						// (because we won't try to start them).
-						gmState = GM_SEEK_INSTANCE_ID;
+				if ( m_instanceName.empty() ) {
+					// This is a fresh job submission.
+					gmState = GM_CLEAR_REQUEST;
+				} else if ( m_instanceId.empty() ) {
+					// We died during submission. There may be a running
+					// instance whose ID we don't know.
+					// Wait for a bulk query of instances and see if an
+					// instance that matches our m_instanceName appears.
+					gmState = GM_SEEK_INSTANCE_ID;
+				} else {
+					// There is (or was) a running instance and we know
+					// its ID.
+					submitLogged = true;
+					if ( condorState == RUNNING || condorState == COMPLETED ) {
+						executeLogged = true;
 					}
+					gmState = GM_SUBMITTED;
 				}
 				break;
 
 
 			case GM_SAVE_INSTANCE_NAME: {
-				// If we don't know yet what type of server we're talking
-				// to (e.g. all pings have failed because the server's
-				// down), we have to wait here, as that affects how we'll
-				// submit the job.
 				if ( condorState == REMOVED || condorState == HELD ) {
 					gmState = GM_CLEAR_REQUEST;
 					break;
@@ -493,9 +483,7 @@ void GCEJob::doEvaluateState()
 					SetInstanceName(build_instance_name().c_str());
 				}
 
-				jobAd->GetDirtyFlag( ATTR_GRID_JOB_ID, &attr_exists, &attr_dirty );
-
-				if ( attr_exists && attr_dirty ) {
+				if ( jobAd->IsAttributeDirty( ATTR_GRID_JOB_ID ) ) {
 					requestScheddUpdate( this, true );
 					break;
 				}
@@ -511,6 +499,12 @@ void GCEJob::doEvaluateState()
 				// dcloudjob.
 				if ( numSubmitAttempts >= MAX_SUBMIT_ATTEMPTS ) {
 					gmState = GM_HOLD;
+					break;
+				}
+
+				if ( ( condorState == REMOVED || condorState == HELD ) &&
+					 !gahp->pendingRequestIssued() ) {
+					gmState = GM_CLEAR_REQUEST;
 					break;
 				}
 
@@ -537,6 +531,7 @@ void GCEJob::doEvaluateState()
 					// gce_instance_insert() will check the input arguments
 					rc = gahp->gce_instance_insert( m_serviceUrl,
 													m_authFile,
+													m_account,
 													m_project,
 													m_zone,
 													m_instanceName,
@@ -544,6 +539,9 @@ void GCEJob::doEvaluateState()
 													m_image,
 													m_metadata,
 													m_metadataFile,
+													m_preemptible,
+													m_jsonFile,
+													m_labels,
 													instance_id );
 
 					if ( rc == GAHPCLIENT_COMMAND_NOT_SUBMITTED ||
@@ -553,18 +551,6 @@ void GCEJob::doEvaluateState()
 
 					lastSubmitAttempt = time(NULL);
 
-					if ( rc != 0 &&
-						 gahp_error_code == "NEED_CHECK_VM_START" ) {
-						// get an error code from gahp server said that we should check if
-						// the VM has been started successfully in EC2
-
-						// Maxmium retry times is 3, if exceeds this limitation, we fall through
-						if ( m_retry_times++ < maxRetryTimes ) {
-							gmState = GM_START_VM;
-						}
-						break;
-					}
-
 					if ( rc == 0 ) {
 
 						ASSERT( instance_id != "" );
@@ -573,12 +559,6 @@ void GCEJob::doEvaluateState()
 
 						gmState = GM_SAVE_INSTANCE_ID;
 
-					} else if ( gahp_error_code == "InstanceLimitExceeded" ) {
-						// meet the resource limitation (maximum 20 instances)
-						// should retry this command later
-						myResource->CancelSubmit( this );
-						daemonCore->Reset_Timer( evaluateStateTid,
-												 submitInterval );
 					 } else {
 						errorString = gahp->getErrorString();
 						dprintf(D_ALWAYS,"(%d.%d) job submit failed: %s: %s\n",
@@ -606,9 +586,7 @@ void GCEJob::doEvaluateState()
 
 			case GM_SAVE_INSTANCE_ID:
 
-				jobAd->GetDirtyFlag( ATTR_GRID_JOB_ID,
-									 &attr_exists, &attr_dirty );
-				if ( attr_exists && attr_dirty ) {
+				if ( jobAd->IsAttributeDirty( ATTR_GRID_JOB_ID ) ) {
 					// Wait for the instance id to be saved to the schedd
 					requestScheddUpdate( this, true );
 					break;
@@ -670,27 +648,14 @@ void GCEJob::doEvaluateState()
 				if ( condorState != HELD && condorState != REMOVED ) {
 					JobTerminated();
 					if ( condorState == COMPLETED ) {
-						jobAd->GetDirtyFlag( ATTR_JOB_STATUS,
-											 &attr_exists, &attr_dirty );
-						if ( attr_exists && attr_dirty ) {
+						if ( jobAd->IsAttributeDirty( ATTR_JOB_STATUS ) ) {
 							requestScheddUpdate( this, true );
 							break;
 						}
 					}
 				}
 
-				// TODO Need to delete instance!
-
-				myResource->CancelSubmit( this );
-				if ( condorState == COMPLETED || condorState == REMOVED ) {
-					gmState = GM_DELETE;
-				} else {
-					// Clear the contact string here because it may not get
-					// cleared in GM_CLEAR_REQUEST (it might go to GM_HOLD first).
-					SetInstanceId( NULL );
-					SetInstanceName( NULL );
-					gmState = GM_CLEAR_REQUEST;
-				}
+				gmState = GM_CANCEL;
 
 				break;
 
@@ -713,18 +678,18 @@ void GCEJob::doEvaluateState()
 				// TODO: Let our action here be dictated by the user preference
 				// expressed in the job ad.
 				if ( !m_instanceId.empty() && condorState != REMOVED
-					 && wantResubmit == 0 && doResubmit == 0 ) {
+					 && wantResubmit == false && doResubmit == 0 ) {
 					gmState = GM_HOLD;
 					break;
 				}
 
 				// Only allow a rematch *if* we are also going to perform a resubmit
 				if ( wantResubmit || doResubmit ) {
-					jobAd->EvalBool(ATTR_REMATCH_CHECK,NULL,wantRematch);
+					jobAd->LookupBool(ATTR_REMATCH_CHECK,wantRematch);
 				}
 
 				if ( wantResubmit ) {
-					wantResubmit = 0;
+					wantResubmit = false;
 					dprintf(D_ALWAYS, "(%d.%d) Resubmitting to Globus because %s==TRUE\n",
 						procID.cluster, procID.proc, ATTR_GLOBUS_RESUBMIT_CHECK );
 				}
@@ -760,7 +725,7 @@ void GCEJob::doEvaluateState()
 						procID.cluster, procID.proc, ATTR_REMATCH_CHECK );
 
 					// Set ad attributes so the schedd finds a new match.
-					int dummy;
+					bool dummy;
 					if ( jobAd->LookupBool( ATTR_JOB_MATCHED, dummy ) != 0 ) {
 						jobAd->Assign( ATTR_JOB_MATCHED, false );
 						jobAd->Assign( ATTR_CURRENT_HOSTS, 0 );
@@ -782,10 +747,7 @@ void GCEJob::doEvaluateState()
 				// through. However, since we registered update events the
 				// first time, requestScheddUpdate won't return done until
 				// they've been committed to the schedd.
-				const char *name;
-				ExprTree *expr;
-				jobAd->ResetExpr();
-				if ( jobAd->NextDirtyExpr(name, expr) ) {
+				if ( jobAd->dirtyBegin() != jobAd->dirtyEnd() ) {
 					requestScheddUpdate( this, true );
 					break;
 				}
@@ -824,188 +786,49 @@ void GCEJob::doEvaluateState()
 						JobRunning();
 					}
 
-					// dprintf( D_ALWAYS, "DEBUG: m_state_reason_code = %s (assuming 'NULL')\n", m_state_reason_code.c_str() );
-					if( ! m_state_reason_code.empty() ) {
-						// Send the user a copy of the reason code.
-						jobAd->Assign( ATTR_EC2_STATUS_REASON_CODE, m_state_reason_code.c_str() );
-						requestScheddUpdate( this, false );
-
-							//
-							// http://docs.amazonwebservices.com/AWSEC2/latest/APIReference/ApiReference-ItemType-StateReasonType.html
-							// defines the state [transition] reason codes.
-							//
-							// We consider the following reasons to be normal
-							// termination conditions:
-							//
-							// - Client.InstanceInitiatedShutdown
-							// - Client.UserInitiatedShutdown
-							// - Server.SpotInstanceTermination
-							//
-							// the last because the user will be able to ask
-							// Condor, via on_exit_remove (and the attribute
-							// updated above), to resubmit the job.
-							//
-							// We consider the following reasons to be abnormal
-							// termination conditions, and thus put the job
-							// on hold:
-							//
-							// - Server.InternalError
-							// - Server.InsufficientInstanceCapacity
-							// - Client.VolumeLimitExceeded
-							// - Client.InternalError
-							// - Client.InvalidSnapshot.NotFound
-							//
-							// The first three are likely to be transient; if
-							// the distinction becomes important, we can add
-							// it later.
-							//
-
-						if(
-							m_state_reason_code == "Client.InstanceInitiatedShutdown"
-						 || m_state_reason_code == "Client.UserInitiatedShutdown"
-						 || m_state_reason_code == "Server.SpotInstanceTermination" ) {
-							// Normal instance terminations are normal.
-						} else if(
-							m_state_reason_code == "purged" ) {
-							// This isn't normal, but if the job was purged,
-							// there's no reason to hold onto it.  Added this
-							// so that we wouldn't complain but still write
-							// purged as the EC2StatusReasonCode to the
-							// history file.
-						} else if(
-							m_state_reason_code == "Server.InternalError"
-						 || m_state_reason_code == "Server.InsufficientInstanceCapacity"
-						 || m_state_reason_code == "Client.VolumeLimitExceeded"
-						 || m_state_reason_code == "Client.InternalError"
-						 || m_state_reason_code == "Client.InvalidSnapshot.NotFound" ) {
-							// Put abnormal instance terminations on hold.
-							formatstr( errorString, "Abnormal instance termination: %s.", m_state_reason_code.c_str() );
-							dprintf( D_ALWAYS, "(%d.%d) %s\n", procID.cluster, procID.proc, errorString.c_str() );
-							gmState = GM_HOLD;
-							break;
-						} else {
-							// Treat all unrecognized reasons as abnormal.
-							formatstr( errorString, "Unrecognized reason for instance termination: %s.  Treating as abnormal.", m_state_reason_code.c_str() );
-							dprintf( D_ALWAYS, "(%d.%d) %s\n", procID.cluster, procID.proc, errorString.c_str() );
-							gmState = GM_HOLD;
-							break;
-						}
-					}
-
 					lastProbeTime = now;
 					gmState = GM_SUBMITTED;
 				}
 				break;
 
 			case GM_CANCEL:
+				// Delete the instance on the server. This can be due
+				// to the user running condor_rm/condor_hold or the
+				// the instance shutting down (job completion).
 
-				// Rather than duplicate code in the spot instance subgraph,
-				// just handle jobs with no corresponding instance here.
-				if( m_instanceId.empty() ) {
-					// Bypasses the polling delay in GM_CANCEL_CHECK.
-					probeNow = true;
-				} else {
-					rc = gahp->gce_instance_delete( m_serviceUrl,
-													m_authFile,
-													m_project,
-													m_zone,
-													m_instanceName );
+				rc = gahp->gce_instance_delete( m_serviceUrl,
+												m_authFile,
+												m_account,
+												m_project,
+												m_zone,
+												m_instanceName );
 
-					if ( rc == GAHPCLIENT_COMMAND_NOT_SUBMITTED ||
-						 rc == GAHPCLIENT_COMMAND_PENDING ) {
-						break;
-					}
-
-					if( rc != 0 ) {
-						if ( strstr( gahp->getErrorString(), "was not found" ) ) {
-							// The instance is gone. Don't wait in
-							// GM_CANCEL_CHECK for a bulk status update.
-							SetRemoteJobStatus( GCE_INSTANCE_TERMINATED );
-							remoteJobState = GCE_INSTANCE_TERMINATED;
-							probeNow = true;
-							gmState = GM_CANCEL_CHECK;
-							break;
-						}
-						errorString = gahp->getErrorString();
-						dprintf( D_ALWAYS, "(%d.%d) job cancel failed: %s: %s\n",
-								 procID.cluster, procID.proc,
-								 gahp_error_code.c_str(),
-								errorString.c_str() );
-						gmState = GM_HOLD;
-						break;
-					}
-
+				if ( rc == GAHPCLIENT_COMMAND_NOT_SUBMITTED ||
+					 rc == GAHPCLIENT_COMMAND_PENDING ) {
+					break;
 				}
 
-				gmState = GM_CANCEL_CHECK;
-				break;
+				if( rc != 0 && !strstr( gahp->getErrorString(), "was not found" ) ) {
+					errorString = gahp->getErrorString();
+					dprintf( D_ALWAYS, "(%d.%d) job cancel failed: %s: %s\n",
+							 procID.cluster, procID.proc,
+							 gahp_error_code.c_str(),
+							 errorString.c_str() );
+					gmState = GM_HOLD;
+					break;
+				}
 
-			case GM_CANCEL_CHECK:
-				// Wait for the job's state to change.  This should happen
-				// on the next poll, because the job is in an invalid state.
-				if( ! probeNow ) { break; }
-				probeNow = false;
-
-				// We cancel (terminate) a job for one of two reasons: it
-				// either entered one of the two semi-terminated states
-				// (STOPPED or SHUTOFF) of its own accord, or the job went
-				// on hold or was removed.
-				//
-				// In either case, we need to confirm that the cancel
-				// command succeeded.  However, since Amazon permits
-				// STOPPED instances to enter the TERMINATED state, we
-				// can, presuming the same for SHUTOFF instances, just
-				// retry until the instance becomes TERMINATED.  An
-				// instance that has been purged must have successfully
-				// terminated first, so we will treat it the same.
-				//
-				// All other states, therefore, will cause us to try
-				// terminating the instance again.
-				//
-				// Once we've successfully terminated the instance,
-				// we need to go to GM_DONE_SAVE for instances that were
-				// STOPPED or SHUTOFF, and either GM_DELETE or
-				// GM_CLEAR_REQUEST, depending on the condor state of the
-				// job, otherwise.
-				//
-
-				// TODO When do we see STOPPED? Do we have to do something
-				//   when we see this state?
-				if( remoteJobState == GCE_INSTANCE_TERMINATED ) {
-					if( m_was_job_completion ) {
-						gmState = GM_DONE_SAVE;
-					} else {
-						if( condorState == COMPLETED || condorState == REMOVED ) {
-							gmState = GM_DELETE;
-						} else {
-							// The job may run again, so clear the job state.
-							//
-							// (If a job is held and then released, the job
-							// could find its previous (terminated) instance
-							// and consider itself complete.)
-							//
-							// Clear the contact string here first because
-							// we may enter GM_HOLD before GM_CLEAR_REQUEST
-							// actually clears the request. (*sigh*)
-							myResource->CancelSubmit( this );
-							SetInstanceId( NULL );
-							SetInstanceName( NULL );
-							gmState = GM_CLEAR_REQUEST;
-						}
-					}
+				myResource->CancelSubmit( this );
+				if ( condorState == COMPLETED || condorState == REMOVED ) {
+					gmState = GM_DELETE;
 				} else {
-					if( m_retry_times++ < maxRetryTimes ) {
-						gmState = GM_CANCEL;
-					} else {
-						errorString = gahp->getErrorString();
-						dprintf( D_ALWAYS, "(%d.%d) job cancel did not succeed after %d tries, giving up.\n",
-								 procID.cluster, procID.proc, maxRetryTimes );
-						gmState = GM_HOLD;
-						break;
-					}
+					// Clear the contact string here because it may not get
+					// cleared in GM_CLEAR_REQUEST (it might go to GM_HOLD first).
+					SetInstanceId( NULL );
+					SetInstanceName( NULL );
+					gmState = GM_CLEAR_REQUEST;
 				}
 				break;
-
 
 			case GM_HOLD:
 				// Put the job on hold in the schedd.
@@ -1051,7 +874,8 @@ void GCEJob::doEvaluateState()
 				// If the bulk query found this job, it has an instance ID.
 				// (If the job had an instance ID before, we would be in
 				// an another state.)  Otherwise, the service doesn't know
-				// about this job, and we can remove it from the queue.
+				// about this job, and we can submit the job or let it
+				// leave the queue.
 				if( ! m_instanceId.empty() ) {
 					WriteGridSubmitEventToUserLog( jobAd );
 					gmState = GM_SAVE_INSTANCE_ID;
@@ -1139,7 +963,7 @@ void GCEJob::GCESetRemoteJobId( const char *instance_name, const char *instance_
 		formatstr( full_job_id, "gce %s %s", m_serviceUrl.c_str(), instance_name );
 		if ( instance_id && instance_id[0] ) {
 			// We need this to do bulk status queries.
-			myResource->jobsByInstanceID.insert( HashKey( instance_id ), this );
+			myResource->jobsByInstanceID.insert( instance_id, this );
 			formatstr_cat( full_job_id, " %s", instance_id );
 		}
 	}
@@ -1223,7 +1047,7 @@ void GCEJob::StatusUpdate( const char * instanceID,
 	// SetRemoteJobStatus() sets the last-update timestamp, but
 	// only returns true if the status has changed.
 	if( SetRemoteJobStatus( status ) ) {
-		remoteJobState = status;
+		remoteJobState = status ? status : "";
 		probeNow = true;
 		SetEvaluateState();
 	}

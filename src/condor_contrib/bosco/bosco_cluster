@@ -33,12 +33,6 @@ ssh_control_path="/tmp/bosco_ssh_control.%r@%h:%p"
 # Executables
 TR=tr
 
-if [ `uname` = Darwin ] ; then
-    MD5SUM=md5
-else
-    MD5SUM=md5sum
-fi
-
 usage()
 {
 cat << EOM
@@ -50,6 +44,7 @@ commands:
  -r|--remove [host]         Remove the installed cluster (first in list)
  -s|--status [host]         Get status of installed cluster
  -t|--test [host]           Test the installed cluster (all clusters)
+ -o|--override directory    Override the bosco installation with a directory structure
  -h|--help                  Show this help message
 
 Where host is user@fqdn.example.com
@@ -145,8 +140,9 @@ set_bosco_routing () {
         rm $dest_file 2>/dev/null
     else
         cat > $dest_file << EOF 
-grid_resource = $grid_res
-SUBMIT_EXPRS = grid_resource
+# Specifying a default grid_resource doesn't work in HTCondor 8.4.7+/8.5.5+
+#grid_resource = $grid_res
+#SUBMIT_EXPRS = grid_resource
 EOF
     fi
 }
@@ -267,6 +263,8 @@ ssh_find_remote () {
                        ;;
             redhat7*) echo "`$findplatform_path --url --force RH7`"
                        ;;
+            centos7*) echo "`$findplatform_path --url --force RH7`"
+                       ;;
             debian6*) echo "`$findplatform_path --url --force DEB6`"
                        ;;
             debian7*) echo "`$findplatform_path --url --force DEB7`"
@@ -353,8 +351,8 @@ add_cluster_to_list () {
     check_cluster_list2 $remote_host
     if [ $? -eq 0 ]; then
         tmpfile=`mktemp -t tmpclusterlist.XXXXXX`
-        sed "/entry=$remote_host max_queued=.*/d" $CLUSTERLIST_LOCATION > tmpfile
-        mv tmpfile $CLUSTERLIST_LOCATION
+        sed "/entry=$remote_host max_queued=.*/d" $CLUSTERLIST_LOCATION > $tmpfile
+        mv $tmpfile $CLUSTERLIST_LOCATION
     fi
 
     echo "entry=$remote_host max_queued=$max_queued cluster_type=$cluster_type" >> $CLUSTERLIST_LOCATION
@@ -734,23 +732,21 @@ get_status () {
 }
 
 
+# TODO: a better syntax would be: bosco_cluster [options] [command [arguments]]
 # The getopt command line.  Using -a for alternate (allow options with only 1 '-')
-#if [ `uname` = "Darwin" ] ; then
-#    # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
-#    TEMP="$@"
-#else
-#    # GNU getopt :: for optional arguments - but would cause restrictions on how the optional argument is specified (=,no spaces)
-#    TEMP=`getopt -a -o a:ls:t:r:hp: --longoptions add:,platform:,list,status:,test:,remove:,help  -n 'bosco_cluster' -- "$@"`
-#
-#    if [ $? != 0 ]; then usage; echo "Terminating..." >&2; exit 1; fi
-#fi
-# a better syntax would be: bosco_cluster [options] [command [arguments]]
+if [ `uname` = "Darwin" ] ; then
+    # Mac OS X doesn't have GNU getopt, so not fancy argument checking here
+    TEMP="$@"
+else
+    TEMP=`getopt -a -o a:ls:t:r:hp:o: --longoptions add:,platform:,list,status:,test:,remove:,help,override:  -n 'bosco_cluster' -- "$@"`
 
-TEMP="$@"
+    if [ $? != 0 ]; then usage; echo "Terminating..." >&2; exit 1; fi
+fi
 
 eval set -- "$TEMP"
 
 platform_force=
+override_dir=
 
 # test and remove could have 0 or 1 parameter
 while true; do
@@ -766,6 +762,7 @@ while true; do
         -s|--status) get_status $2;  shift 2; exit 0 ;;
         -t|--test) test_cluster $2; exit 0 ;;
         -r|--remove) remove_cluster $2; exit 0;;
+        -o|--override) override_dir=$2; shift 2;;
         
         --) echo "No command found" >&2; usage; exit 1;;
         *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -794,9 +791,9 @@ else
     if [ "$cluster_type" == "htcondor" ]; then
         cluster_type="condor"
     fi
-    if [ ! "$cluster_type" == "pbs" -a ! "$cluster_type" == "lsf" -a ! "$cluster_type" == "sge" -a ! "$cluster_type" == "condor" ]; then
+    if [ ! "$cluster_type" == "pbs" -a ! "$cluster_type" == "lsf" -a ! "$cluster_type" == "sge" -a ! "$cluster_type" == "condor" -a ! "$cluster_type" == "slurm" ]; then
         echo "Unrecognized batch system: $1 (normalized: $cluster_type)"
-        echo "Please specify one of the following: pbs, lsf, sge, condor"
+        echo "Please specify one of the following: pbs, lsf, sge, condor, slurm"
         exit 1
     fi
 fi
@@ -814,8 +811,8 @@ fi
 
 # If the key doesn't exist, create it
 if [ ! -e $bosco_key ]; then
-    # Generate a md5sum password
-    PASSPHRASE=`echo $RANDOM$RANDOM$RANDOM$RANDOM | $MD5SUM | awk '{print $1}'`
+    # Generate a password
+    PASSPHRASE=`echo $RANDOM$RANDOM$RANDOM$RANDOM`
 
     # Output the password to a specially crafted file
     mkdir -p `dirname $PASSPHRASE_LOCATION`
@@ -913,7 +910,7 @@ if [ "x$url" == "x" ]; then
     # Attempt in a different way
     url=`ssh_find_remote $remote_host $findplatform_path`
     if [ "x$url" == "x" ]; then
-        echo "BOSCO is not supporting the remote platform."
+        echo "BOSCO does not support the remote host's OS."
         echo "Aborting installation to $remote_host."
         exit 1
     fi
@@ -988,6 +985,8 @@ LOG=\$ENV(HOME)/$remote_base_dir_host/glite/log
 FT_GAHP_LOG=\$(LOG)/FTGahpLog
 SEC_CLIENT_AUTHENTICATION_METHODS = FS, PASSWORD
 SEC_PASSWORD_FILE = \$ENV(HOME)/$remote_base_dir_host/glite/etc/passwdfile
+USE_SHARED_PORT = False
+ENABLE_URL_TRANSFERS = False
 EOF
 
 # A regular user cannot write on system files
@@ -1003,7 +1002,7 @@ if [ ! -n "$PRIVATE_ON_MU" ]; then
     fi
 
     if [ ! -e $bosco_passwd_file ]; then  
-        random_string=`echo $RANDOM | $MD5SUM | awk '{print $1}'` 
+        random_string=`echo $RANDOM`
         condor_store_cred -p $random_string -f $bosco_passwd_file 
     fi
 
@@ -1015,6 +1014,12 @@ if [ ! -n "$PRIVATE_ON_MU" ]; then
     fi 
     rsync -aq $bosco_passwd_file $local_install_dir/campus_factory/share/glidein_jobs 2>/dev/null
     rsync -aq $bosco_passwd_file $remote_glite_dir/etc 2>/dev/null
+fi
+
+# If patch is set, perform the patch
+if [ ! -z "${override_dir}" ]; then
+    echo "Patching bosco installation from directory: $override_dir"
+    rsync -aq $override_dir/ $local_install_dir
 fi
 
 # Do the actual rsync

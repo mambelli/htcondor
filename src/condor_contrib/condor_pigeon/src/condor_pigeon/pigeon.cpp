@@ -87,9 +87,9 @@ void Pigeon::initialize() {
   char* proc= param("QPID_EXEC");
   if (!proc) {
   	dprintf(D_ALWAYS, "You need to specify the QPID executable as QPID_EXEC in your condor config \n");
-  	EXCEPT("No qpid executable (QPID_EXEC) specified!\n");
+  	EXCEPT("No qpid executable (QPID_EXEC) specified!");
   }
-  const char *hostname = my_full_hostname() ;
+  MyString hostname = get_local_fqdn();
   
   ArgList arglist; 
   arglist.AppendArg("qpidd");
@@ -113,9 +113,9 @@ void Pigeon::initialize() {
   int fd_stdout = safe_open_wrapper(path, O_RDWR|O_CREAT, 0666);
   free(path);
   int fds[3] = {-1, fd_stdout, -1};
-  int mm_pid = daemonCore->Create_Process(proc,arglist,PRIV_CONDOR_FINAL, 0,FALSE,NULL,NULL,NULL,NULL,fds);
+  int mm_pid = daemonCore->Create_Process(proc,arglist,PRIV_CONDOR_FINAL, 0,FALSE,FALSE,NULL,NULL,NULL,NULL,fds);
   if (mm_pid <= 0) 
-    EXCEPT("Failed to launch qpid process using Create_Process.\n ");
+    EXCEPT("Failed to launch qpid process using Create_Process.");
 
   dprintf(D_ALWAYS, "Launched qpid process pid=%d \n", mm_pid);
   sleep(10);
@@ -132,7 +132,7 @@ void Pigeon::initialize() {
   SetMyTypeName(m_qpidAd, "pigeon");
   SetTargetTypeName(m_qpidAd, "");
   std::string hostAddr = "pigeon@";
-  hostAddr += hostname;
+  hostAddr += hostname.Value();
   m_qpidAd.Assign(ATTR_NAME, "pigeon"); //hostAddr.c_str());
   m_qpidAd.Assign("Key", "qpidKey");
   m_qpidAd.Assign("IP","128" );
@@ -156,9 +156,9 @@ void Pigeon::initialize() {
   	qArglist.AppendArg(proc);
   	qArglist.AppendArg(hostname);
   	qArglist.AppendArg(portStr.c_str());
-  	mm_pid = daemonCore->Create_Process(proc,qArglist,PRIV_CONDOR_FINAL, 0,FALSE,NULL,NULL,NULL,NULL);
+  	mm_pid = daemonCore->Create_Process(proc,qArglist,PRIV_CONDOR_FINAL, 0,FALSE,FALSE,NULL,NULL,NULL,NULL);
   	if (mm_pid <= 0) 
-		EXCEPT("Failed to launch declareQueues process using Create_Process.\n ");
+		EXCEPT("Failed to launch declareQueues process using Create_Process.");
     free(proc);
     free(execDir);
 	dprintf(D_ALWAYS, "QPID queues declared. \n");
@@ -206,7 +206,7 @@ int Pigeon::reaperResponse(int exit_pid, int exit_status) {
     initialize();
   }
   else if ( m_state != STATE_STOP_REQUESTED && exit_status != 0) {
-    EXCEPT("qpid daemon %d was killed unexpectedly\n", exit_pid);
+    EXCEPT("qpid daemon %d was killed unexpectedly", exit_pid);
   }
 
   m_state = STATE_NULL;
@@ -247,8 +247,8 @@ void Pigeon::stdoutHandler(int /*pipe*/) {
     int pos = m_line_stdout.FindChar('\n', 0);
     while (pos > 0) {                
       //Here we get a newline terminated string to process.
-      MyString line = m_line_stdout.Substr(0, pos-1);
-      m_line_stdout = m_line_stdout.Substr(pos+1, m_line_stdout.Length());
+      MyString line = m_line_stdout.substr(0, pos);
+      m_line_stdout = m_line_stdout.substr(pos+1, m_line_stdout.Length());
 
       if (line.find("START_AD") >= 0) {
         MyString adKey, adValue;
@@ -288,8 +288,8 @@ void Pigeon::stderrHandler(int /*pipe*/) {
     int pos = m_line_stderr.FindChar('\n', 0);
     while (pos > 0) {                
       //Here we get a newline terminated string to process.
-      MyString line = m_line_stderr.Substr(0, pos-1);
-      m_line_stderr = m_line_stderr.Substr(pos+1, m_line_stderr.Length());
+      MyString line = m_line_stderr.ubstr(0, pos);
+      m_line_stderr = m_line_stderr.substr(pos+1, m_line_stderr.Length());
       dprintf(D_ALWAYS, "STDERR: %s\n", line.Value());
       pos = m_line_stderr.FindChar('\n', 0);
     }

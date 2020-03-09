@@ -64,6 +64,8 @@ class VanillaProc : public OsProc
 public:
 	VanillaProc(ClassAd* jobAd);
 
+	virtual ~VanillaProc();
+
 		/** call OsProc::StartJob(), make a new ProcFamily with new
 			process as head. */
 	virtual int StartJob();
@@ -78,6 +80,8 @@ public:
 
 		/** Cass family->resume() */
 	virtual void Continue();
+
+	virtual bool Ckpt();
 
 		/** Take a family snapshot, call OsProc::ShutDownGraceful() */
 	virtual bool ShutdownGraceful();
@@ -96,11 +100,14 @@ public:
 		*/
 	virtual bool PublishUpdateAd( ClassAd* ad );
 
-	virtual bool SupportsPIDNamespace() { return true;}
-
 	virtual std::string CgroupSuffix() { return "";}
 
 	bool finishShutdownFast();
+
+protected:
+
+	virtual int outputOpenFlags();
+	virtual int streamingOpenFlags( bool isOutput );
 
 private:
 		/// Final usage stats for this proc and all its children.
@@ -115,14 +122,29 @@ private:
 
 	// Configure OOM killer for this job
 	int m_memory_limit; // Memory limit, in MB.
-	int m_oom_fd; // The file descriptor which recieves events
-	int m_oom_efd; // The event FD to watch
-	int setupOOMScore(int new_score);
+	int m_oom_fd; // The file descriptor which receives events
+	int m_oom_efd; // The event FD "pipe" to watch
+	int m_oom_efd2; // The other end of m_oom_efd.
+
+		// old kernels have /proc/self/oom_adj, newer /proc/self/oom_score_adj
+		// and the scales are different.
+	int setupOOMScore(int oom_adj, int oom_score_adj);
+	void cleanupOOM();
 	int outOfMemoryEvent(int fd);
 	int setupOOMEvent(const std::string & cgroup_string);
 
-	std::string m_pid_ns_init_filename;
+	std::string m_pid_ns_status_filename;
 
+	// Internal helper functions.
+	int pidNameSpaceReaper( int status );
+	void recordFinalUsage();
+	void killFamilyIfWarranted();
+	void notifySuccessfulEvictionCheckpoint();
+	void notifySuccessfulPeriodicCheckpoint();
+	void restartCheckpointedJob();
+
+	bool isCheckpointing;
+	bool isSoftKilling;
 };
 
 #endif

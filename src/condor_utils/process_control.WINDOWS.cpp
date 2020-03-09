@@ -155,7 +155,7 @@ windows_hard_kill(DWORD pid)
 // stupid hash function for DWORD (need by the hash tables
 // used in the suspend/contiunue code below)
 //
-static unsigned int
+static size_t
 hash_func(const DWORD& n)
 {
 	return n;
@@ -187,7 +187,7 @@ typedef HashTable<DWORD, SuspendedThread*> SuspendedProcess;
 // we keep track of all suspended processes via a hash table
 // keyed on process id
 //
-static HashTable<DWORD, SuspendedProcess*> suspended_processes(11, hash_func);
+static HashTable<DWORD, SuspendedProcess*> suspended_processes(hash_func);
 
 bool
 windows_suspend(DWORD pid)
@@ -198,7 +198,7 @@ windows_suspend(DWORD pid)
 	SuspendedProcess* sp;
 	int ret = suspended_processes.lookup(pid, sp);
 	ASSERT(ret == -1);
-	sp = new SuspendedProcess(11, hash_func);
+	sp = new SuspendedProcess(hash_func);
 	ASSERT(sp != NULL);
 	ret = suspended_processes.insert(pid, sp);
 	ASSERT(ret != -1);
@@ -216,7 +216,7 @@ windows_suspend(DWORD pid)
 
 		// get the list of threads for this process
 		//
-		ExtArray<DWORD> tid_array;
+		std::vector<DWORD> tid_array;
 		int num_tids = sys_info.GetTIDs(pid, tid_array);
 		if (num_tids == 0) {
 			// TODO: we need to handle this case!!!
@@ -227,7 +227,7 @@ windows_suspend(DWORD pid)
 
 		// go through the thread list, calling SuspendThread on each
 		//
-		for (int i = 0; i < num_tids; i++) {
+		for (size_t i = 0; i < tid_array.size(); i++) {
 
 			// see if we already have a record for this thread
 			//

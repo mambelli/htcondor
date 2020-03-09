@@ -40,12 +40,12 @@
 BEGIN_C_DECLS
 
 #ifdef WIN32
+#if _MSC_VER < 1900
+// these declarations added to the microsoft c-runtime in 2013
+#pragma warning(disable : 4273) // inconsistent dll linkage.
 int snprintf(char *str, size_t size, const char *format, ...);
-/**	Disable the warning about the number of formal parameters 
-	differing from a previous declaration */
-#pragma warning ( disable : 4273 ) // inconsistent dll linkage
 int __cdecl vsnprintf(char *str, size_t size, const char *format, va_list args);
-#pragma warning ( default : 4273 )
+#endif
 #endif
 
 int printf_length(const char *format, ...);

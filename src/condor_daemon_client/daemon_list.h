@@ -28,6 +28,7 @@
 #include "condor_query.h"
 
 
+class DCTokenRequester;
 class DCCollector;
 class CondorQuery;
 
@@ -76,6 +77,8 @@ public:
 	void deleteCurrent();
 	void DeleteCurrent();
 
+	bool shouldTryTokenRequest();
+
  protected:
 	SimpleList<Daemon*> list;
 
@@ -92,31 +95,53 @@ public:
 	DaemonList& operator = ( const DaemonList& );
 };
 
+class DCCollectorAdSequences;
 
 class CollectorList : public DaemonList {
  public:
-	CollectorList();
+	CollectorList(DCCollectorAdSequences * adseq=NULL);
 	virtual ~CollectorList();
 
 		// Create the list of collectors for the pool
 		// based on configruation settings
-	static CollectorList * create(const char * pool = NULL);
+	static CollectorList * create(const char * pool = NULL, DCCollectorAdSequences * adseq = NULL);
 
 		// Resort a collector list for locality (for negotiator)
 	int resortLocal( const char *preferred_collector );
 
 		// Send updates to all the collectors
 		// return - number of successfull updates
-	int sendUpdates (int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking);
+	int sendUpdates (int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking,
+		DCTokenRequester *token_requester = nullptr, const std::string &identity = "",
+		const std::string authz_name = "");
+
+		// use this to detach the ad sequence counters before destroying the collector list
+		// we do this when we want to move the sequence counters to a new list
+	DCCollectorAdSequences * detachAdSequences() { DCCollectorAdSequences * p = adSeq; adSeq = NULL; return p; }
+
+	bool hasAdSeq() { return adSeq != NULL; }
+	DCCollectorAdSequences & getAdSeq();
 	
 		// Try querying all the collectors until you get a good one
-	QueryResult query (CondorQuery & query, ClassAdList & adList, CondorError *errstack = 0);
+	QueryResult query (CondorQuery & cQuery, bool (*callback)(void*, ClassAd *), void* pv, CondorError * errstack = 0);
+
+		// a common case is just wanting a list of ads back, so provide a ready-made callback that does that...
+	static bool fetchAds_callback(void* pv, ClassAd * ad) {
+		ClassAdList * padList = (ClassAdList *)pv;
+		padList->Insert (ad);
+		return false;
+	}
+	QueryResult query (CondorQuery & cQuery, ClassAdList & adList, CondorError *errstack = 0) {
+		return query(cQuery, fetchAds_callback, &adList, errstack);
+	}
 
     bool next( DCCollector* &);
     bool Next( DCCollector* &);
     bool next( Daemon* &);
     bool Next( Daemon* &);
 
+private:
+	DCCollectorAdSequences * adSeq;
 };
 
 

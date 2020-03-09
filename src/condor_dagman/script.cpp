@@ -19,7 +19,6 @@
 
 
 #include "condor_common.h"
-#include "condor_string.h"
 
 #include "script.h"
 #include "util.h"
@@ -33,22 +32,26 @@
 extern DLL_IMPORT_MAGIC char **environ;
 
 //-----------------------------------------------------------------------------
-Script::Script( bool post, const char* cmd, Job* node ) :
+Script::Script( bool post, const char* cmd, int deferStatus, time_t deferTime,
+			Job* node ) :
     _post         (post),
     _retValScript (-1),
     _retValJob    (-1),
 	_pid		  (0),
 	_done         (FALSE),
+	_deferStatus  (deferStatus),
+	_deferTime    (deferTime),
+	_nextRunTime  (0),
 	_node         (node)
 {
 	ASSERT( cmd != NULL );
-    _cmd = strnewp (cmd);
+    _cmd = strdup (cmd);
     return;
 }
 
 //-----------------------------------------------------------------------------
 Script::~Script () {
-    delete [] _cmd;
+    free(_cmd);
     return;
 }
 
@@ -79,7 +82,7 @@ Script::BackgroundRun( int reaperId, int dagStatus, int failedCount )
     const char *delimiters = " \t";
     char * token;
 	ArgList args;
-    char * cmd = strnewp(_cmd);
+    char * cmd = strdup(_cmd);
     for (token = strtok (cmd,  delimiters) ; token != NULL ;
          token = strtok (NULL, delimiters)) {
 
@@ -89,10 +92,10 @@ Script::BackgroundRun( int reaperId, int dagStatus, int failedCount )
 			arg += _node->GetJobName();
 
 		} else if ( !strcasecmp( token, "$RETRY" ) ) {
-            arg += _node->GetRetries();
+            arg += IntToStr( _node->GetRetries() );
 
 		} else if ( !strcasecmp( token, "$MAX_RETRIES" ) ) {
-            arg += _node->GetRetryMax();
+            arg += IntToStr( _node->GetRetryMax() );
 
         } else if ( !strcasecmp( token, "$JOBID" ) ) {
 			if ( !_post ) {
@@ -101,9 +104,9 @@ Script::BackgroundRun( int reaperId, int dagStatus, int failedCount )
 				check_warning_strictness( DAG_STRICT_1 );
 				arg += token;
 			} else {
-            	arg += _node->GetCluster();
+				arg += IntToStr( _node->GetCluster() );
             	arg += '.';
-            	arg += _node->GetProc();
+				arg += IntToStr( _node->GetProc() );
 			}
 
         } else if (!strcasecmp(token, "$RETURN")) {
@@ -112,7 +115,7 @@ Script::BackgroundRun( int reaperId, int dagStatus, int failedCount )
 							"not be used as a PRE script argument!\n" );
 				check_warning_strictness( DAG_STRICT_1 );
 			}
-			arg += _retValJob;
+			arg += IntToStr( _retValJob );
 
 		} else if (!strcasecmp( token, "$PRE_SCRIPT_RETURN" ) ) {
 			if ( !_post ) {
@@ -120,13 +123,13 @@ Script::BackgroundRun( int reaperId, int dagStatus, int failedCount )
 						"not be used as a PRE script argument!\n" );
 				check_warning_strictness( DAG_STRICT_1 );
 			}
-			arg += _retValScript;
+			arg += IntToStr( _retValScript );
 
 		} else if (!strcasecmp(token, "$DAG_STATUS")) {
-			arg += dagStatus;
+			arg += IntToStr( dagStatus );
 
 		} else if (!strcasecmp(token, "$FAILED_COUNT")) {
-			arg += failedCount;
+			arg += IntToStr( failedCount );
 
 		} else if (token[0] == '$') {
 			// This should probably be a fatal error when -strict is
@@ -144,9 +147,9 @@ Script::BackgroundRun( int reaperId, int dagStatus, int failedCount )
     }
 
 	_pid = daemonCore->Create_Process( cmd, args,
-									   PRIV_UNKNOWN, reaperId, FALSE,
+									   PRIV_UNKNOWN, reaperId, FALSE, FALSE,
 									   NULL, NULL, NULL, NULL, NULL, 0 );
-    delete [] cmd;
+    free( cmd );
 
 	if ( !tmpDir.Cd2MainDir( errMsg ) ) {
 		debug_printf( DEBUG_QUIET,

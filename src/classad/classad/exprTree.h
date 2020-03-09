@@ -21,7 +21,7 @@
 #ifndef __CLASSAD_EXPR_TREE_H__
 #define __CLASSAD_EXPR_TREE_H__
 
-#include "classad/classad_stl.h"
+#include "classad/classad_containers.h"
 #include "classad/common.h"
 #include "classad/value.h"
 
@@ -43,11 +43,18 @@ class EvalState {
 
 		int depth_remaining; // max recursion depth - current depth
 
+		// Normally, rootAd will be the ClassAd at the root of the tree
+		// of ExprTrees in the current evaluation. That is, the parent
+		// scope whose parent scope is NULL.
+		// It can be set to a closer parent scope. Then that ClassAd is
+		// treated like it has no parent scope for LookupInScope() and
+		// Evaluate().
 		const ClassAd *rootAd;
 		const ClassAd *curAd;
 
 		bool		flattenAndInline;	// NAC
 		bool		debug;
+		bool		inAttrRefScope;
 
 		// Cache_to_free are the things in the cache that must be
 		// freed when this gets deleted. The problem is that we put
@@ -86,7 +93,7 @@ class ExprTree
 		};
 
 		/// Virtual destructor
-		virtual ~ExprTree ();
+		virtual ~ExprTree () {};
 
 		/** Sets the lexical parent scope of the expression, which is used to 
 				determine the lexical scoping structure for resolving attribute
@@ -101,9 +108,11 @@ class ExprTree
 		void SetParentScope( const ClassAd* p );
 
 		/** Gets the parent scope of the expression.
+			Some expressions (e.g. literals) don't know their parent
+			scope and always return NULL.
 		 	@return The parent scope of the expression.
 		*/
-		const ClassAd *GetParentScope( ) const { return( parentScope ); }
+		virtual const ClassAd *GetParentScope( ) const = 0;
 
 		/** Makes a deep copy of the expression tree
 		 * 	@return A deep copy of the expression, or NULL on failure.
@@ -124,12 +133,14 @@ class ExprTree
 		
 		/**
 		 * Return a ptr to the raw exprtree below the interface
-		 */ 
+		 */
+		SAL_Ret_notnull
 		virtual const ExprTree* self() const;
 
 		/* This version is for shared-library compatibility.
 		 * Remove it the next time we have to bump the ClassAds SO version.
 		 */
+		SAL_Ret_notnull
 		virtual const ExprTree* self();
 
 		/// A debugging method; send expression to stdout
@@ -163,12 +174,12 @@ class ExprTree
   	protected:
 		void debug_print(const char *message) const;
 		void debug_format_value(Value &value, double time=0) const;
-		ExprTree ();
+		ExprTree () {};
 
-        /** Fill in this ExprTree with the contents of the other ExprTree.
-         *  @return true if the copy succeeded, false otherwise.
-         */
-        void CopyFrom(const ExprTree &literal);
+		/** Fill in this ExprTree with the contents of the other ExprTree.
+		*  @return true if the copy succeeded, false otherwise.
+		*/
+		void CopyFrom(const ExprTree &) { }
 
 		bool Evaluate( Value& v, ExprTree*& t ) const;
 		bool Flatten( Value& val, ExprTree*& tree) const;
@@ -176,27 +187,20 @@ class ExprTree
 		bool Flatten( EvalState&, Value&, ExprTree*&, int* = NULL ) const;
 		bool Evaluate( EvalState &, Value &, ExprTree *& ) const;
 
-		const ClassAd	*parentScope;
-
 		enum {
 			EVAL_FAIL,
 			EVAL_OK,
 			EVAL_UNDEF,
-			PROP_UNDEF,
-			EVAL_ERROR,
-			PROP_ERROR
+			EVAL_ERROR
 		};
 
 
   	private: 
 		friend class Operation;
-#ifdef TJ_REFACTOR
-#else
 		friend class Operation1;
 		friend class Operation2;
 		friend class Operation3;
 		friend class OperationParens;
-#endif
 		friend class AttributeReference;
 		friend class FunctionCall;
 		friend class FunctionTable;
@@ -220,8 +224,6 @@ class ExprTree
 		// have the user set a function to call to debug classads
 		static void (*user_debug_function)(const char *);
 };
-
-std::ostream& operator<<(std::ostream &os, const ExprTree *expr);
 
 } // classad
 

@@ -155,18 +155,18 @@ typedef struct _AttribValue {
     // the value string.
     //
     static struct _AttribValue * Allocate(const char * pszAttr, const char * value) {
-        int cchValue = value ? strlen(value)+1 : 1;
-        int cchAttr  = strlen(pszAttr) + 1;
-        int cb = sizeof(struct _AttribValue) + cchValue + cchAttr;
+        size_t cchValue = value ? strlen(value)+1 : 1;
+        size_t cchAttr  = strlen(pszAttr) + 1;
+        size_t cb = sizeof(struct _AttribValue) + cchValue + cchAttr;
         struct _AttribValue * pav = (struct _AttribValue *)malloc(cb);
         if (pav) {
-            pav->cb = cb;
+            pav->cb = (int)cb;
             strcpy((char*)(pav+1), pszAttr);
             pav->pszAttr = (char*)(pav+1);
 
             pav->vtype = AttribValue_DataType_String;
-            pav->value.zstr.ix = sizeof(struct _AttribValue) + cchAttr;
-            pav->value.zstr.cb = cchValue;
+            pav->value.zstr.ix = (int)(sizeof(struct _AttribValue) + cchAttr);
+            pav->value.zstr.cb = (int)cchValue;
             if (value)
                strcpy(const_cast<char*>(pav->StringValue()), value);
             else
@@ -223,19 +223,20 @@ public:
 	void final_idle_dprintf();
 
 		// Functions to return the value of shared attributes
-	double			num_cpus()	{ return m_num_cpus; };
-	double			num_real_cpus()	{ return m_num_real_cpus; };
-	int				phys_mem()	{ return m_phys_mem; };
-	long long		virt_mem()	{ return m_virt_mem; };
-	float		load()			{ return m_load; };
-	float		condor_load()	{ return m_condor_load; };
-	time_t		keyboard_idle() { return m_idle; };
-	time_t		console_idle()	{ return m_console_idle; };
+	double			num_cpus()	const { return m_num_cpus; };
+	double			num_real_cpus()	const { return m_num_real_cpus; };
+	int				phys_mem()	const { return m_phys_mem; };
+	long long		virt_mem()	const { return m_virt_mem; };
+	float		load()			const { return m_load; };
+	float		condor_load()	const { return m_condor_load; };
+	time_t		keyboard_idle() const { return m_idle; };
+	time_t		console_idle()	const { return m_console_idle; };
 	const slotres_map_t& machres() const { return m_machres_map; }
 	const slotres_devIds_map_t& machres_devIds() const { return m_machres_devIds_map; }
 	const ClassAd& machres_attrs() const { return m_machres_attr; }
 	const char * AllocateDevId(const std::string & tag, int assign_to, int assign_to_sub);
 	bool         ReleaseDynamicDevId(const std::string & tag, const char * id, int was_assign_to, int was_assign_to_sub);
+	const char * DumpDevIds(std::string & buf, const char * tag = NULL, const char * sep = "\n");
 	//bool ReAssignDevId(const std::string & tag, const char * id, void * was_assigned_to, void * assign_to);
 
 private:
@@ -283,7 +284,6 @@ private:
 	char*			m_uid_domain;
 	char*			m_filesystem_domain;
 	int				m_idle_interval; 	// for D_IDLE dprintf messages
-	char*			m_ckptpltfrm;
 	List<AttribValue> m_lst_static;     // list of user-specified static attributes
 
      	// temporary attributes for raw utsname info
@@ -360,8 +360,14 @@ public:
 	char const *executeDir() { return c_execute_dir.Value(); }
 	char const *executePartitionID() { return c_execute_partition_id.Value(); }
     const slotres_map_t& get_slotres_map() { return c_slotres_map; }
+    const slotres_devIds_map_t & get_slotres_ids_map() { return c_slotres_ids_map; }
     const MachAttributes* get_mach_attr() { return map; }
 
+	void init_total_disk(const CpuAttributes* r_attr) {
+		if (r_attr && (r_attr->c_execute_partition_id == c_execute_partition_id)) {
+			c_total_disk = r_attr->c_total_disk;
+		}
+	}
 	static void swap_attributes(CpuAttributes & attra, CpuAttributes & attrb, int flags);
 
 	CpuAttributes& operator+=( CpuAttributes& rhs);

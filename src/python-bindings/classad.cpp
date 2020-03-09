@@ -1,29 +1,25 @@
 
 // Note - pyconfig.h must be included before condor_common to avoid
 // re-definition warnings.
-# include <pyconfig.h>
+#include "python_bindings_common.h"
 #include <Python.h>
 #include <datetime.h>
 
+#ifdef WIN32
+#include <time.h>
+#endif
 #include <string>
 
 #include <classad/source.h>
 #include <classad/sink.h>
+#include <classad/jsonSink.h>
 #include <classad/classadCache.h>
 #include <classad/matchClassad.h>
 
 #include "classad_wrapper.h"
 #include "exprtree_wrapper.h"
 #include "old_boost.h"
-
-// http://docs.python.org/3/c-api/apiabiversion.html#apiabiversion
-#if PY_MAJOR_VERSION >= 3
-   #define PyInt_Check(op)  PyNumber_Check(op)
-   #define PyString_Check(op)  PyBytes_Check(op)
-#endif
-
-static classad::ExprTree*
-convert_python_to_exprtree(boost::python::object value);
+#include "classad_expr_return_policy.h"
 
 void
 ExprTreeHolder::init()
@@ -61,33 +57,88 @@ bool ExprTreeHolder::ShouldEvaluate() const
     {
         classad::CachedExprEnvelope *expr = static_cast<classad::CachedExprEnvelope*>(m_expr);
         return expr->get()->GetKind() == classad::ExprTree::LITERAL_NODE ||
-               expr->get()->GetKind() == classad::ExprTree::CLASSAD_NODE;
+               expr->get()->GetKind() == classad::ExprTree::CLASSAD_NODE ||
+               expr->get()->GetKind() == classad::ExprTree::EXPR_LIST_NODE;
     }
     return m_expr->GetKind() == classad::ExprTree::LITERAL_NODE ||
-           m_expr->GetKind() == classad::ExprTree::CLASSAD_NODE;
+           m_expr->GetKind() == classad::ExprTree::CLASSAD_NODE ||
+           m_expr->GetKind() == classad::ExprTree::EXPR_LIST_NODE;
 }
 
-class ScopeGuard
+long long ExprTreeHolder::toLong() const
 {
-public:
-    ScopeGuard(classad::ExprTree &expr, const classad::ClassAd *scope_ptr)
-       : m_orig(expr.GetParentScope()), m_expr(expr), m_new(scope_ptr)
-    {
-        if (m_new) m_expr.SetParentScope(scope_ptr);
+    classad::Value val;
+    const classad::ClassAd *origParent = m_expr->GetParentScope();
+    bool evalresult;
+    if (origParent) {
+        evalresult = m_expr->Evaluate(val);
+    } else {
+        classad::EvalState state;
+        evalresult = m_expr->Evaluate(state, val);
     }
-    ~ScopeGuard()
+    if (PyErr_Occurred()) {boost::python::throw_error_already_set();}
+    if (!evalresult)
     {
-        if (m_new) m_expr.SetParentScope(m_orig);
+        THROW_EX(TypeError, "Unable to evaluate expression");
     }
+    long long retInt;
+    std::string retStr;
+    if (val.IsNumber(retInt)) {return retInt;}
+    else if (val.IsStringValue(retStr)) {
+        errno = 0;
+        char *endptr;
+        long long val = strtoll(retStr.c_str(), &endptr, 10);
+        if (errno == ERANGE) {
+            if (val == LLONG_MIN) {THROW_EX(ValueError, "Underflow when converting to integer.");}
+            else {THROW_EX(ValueError, "Overflow when converting to integer.");}
+        }
+        if (endptr != (retStr.c_str() + retStr.size())) {
+            THROW_EX(ValueError, "Unable to convert string to integer.");
+        }
+        return val;
+    }
+    THROW_EX(ValueError, "Unable to convert expression to numeric type.");
+    return 0;  // Should never get here
+}
 
-private:
-    const classad::ClassAd *m_orig;
-    classad::ExprTree &m_expr;
-    const classad::ClassAd *m_new;
-    
-};
+double ExprTreeHolder::toDouble() const
+{
+    classad::Value val;
+    const classad::ClassAd *origParent = m_expr->GetParentScope();
+    bool evalresult;
+    if (origParent) {
+        evalresult = m_expr->Evaluate(val);
+    } else {
+        classad::EvalState state;
+        evalresult = m_expr->Evaluate(state, val);
+    }
+    if (PyErr_Occurred()) {boost::python::throw_error_already_set();}
+    if (!evalresult)
+    {   
+        THROW_EX(TypeError, "Unable to evaluate expression");
+    }   
+    double retDouble;
+    std::string retStr;
+    if (val.IsNumber(retDouble)) {return retDouble;}
+    else if (val.IsStringValue(retStr)) {
+        errno = 0;
+        char *endptr;
+        double val = strtod(retStr.c_str(), &endptr);
+        if (errno == ERANGE) {
+            // Any small value will indicate underflow.
+            if (fabs(val) < 1.0) {THROW_EX(ValueError, "Underflow when converting to integer.");}
+            else {THROW_EX(ValueError, "Overflow when converting to integer.");}
+        }
+        if (endptr != (retStr.c_str() + retStr.size())) {
+            THROW_EX(ValueError, "Unable to convert string to integer.");
+        }
+        return val;
+    }
+    THROW_EX(ValueError, "Unable to convert expression to numeric type.");
+    return 0;  // Should never get here
+}
 
-static boost::python::object
+boost::python::object
 convert_value_to_python(const classad::Value &value)
 {
     boost::python::object result;
@@ -104,23 +155,24 @@ convert_value_to_python(const classad::Value &value)
     classad_shared_ptr<classad::ExprList> exprlist;
     switch (value.GetType())
     {
+    case classad::Value::SCLASSAD_VALUE:
     case classad::Value::CLASSAD_VALUE:
-        value.IsClassAdValue(advalue);
+        (void) value.IsClassAdValue(advalue);
         wrap.reset(new ClassAdWrapper());
         wrap->CopyFrom(*advalue);
-        result = boost::python::object(wrap);
+        result = boost::python::dict(wrap);
         break;
     case classad::Value::BOOLEAN_VALUE:
-        value.IsBooleanValue(boolvalue);
+        (void) value.IsBooleanValue(boolvalue);
         obj = boolvalue ? Py_True : Py_False;
         result = boost::python::object(boost::python::handle<>(boost::python::borrowed(obj)));
         break;
     case classad::Value::STRING_VALUE:
-        value.IsStringValue(strvalue);
+        (void) value.IsStringValue(strvalue);
         result = boost::python::str(strvalue);
         break;
     case classad::Value::ABSOLUTE_TIME_VALUE:
-        value.IsAbsoluteTimeValue(atime);
+        (void) value.IsAbsoluteTimeValue(atime);
         // Note we don't use offset -- atime.secs is always in UTC, which is
         // what python wants for PyDateTime_FromTimestamp
         timestamp = boost::python::long_(atime.secs);
@@ -129,15 +181,15 @@ convert_value_to_python(const classad::Value &value)
         result = boost::python::object(boost::python::handle<>(obj));
         break;
     case classad::Value::INTEGER_VALUE:
-        value.IsIntegerValue(intvalue);
+        (void) value.IsIntegerValue(intvalue);
         result = boost::python::long_(intvalue);
         break;
     case classad::Value::RELATIVE_TIME_VALUE:
-        value.IsRelativeTimeValue(realvalue);
+        (void) value.IsRelativeTimeValue(realvalue);
         result = boost::python::object(realvalue);
         break;
     case classad::Value::REAL_VALUE:
-        value.IsRealValue(realvalue);
+        (void) value.IsRealValue(realvalue);
         result = boost::python::object(realvalue);
         break;
     case classad::Value::ERROR_VALUE:
@@ -159,7 +211,14 @@ convert_value_to_python(const classad::Value &value)
         {
             classad::ExprTree *exprTree = (*it)->Copy();
             ExprTreeHolder exprHolder(exprTree, true);
-            result.attr("append")(exprHolder);
+            if (exprHolder.ShouldEvaluate())
+            {
+                result.attr("append")(exprHolder.Evaluate());
+            }
+            else
+            {
+                result.attr("append")(exprHolder);
+            }
         }
         break;
     }
@@ -170,49 +229,65 @@ convert_value_to_python(const classad::Value &value)
     return result;
 }
 
-boost::python::object ExprTreeHolder::Evaluate(boost::python::object scope) const
-{
-    const ClassAdWrapper *scope_ptr = NULL;
-    boost::python::extract<ClassAdWrapper> ad_extract(scope);
-    ClassAdWrapper tmp_ad;
-    if (ad_extract.check())
-    {
-        tmp_ad = ad_extract();
-        scope_ptr = &tmp_ad;
-    }
+void
+ExprTreeHolder::eval( boost::python::object scope, classad::Value & value ) const {
+    // This MUST be a pointer.  Otherwise, the ClassAd destructor will
+    // run -- ClassAdWrapper is-a ClassAd, despite the name -- and cause
+    // value to point to garbage, if value was an attribute reference.
+    boost::python::extract<ClassAdWrapper *> scopeAd(scope);
 
-    if (!m_expr)
-    {
-        PyErr_SetString(PyExc_RuntimeError, "Cannot operate on an invalid ExprTree");
-        boost::python::throw_error_already_set();
-    }
-    classad::Value value;
-    const classad::ClassAd *origParent = m_expr->GetParentScope();
-    if (origParent || scope_ptr)
-    {
-        ScopeGuard guard(*m_expr, scope_ptr);
-        if (!m_expr->Evaluate(value))
-        {
-            PyErr_SetString(PyExc_TypeError, "Unable to evaluate expression");
-            boost::python::throw_error_already_set();
-        }
-    }
-    else
-    {
+    bool rv = false;
+    if( scopeAd.check() && scopeAd() != NULL ) {
+        const classad::ClassAd * originalScope = m_expr->GetParentScope();
+        m_expr->SetParentScope(scopeAd());
+        rv = m_expr->Evaluate(value);
+        m_expr->SetParentScope(originalScope);
+    } else if( m_expr->GetParentScope() ) {
+        rv = m_expr->Evaluate(value);
+    } else {
         classad::EvalState state;
-        if (!m_expr->Evaluate(state, value))
-        {
-            PyErr_SetString(PyExc_TypeError, "Unable to evaluate expression");
-            boost::python::throw_error_already_set();
-        }
+        rv = m_expr->Evaluate(state, value);
     }
+    if( PyErr_Occurred() ) { boost::python::throw_error_already_set(); }
+    if(! rv) { THROW_EX(TypeError, "Unable to evaluate expression" ); }
+}
+
+boost::python::object
+ExprTreeHolder::Evaluate(boost::python::object scope) const
+{
+    classad::Value value;
+    eval(scope, value);
     return convert_value_to_python(value);
+}
+
+ExprTreeHolder
+ExprTreeHolder::simplify(boost::python::object scope) const
+{
+    classad::Value * value = NULL;
+    classad::Literal * literal = classad::Literal::MakeUndefined(value);
+    eval(scope, *value);
+    ExprTreeHolder rv(literal, true);
+    return rv;
+}
+
+bool
+isKind(classad::ExprTree &expr, classad::ExprTree::NodeKind kind)
+{
+    return (expr.GetKind() == kind) || ((expr.GetKind() == classad::ExprTree::EXPR_ENVELOPE) && (static_cast<classad::CachedExprEnvelope&>(expr).get()->GetKind() == kind));
+}
+
+
+ExprTreeHolder
+ExprTreeHolder::subscript(boost::python::object input)
+{
+    classad::ExprTree *expr = convert_python_to_exprtree(input);
+    ExprTreeHolder holder(classad::Operation::MakeOperation(classad::Operation::SUBSCRIPT_OP, m_expr->Copy(), expr), true);
+    return holder;
 }
 
 boost::python::object ExprTreeHolder::getItem(boost::python::object input)
 {
-    if (m_expr->GetKind() == classad::ExprTree::EXPR_LIST_NODE ||
-        (m_expr->GetKind() == classad::ExprTree::EXPR_ENVELOPE && (static_cast<classad::CachedExprEnvelope*>(m_expr)->get()->GetKind() == classad::ExprTree::EXPR_LIST_NODE)))
+    if (isKind(*m_expr, classad::ExprTree::EXPR_LIST_NODE))
     {
         ssize_t idx = boost::python::extract<ssize_t>(input);
         std::vector<classad::ExprTree*> exprs;
@@ -236,23 +311,61 @@ boost::python::object ExprTreeHolder::getItem(boost::python::object input)
         if (holder.ShouldEvaluate()) { return holder.Evaluate(); }
         return boost::python::object(holder);
     }
-    else if (m_expr->GetKind() == classad::ExprTree::LITERAL_NODE ||
-        (m_expr->GetKind() == classad::ExprTree::EXPR_ENVELOPE && (static_cast<classad::CachedExprEnvelope*>(m_expr)->get()->GetKind() == classad::ExprTree::LITERAL_NODE)))
+    else if (isKind(*m_expr, classad::ExprTree::LITERAL_NODE))
     {
         return Evaluate()[input];
     }
     else
-    {
-        classad::ExprTree *expr = convert_python_to_exprtree(input);
-        ExprTreeHolder holder(classad::Operation::MakeOperation(classad::Operation::SUBSCRIPT_OP, m_expr->Copy(), expr));
-        return boost::python::object(holder);
+    {   // We need to evaluate first to see if we can subscript this expression.
+        classad::EvalState state;
+        classad::Value value;
+        if (!m_expr->Evaluate(state, value))
+        {
+            if (!PyErr_Occurred()) {PyErr_SetString(PyExc_RuntimeError, "Unable to evaluate expression");}
+            boost::python::throw_error_already_set();
+        }
+        classad::ExprList *listExpr = NULL;
+        if (value.IsStringValue())
+        {
+            return convert_value_to_python(value)[input];
+        }
+        else if (value.IsListValue(listExpr))
+        {
+            ExprTreeHolder holder(listExpr, true);
+            return holder.getItem(input);
+        }
+        else
+        {
+            THROW_EX(TypeError, "ClassAd expression is unsubscriptable.");
+        }
+        return boost::python::object();
     }
 }
 
 ExprTreeHolder
 ExprTreeHolder::apply_this_operator(classad::Operation::OpKind kind, boost::python::object obj) const
 {
-    classad::ExprTree *right = convert_python_to_exprtree(obj);
+    classad::ExprTree *right = nullptr;
+    try
+    {
+        right = convert_python_to_exprtree(obj);
+    }
+    catch (boost::python::error_already_set &)
+    {
+        if (PyErr_ExceptionMatches(PyExc_TypeError))
+        {
+                if (kind == classad::Operation::OpKind::EQUAL_OP || kind == classad::Operation::OpKind::IS_OP) {
+                    PyErr_Clear();
+                    ExprTreeHolder holder(classad::Literal::MakeBool(false));
+                    return holder;
+                } else if (kind == classad::Operation::OpKind::NOT_EQUAL_OP || kind == classad::Operation::OpKind::ISNT_OP) {
+                    PyErr_Clear();
+                    ExprTreeHolder holder(classad::Literal::MakeBool(true));
+                    return holder;
+                }
+        }
+        throw;
+    }
     classad::ExprTree *expr = classad::Operation::MakeOperation(kind, get(), right);
     ExprTreeHolder holder(expr);
     return holder;
@@ -276,7 +389,7 @@ ExprTreeHolder::apply_unary_operator(classad::Operation::OpKind kind) const
 }
 
 bool
-ExprTreeHolder::__nonzero__()
+ExprTreeHolder::__bool__()
 {
     boost::python::object result = Evaluate();
     boost::python::extract<classad::Value::ValueType> value_extract(result);
@@ -295,7 +408,7 @@ ExprTreeHolder::__nonzero__()
     return result;
 }
 
-std::string ExprTreeHolder::toRepr()
+std::string ExprTreeHolder::toRepr() const
 {
     if (!m_expr)
     {
@@ -309,7 +422,7 @@ std::string ExprTreeHolder::toRepr()
 }
 
 
-std::string ExprTreeHolder::toString()
+std::string ExprTreeHolder::toString() const
 {
     if (!m_expr)
     {
@@ -429,6 +542,7 @@ void ClassAdWrapper::update(boost::python::object source)
     }
 }
 
+
 boost::python::object ClassAdWrapper::Flatten(boost::python::object input) const
 {
     classad_shared_ptr<classad::ExprTree> expr(convert_python_to_exprtree(input));
@@ -444,10 +558,38 @@ boost::python::object ClassAdWrapper::Flatten(boost::python::object input) const
     }
     else
     {
-        ExprTreeHolder holder(output);
+        ExprTreeHolder holder(output, true);
         return boost::python::object(holder);
     }
 }
+
+boost::python::list ClassAdWrapper::externalRefs(boost::python::object input) const
+{
+    classad_shared_ptr<classad::ExprTree> expr(convert_python_to_exprtree(input));
+    classad::References refs;
+    if (!static_cast<const classad::ClassAd*>(this)->GetExternalReferences(expr.get(), refs, true))
+    {
+        THROW_EX(ValueError, "Unable to determine external references.");
+    }
+    boost::python::list results;
+    for (classad::References::const_iterator it = refs.begin(); it != refs.end(); it++) { results.append(*it); }
+    return results;
+}
+
+
+boost::python::list ClassAdWrapper::internalRefs(boost::python::object input) const
+{
+    classad_shared_ptr<classad::ExprTree> expr(convert_python_to_exprtree(input));
+    classad::References refs;
+    if (!static_cast<const classad::ClassAd*>(this)->GetInternalReferences(expr.get(), refs, true))
+    {
+        THROW_EX(ValueError, "Unable to determine external references.");
+    }
+    boost::python::list results;
+    for (classad::References::const_iterator it = refs.begin(); it != refs.end(); it++) { results.append(*it); }
+    return results;
+}
+
 
 bool ClassAdWrapper::matches(boost::python::object obj) const
 {
@@ -522,6 +664,8 @@ literal(boost::python::object value)
         {
             THROW_EX(ValueError, "Unable to convert expression to literal")
         }
+        ExprTreeHolder holder(expr, true);
+        return holder;
     }
     ExprTreeHolder holder(expr);
     return holder;
@@ -560,13 +704,123 @@ attribute(std::string name)
 {
     classad::ExprTree *expr;
     expr = classad::AttributeReference::MakeAttributeReference(NULL, name.c_str());
-    ExprTreeHolder holder(expr);
+    ExprTreeHolder holder(expr, true);
     return holder;
 }
 
-static classad::ExprTree*
+
+/**
+ * See if a given python function accepts an argument named `state`.
+ *
+ * We do this to determine whether a python-based classad function is able to
+ * accept the evaluation context (state).
+ *
+ * This function is likely a historical mistake.  I can think of no other case in
+ * python where the call is changed based on reflection of the target function.
+ * It has a few holes -- for example, it can only make this determination for
+ * functions implemented in Python (as it looks at the associated bytecode
+ * object).  It was done because so many users forgot to accept the state
+ * argument - and getting error messages out of ClassAds is so awkward.  We
+ * actually populate the `error` global - which is useless in multithreaded
+ * programs, but no one seems to look at this.  Python programmers expect
+ * exceptions -- but these can only be thrown when the ClassAd library is used
+ * inside a python interpreter.
+ */
+bool
+checkAcceptsState(boost::python::object pyFunc)
+{
+    // First, check all the named (positional) arguments.  Covers cases like:
+    //   def f1(arg1, arg2, state)
+    //   def f2(arg1, arg2=None, state={})
+    boost::python::object varnames = pyFunc.attr("__code__").attr("co_varnames");
+    ssize_t len = boost::python::extract<ssize_t>(pyFunc.attr("__code__").attr("co_argcount"));
+    for (int idx=0; idx<len; idx++)
+    {
+        std::string varname = boost::python::extract<std::string>(varnames[idx]);
+        if (varname == "state") {return true;}
+    }
+    // Next, check the flags to see if unnamed keywords are accepted.
+    // This is specified in the flags given to the code object.  Covers functions of the form
+    //    def f3(arg, **kw)
+    // The co_flags attribute is a bitmask; 0x08 indicates keyword arguments.
+    int flags = boost::python::extract<int>(pyFunc.attr("__code__").attr("co_flags"));
+    return (flags & 8) == 8;
+}
+
+
+static void
+pythonFunctionTrampoline_internal(const char *name, const classad::ArgumentList& args, classad::EvalState& state, classad::Value& result)
+{
+    boost::python::object pyFunc = py_import("classad").attr("_registered_functions")[name];
+    bool acceptState = checkAcceptsState(pyFunc);
+
+    boost::python::list pyArgs;
+    for (classad::ArgumentList::const_iterator it=args.begin(); it != args.end(); it++)
+    {
+        ExprTreeHolder holder(*it, false);
+        if (holder.ShouldEvaluate())
+        {
+            pyArgs.append(holder.Evaluate());
+        }
+        else
+        {
+            classad::ExprTree * exprTree = (*it)->Copy();
+            ExprTreeHolder myExpr(exprTree, true);
+            pyArgs.append(myExpr);
+        }
+    }
+
+    boost::python::dict pyKw;
+    if (acceptState && state.curAd)
+    {
+        boost::shared_ptr<ClassAdWrapper> wrapper(new ClassAdWrapper());
+        wrapper->CopyFrom(*(state.curAd));
+        pyKw["state"] = wrapper;
+    }
+
+    // the `apply` builtin is unavailable in python3; hack it with a lambda
+    boost::python::object pyResult = boost::python::eval("lambda f,a,kw: f(*a,**kw)")(pyFunc, pyArgs, pyKw);
+
+    classad::ExprTree* exprTreeResult = convert_python_to_exprtree(pyResult);
+    if (!exprTreeResult || !exprTreeResult->Evaluate(state, result))
+    {
+        THROW_EX(ValueError, "Unable to convert python function result to ClassAd value");
+    }
+}
+
+static bool
+pythonFunctionTrampoline(const char *name, const classad::ArgumentList& args, classad::EvalState& state, classad::Value& result)
+{
+    try
+    {
+        pythonFunctionTrampoline_internal(name, args, state, result);
+    }
+    catch (...) // If this is being invoked from python, this will *not* clear the python exception
+                // However, it does prevent an exception being thrown into the ClassAd code... which is not ready for it!
+    {
+        result.SetErrorValue();
+    }
+    return true;
+}
+
+void
+registerFunction(boost::python::object function, boost::python::object name)
+{
+    if (name.ptr() == Py_None)
+    {
+        name = function.attr("__name__");
+    }
+    std::string classadName = boost::python::extract<std::string>(name);
+    py_import("classad").attr("_registered_functions")[name] = function;
+    classad::FunctionCall::RegisterFunction(classadName, pythonFunctionTrampoline);
+}
+
+classad::ExprTree*
 convert_python_to_exprtree(boost::python::object value)
 {
+	if( value.ptr() == Py_None ) {
+		return classad::Literal::MakeUndefined();
+	}
     boost::python::extract<ExprTreeHolder&> expr_obj(value);
     if (expr_obj.check())
     {
@@ -596,7 +850,7 @@ convert_python_to_exprtree(boost::python::object value)
         classad::Value val; val.SetBooleanValue(cppvalue);
         return classad::Literal::MakeLiteral(val);
     }
-    if (PyString_Check(value.ptr()) || PyUnicode_Check(value.ptr()))
+    if (PyBytes_Check(value.ptr()) || PyUnicode_Check(value.ptr()))
     {
         std::string cppvalue = boost::python::extract<std::string>(value);
         classad::Value val; val.SetStringValue(cppvalue);
@@ -627,11 +881,9 @@ convert_python_to_exprtree(boost::python::object value)
         classad::abstime_t atime;
         boost::python::object timestamp = py_import("calendar").attr("timegm")(value.attr("timetuple")());
         // Determine the UTC offset; timetuple above is in local time, but timegm assumes UTC.
-        std::time_t current_time;
-        std::time(&current_time);
-        struct std::tm *timeinfo = std::localtime(&current_time);
-        long offset = timeinfo->tm_gmtoff;
-        atime.secs = boost::python::extract<time_t>(timestamp) - offset;
+        atime.secs = boost::python::extract<time_t>(timestamp);
+        int offset = classad::Literal::findOffset(atime.secs);
+        atime.secs -= offset;
         atime.offset = 0;
         classad::Value val; val.SetAbsoluteTimeValue(atime);
         return classad::Literal::MakeLiteral(val);
@@ -640,6 +892,36 @@ convert_python_to_exprtree(boost::python::object value)
     {
         boost::python::dict dict = boost::python::extract<boost::python::dict>(value);
         return new ClassAdWrapper(dict);
+    }
+    if (PyMapping_Check(value.ptr()))
+    {
+        PyObject *keys = PyMapping_Keys(value.ptr());
+        if (!keys) {
+            PyErr_Clear();
+        } else {
+            PyObject * iter = PyObject_GetIter(keys);
+            if (!iter) {
+                PyErr_Clear();
+            } else {
+                ClassAdWrapper *ad = new ClassAdWrapper();
+                while (true)
+                {
+                    PyObject *pyobj = PyIter_Next(iter);
+                    if (!pyobj) {break;}
+                    boost::python::object key_obj = boost::python::object(boost::python::handle<>(pyobj));
+                    std::string key_str = boost::python::extract<std::string>(key_obj);
+                    boost::python::object val = value[key_obj];
+                    classad::ExprTree *val_expr = convert_python_to_exprtree(val);
+                    ad->Insert(key_str, val_expr);
+                    // This _should_ be being called by key_obj.
+                    // Py_DECREF(pyobj);
+                }
+                Py_DECREF(iter);
+                Py_DECREF(keys);
+                return ad;
+            }
+            Py_DECREF(keys);
+        }
     }
     PyObject *py_iter = PyObject_GetIter(value.ptr());
     if (py_iter)
@@ -658,7 +940,7 @@ convert_python_to_exprtree(boost::python::object value)
     {
         PyErr_Clear();
     }
-    PyErr_SetString(PyExc_TypeError, "Unknown ClassAd value type.");
+    PyErr_SetString(PyExc_TypeError, "Unable to convert Python object to a ClassAd expression.");
     boost::python::throw_error_already_set();
     return NULL;
 }
@@ -674,7 +956,7 @@ void ClassAdWrapper::InsertAttrObject( const std::string &attr, boost::python::o
     return;
 }
 
-std::string ClassAdWrapper::toRepr()
+std::string ClassAdWrapper::toRepr() const
 {
     classad::ClassAdUnParser up;
     std::string ad_str;
@@ -683,7 +965,7 @@ std::string ClassAdWrapper::toRepr()
 }
 
 
-std::string ClassAdWrapper::toString()
+std::string ClassAdWrapper::toString() const
 {
     classad::PrettyPrint pp;
     std::string ad_str;
@@ -691,7 +973,7 @@ std::string ClassAdWrapper::toString()
     return ad_str;
 }
 
-std::string ClassAdWrapper::toOldString()
+std::string ClassAdWrapper::toOldString() const
 {
     classad::ClassAdUnParser pp;
     std::string ad_str;
@@ -699,6 +981,20 @@ std::string ClassAdWrapper::toOldString()
     pp.Unparse(ad_str, this);
     return ad_str;
 }
+
+std::string ClassAdWrapper::toJsonString() const
+{
+	classad::ClassAdJsonUnParser pp;
+	std::string ad_str;
+	pp.Unparse(ad_str, this);
+	return ad_str;
+}
+
+bool ClassAdWrapper::contains(const std::string & attr) const
+{
+	return Lookup(attr) != NULL;
+}
+
 
 AttrKeyIter ClassAdWrapper::beginKeys()
 {
@@ -732,6 +1028,11 @@ AttrItemIter ClassAdWrapper::endItems()
     return AttrItemIter(end());
 }
 
+
+boost::python::object ClassAdWrapper::items(boost::shared_ptr<ClassAdWrapper> ad)
+{
+    return boost::python::range<condor::tuple_classad_value_return_policy<boost::python::objects::default_iterator_call_policies>>(&ClassAdWrapper::beginItems, &ClassAdWrapper::endItems)(ad);
+}
 
 ClassAdWrapper::ClassAdWrapper() : classad::ClassAd() {}
 

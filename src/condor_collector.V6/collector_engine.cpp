@@ -26,18 +26,10 @@ extern "C" void event_mgr (void);
 #include "condor_classad.h"
 #include "condor_debug.h"
 #include "condor_config.h"
-#include "condor_network.h"
-#include "condor_io.h"
-#include "internet.h"
-#include "my_hostname.h"
-#include "condor_email.h"
 
 #include "condor_attributes.h"
 #include "condor_daemon_core.h"
-#include "file_sql.h"
 #include "classad_merge.h"
-
-extern FILESQL *FILEObj;
 
 //-------------------------------------------------------------
 
@@ -52,44 +44,40 @@ int 	engine_clientTimeoutHandler (Service *);
 int 	engine_housekeepingHandler  (Service *);
 
 CollectorEngine::CollectorEngine (CollectorStats *stats ) :
-	StartdAds     (GREATER_TABLE_SIZE, &adNameHashFunction),
-	StartdPrivateAds(GREATER_TABLE_SIZE, &adNameHashFunction),
-
-#ifdef HAVE_EXT_POSTGRESQL
-	QuillAds     (GREATER_TABLE_SIZE, &adNameHashFunction),
-#endif /* HAVE_EXT_POSTGRESQL */
-
-	ScheddAds     (GREATER_TABLE_SIZE, &adNameHashFunction),
-	SubmittorAds  (GREATER_TABLE_SIZE, &adNameHashFunction),
-	LicenseAds    (GREATER_TABLE_SIZE, &adNameHashFunction),
-	MasterAds     (GREATER_TABLE_SIZE, &adNameHashFunction),
-	StorageAds    (GREATER_TABLE_SIZE, &adNameHashFunction),
-	XferServiceAds(GREATER_TABLE_SIZE, &adNameHashFunction),
-	CkptServerAds (LESSER_TABLE_SIZE , &adNameHashFunction),
-	GatewayAds    (LESSER_TABLE_SIZE , &adNameHashFunction),
-	CollectorAds  (LESSER_TABLE_SIZE , &adNameHashFunction),
-	NegotiatorAds (LESSER_TABLE_SIZE , &adNameHashFunction),
-	HadAds        (LESSER_TABLE_SIZE , &adNameHashFunction),
-	LeaseManagerAds(LESSER_TABLE_SIZE , &adNameHashFunction),
-	GridAds       (LESSER_TABLE_SIZE , &adNameHashFunction),
-	GenericAds    (LESSER_TABLE_SIZE , &stringHashFunction)
+	StartdAds     (&adNameHashFunction),
+	StartdPrivateAds(&adNameHashFunction),
+	ScheddAds     (&adNameHashFunction),
+	SubmittorAds  (&adNameHashFunction),
+	LicenseAds    (&adNameHashFunction),
+	MasterAds     (&adNameHashFunction),
+	StorageAds    (&adNameHashFunction),
+	AccountingAds (&adNameHashFunction),
+	CkptServerAds (&adNameHashFunction),
+	GatewayAds    (&adNameHashFunction),
+	CollectorAds  (&adNameHashFunction),
+	NegotiatorAds (&adNameHashFunction),
+	HadAds        (&adNameHashFunction),
+	GridAds       (&adNameHashFunction),
+	GenericAds    (&hashFunction),
+	__self_ad__(0)
 {
 	clientTimeout = 20;
 	machineUpdateInterval = 30;
+	m_forwardInterval = machineUpdateInterval / 3;
+	m_forwardFilteringEnabled = false;
 	housekeeperTimerID = -1;
+
+	m_allowOnlyOneNegotiator = param_boolean("COLLECTOR_ALLOW_ONLY_ONE_NEGOTIATOR", false);
 
 	collectorStats = stats;
 	m_collector_requirements = NULL;
+	m_get_ad_options = 0;
 }
 
 
 CollectorEngine::
 ~CollectorEngine ()
 {
-#ifdef HAVE_EXT_POSTGRESQL
-	killHashTable (QuillAds);
-#endif /* HAVE_EXT_POSTGRESQL */
-
 	killHashTable (StartdAds);
 	killHashTable (StartdPrivateAds);
 	killHashTable (ScheddAds);
@@ -97,13 +85,12 @@ CollectorEngine::
 	killHashTable (LicenseAds);
 	killHashTable (MasterAds);
 	killHashTable (StorageAds);
+	killHashTable (AccountingAds);
 	killHashTable (CkptServerAds);
 	killHashTable (GatewayAds);
 	killHashTable (CollectorAds);
 	killHashTable (NegotiatorAds);
 	killHashTable (HadAds);
-	killHashTable (XferServiceAds);
-	killHashTable (LeaseManagerAds);
 	killHashTable (GridAds);
 	GenericAds.walk(killGenericHashTable);
 
@@ -151,6 +138,14 @@ CollectorEngine::setCollectorRequirements( char const *str, MyString &error_desc
 int CollectorEngine::
 scheduleHousekeeper (int timeout)
 {
+	// Are we filtering updates that we forward to the view collector?
+	std::string watch_list;
+	param(watch_list,"COLLECTOR_FORWARD_WATCH_LIST", "State,Cpus,Memory,IdleJobs,ClaimId,Capability,ClaimIdList,ChildClaimIds");
+	m_forwardWatchList.clearAll();
+	m_forwardWatchList.initializeFromString(watch_list.c_str());
+
+	m_forwardFilteringEnabled = param_boolean( "COLLECTOR_FORWARD_FILTERING", false );
+
 	// cancel outstanding housekeeping requests
 	if (housekeeperTimerID != -1)
 	{
@@ -163,6 +158,8 @@ scheduleHousekeeper (int timeout)
 
 	// set to new timeout interval
 	machineUpdateInterval = timeout;
+
+	m_forwardInterval = param_integer("COLLECTOR_FORWARD_INTERVAL", machineUpdateInterval / 3, 0);
 
 	// if timeout interval was non-zero (i.e., housekeeping required) ...
 	if (timeout > 0)
@@ -275,6 +272,7 @@ walkHashTable (AdTypes adType, int (*scanFunction)(ClassAd *))
 		return walkGenericTables(scanFunction);
 	} else if (ANY_AD == adType) {
 		return
+			AccountingAds.walk(scanFunction) &&
 			StorageAds.walk(scanFunction) &&
 			CkptServerAds.walk(scanFunction) &&
 			LicenseAds.walk(scanFunction) &&
@@ -284,13 +282,8 @@ walkHashTable (AdTypes adType, int (*scanFunction)(ClassAd *))
 			MasterAds.walk(scanFunction) &&
 			SubmittorAds.walk(scanFunction) &&
 			NegotiatorAds.walk(scanFunction) &&
-#ifdef HAVE_EXT_POSTGRESQL
-			QuillAds.walk(scanFunction) &&
-#endif
 			HadAds.walk(scanFunction) &&
 			GridAds.walk(scanFunction) &&
-			XferServiceAds.walk(scanFunction) &&
-			LeaseManagerAds.walk(scanFunction) &&
 			walkGenericTables(scanFunction);
 	}
 
@@ -317,12 +310,13 @@ walkHashTable (AdTypes adType, int (*scanFunction)(ClassAd *))
 	return 1;
 }
 
+
 CollectorHashTable *CollectorEngine::findOrCreateTable(MyString &type)
 {
 	CollectorHashTable *table=0;
 	if (GenericAds.lookup(type, table) == -1) {
 		dprintf(D_ALWAYS, "creating new table for type %s\n", type.Value());
-		table = new CollectorHashTable(LESSER_TABLE_SIZE , &adNameHashFunction);
+		table = new CollectorHashTable(&adNameHashFunction);
 		if (GenericAds.insert(type, table) == -1) {
 			dprintf(D_ALWAYS,  "error adding new generic hash table\n");
 			delete table;
@@ -333,40 +327,77 @@ CollectorHashTable *CollectorEngine::findOrCreateTable(MyString &type)
 	return table;
 }
 
+#ifdef PROFILE_RECEIVE_UPDATE
+collector_runtime_probe CollectorEngine_ruc_runtime;
+collector_runtime_probe CollectorEngine_ruc_getAd_runtime;
+collector_runtime_probe CollectorEngine_ruc_authid_runtime;
+collector_runtime_probe CollectorEngine_ruc_collect_runtime;
+collector_runtime_probe CollectorEngine_rucc_runtime;
+collector_runtime_probe CollectorEngine_rucc_validateAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_makeHashKey_runtime;
+collector_runtime_probe CollectorEngine_rucc_insertAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_updateAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_getPvtAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_insertPvtAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_updatePvtAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_repeatAd_runtime;
+collector_runtime_probe CollectorEngine_rucc_other_runtime;
+#endif
+
+
 ClassAd *CollectorEngine::
 collect (int command, Sock *sock, const condor_sockaddr& from, int &insert)
 {
 	ClassAd	*clientAd;
 	ClassAd	*rval;
 
+#ifdef PROFILE_RECEIVE_UPDATE
+	_condor_auto_accum_runtime<collector_runtime_probe> rt(CollectorEngine_ruc_runtime);
+	double rt_last = rt.begin;
+#endif
+
 		// Avoid lengthy blocking on communication with our peer.
 		// This command-handler should not get called until data
 		// is ready to read.
 	sock->timeout(1);
 
+	// get the ad
 	clientAd = new ClassAd;
 	if (!clientAd) return 0;
 
-	// get the ad
-	if( !getClassAd(sock, *clientAd) )
+	if( !getClassAdEx(sock, *clientAd, m_get_ad_options) )
 	{
-		dprintf (D_ALWAYS,"Command %d on Sock not follwed by ClassAd (or timeout occured)\n",
+		dprintf (D_ALWAYS,"Command %d on Sock not followed by ClassAd (or timeout occured)\n",
 				command);
 		delete clientAd;
 		sock->end_of_message();
 		return 0;
 	}
 
+#ifdef PROFILE_RECEIVE_UPDATE
+	double delta_time = rt.tick(rt_last);
+	CollectorEngine_ruc_getAd_runtime.Add(delta_time);
+#endif
+
 	// insert the authenticated user into the ad itself
 	const char* authn_user = sock->getFullyQualifiedUser();
 	if (authn_user) {
 		clientAd->Assign("AuthenticatedIdentity", authn_user);
+		clientAd->Assign("AuthenticationMethod", sock->getAuthenticationMethodUsed());
 	} else {
 		// remove it from the ad if it's not authenticated.
 		clientAd->Delete("AuthenticatedIdentity");
+		clientAd->Delete("AuthenticationMethod");
 	}
 
+#ifdef PROFILE_RECEIVE_UPDATE
+	CollectorEngine_ruc_authid_runtime.Add(rt.tick(rt_last));
+#endif
+
 	rval = collect(command, clientAd, from, insert, sock);
+#ifdef PROFILE_RECEIVE_UPDATE
+	CollectorEngine_ruc_collect_runtime.Add(rt.tick(rt_last));
+#endif
 
 	// Don't leak the ad on error!
 	if ( ! rval ) {
@@ -386,20 +417,25 @@ collect (int command, Sock *sock, const condor_sockaddr& from, int &insert)
 bool CollectorEngine::ValidateClassAd(int command,ClassAd *clientAd,Sock *sock)
 {
 
-	if( !m_collector_requirements ) {
+	if( !m_collector_requirements && (command != UPDATE_OWN_SUBMITTOR_AD)) {
 			// no need to do any of the following checks if the admin has
-			// not configured any COLLECTOR_REQUIREMENTS
+			// not configured any COLLECTOR_REQUIREMENTS and there aren't
+			// any mandatory checks.
 		return true;
 	}
 
 
 	char const *ipattr = NULL;
+	char const *check_owner = nullptr;
 	switch( command ) {
 	  case MERGE_STARTD_AD:
 	  case UPDATE_STARTD_AD:
 	  case UPDATE_STARTD_AD_WITH_ACK:
 		  ipattr = ATTR_STARTD_IP_ADDR;
 		  break;
+	  case UPDATE_OWN_SUBMITTOR_AD:
+		check_owner = ATTR_NAME;
+		// fallthrough
 	  case UPDATE_SCHEDD_AD:
 	  case UPDATE_SUBMITTOR_AD:
 		  ipattr = ATTR_SCHEDD_IP_ADDR;
@@ -410,9 +446,6 @@ bool CollectorEngine::ValidateClassAd(int command,ClassAd *clientAd,Sock *sock)
 	  case UPDATE_NEGOTIATOR_AD:
 		  ipattr = ATTR_NEGOTIATOR_IP_ADDR;
 		  break;
-	  case UPDATE_QUILL_AD:
-		  ipattr = ATTR_QUILL_DB_IP_ADDR;
-		  break;
 	  case UPDATE_COLLECTOR_AD:
 		  ipattr = ATTR_COLLECTOR_IP_ADDR;
 		  break;
@@ -422,18 +455,14 @@ bool CollectorEngine::ValidateClassAd(int command,ClassAd *clientAd,Sock *sock)
 	  case UPDATE_HAD_AD:
 	  case UPDATE_AD_GENERIC:
       case UPDATE_GRID_AD:
+	  case UPDATE_ACCOUNTING_AD:
+	  default:
 		  break;
-	default:
-		dprintf(D_ALWAYS,
-				"ERROR: Unexpected command %d from %s in ValidateClassAd()\n",
-				command,
-				sock->get_sinful_peer());
-		return false;
 	}
 
 	if(ipattr) {
-		MyString my_address;
-		MyString subsys_ipaddr;
+		std::string my_address;
+		std::string subsys_ipaddr;
 
 			// Some ClassAds contain two copies of the IP address,
 			// one named "MyAddress" and one named "<SUBSYS>IpAddr".
@@ -450,37 +479,62 @@ bool CollectorEngine::ValidateClassAd(int command,ClassAd *clientAd,Sock *sock)
 				        " IP addresses: %s=%s, %s=%s\n",
 				        COLLECTOR_REQUIREMENTS,
 				        (sock ? sock->get_sinful_peer() : "(NULL)"),
-				        ipattr, subsys_ipaddr.Value(),
-				        ATTR_MY_ADDRESS, my_address.Value());
+				        ipattr, subsys_ipaddr.c_str(),
+				        ATTR_MY_ADDRESS, my_address.c_str());
 				return false;
 			}
+		}
+	}
+		// Verify the owner matches the value in the specified attribute.
+	if (check_owner) {
+		const char *sock_owner = sock->getOwner();
+		if (!sock_owner || !*sock_owner || !strcmp(sock_owner, "unmapped")) {
+			return false;
+		}
+		std::string ad_owner;
+		if (!clientAd->EvaluateAttrString(check_owner, ad_owner)) {
+			return false;
+		}
+		auto at_sign = ad_owner.find("@");
+		if (at_sign != std::string::npos) {
+			ad_owner = ad_owner.substr(0, at_sign);
+		}
+		auto last_dot = ad_owner.find_last_of(".");
+		if (last_dot != std::string::npos) {
+			ad_owner = ad_owner.substr(last_dot+1);
+		}
+		if (strcmp(sock_owner, ad_owner.c_str())) {
+			return false;
 		}
 	}
 
 
 		// Now verify COLLECTOR_REQUIREMENTS
-	int collector_req_result = 0;
-	if( !m_collector_requirements->EvalBool(COLLECTOR_REQUIREMENTS,clientAd,collector_req_result) ) {
+	if( !m_collector_requirements ) {
+		return true;
+	}
+	bool collector_req_result = false;
+	if( !EvalBool(COLLECTOR_REQUIREMENTS,m_collector_requirements,clientAd,collector_req_result) ) {
 		dprintf(D_ALWAYS,"WARNING: %s did not evaluate to a boolean result.\n",COLLECTOR_REQUIREMENTS);
-		collector_req_result = 0;
+		collector_req_result = false;
 	}
 	if( !collector_req_result ) {
-		static int details_shown=0;
-		bool show_details = (details_shown<10) || IsFulldebug(D_FULLDEBUG);
-		dprintf(D_ALWAYS,"%s VIOLATION: requirements do not match ad from %s.%s\n",
+		if( IsDebugLevel(D_MACHINE) ) { // Is this still an optimization?
+			dprintf( D_MACHINE,
+				"%s VIOLATION: requirements do not match ad from %s.\n",
 				COLLECTOR_REQUIREMENTS,
-				sock ? sock->get_sinful_peer() : "(null)",
-				show_details ? " Contents of the ClassAd:" : " (turn on D_FULLDEBUG to see details)");
-		if( show_details ) {
-			details_shown += 1;
-			dPrintAd(D_ALWAYS, *clientAd);
+				sock ? sock->get_sinful_peer() : "(null)" );
+			}
+		if( IsDebugVerbose( D_MACHINE ) ) { // Is this still an optimization?
+			dPrintAd( D_MACHINE | D_VERBOSE, * clientAd );
 		}
-
 		return false;
 	}
 
 	return true;
 }
+
+bool   last_updateClassAd_was_insert;
 
 ClassAd *CollectorEngine::
 collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,Sock *sock)
@@ -492,23 +546,29 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 	HashString	hashString;
 	static int repeatStartdAds = -1;		// for debugging
 	ClassAd		*clientAdToRepeat = NULL;
+#ifdef PROFILE_RECEIVE_UPDATE
+	_condor_auto_accum_runtime<collector_runtime_probe> rt(CollectorEngine_rucc_runtime);
+	double rt_last = rt.begin;
+#endif
 
 	if (repeatStartdAds == -1) {
 		repeatStartdAds = param_integer("COLLECTOR_REPEAT_STARTD_ADS",0);
 	}
 
 	if( !ValidateClassAd(command,clientAd,sock) ) {
+	    insert = -4;
 		return NULL;
 	}
+
+#ifdef PROFILE_RECEIVE_UPDATE
+	CollectorEngine_rucc_validateAd_runtime.Add(rt.tick(rt_last));
+#endif
 
 	// mux on command
 	switch (command)
 	{
 	  case UPDATE_STARTD_AD:
 	  case UPDATE_STARTD_AD_WITH_ACK:
-#if defined(ADD_TARGET_SCOPING)
-		  clientAd->AddTargetRefs( TargetJobAttrs );
-#endif
 		if ( repeatStartdAds > 0 ) {
 			clientAdToRepeat = new ClassAd(*clientAd);
 		}
@@ -520,8 +580,18 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 			break;
 		}
 		hashString.Build( hk );
+
+#ifdef PROFILE_RECEIVE_UPDATE
+		CollectorEngine_rucc_makeHashKey_runtime.Add(rt.tick(rt_last));
+#endif
+
 		retVal=updateClassAd (StartdAds, "StartdAd     ", "Start",
 							  clientAd, hk, hashString, insert, from );
+
+#ifdef PROFILE_RECEIVE_UPDATE
+		if (last_updateClassAd_was_insert) { CollectorEngine_rucc_insertAd_runtime.Add(rt.tick(rt_last));
+		} else { CollectorEngine_rucc_updateAd_runtime.Add(rt.tick(rt_last)); }
+#endif
 
 		// if we want to store private ads
 		if (!sock)
@@ -535,7 +605,7 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 			{
 				EXCEPT ("Memory error!");
 			}
-			if( !getClassAd(sock, *pvtAd) )
+			if( !getClassAdEx(sock, *pvtAd, m_get_ad_options) )
 			{
 				dprintf(D_FULLDEBUG,"\t(Could not get startd's private ad)\n");
 				delete pvtAd;
@@ -553,16 +623,23 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 				// Negotiator matches up private ad with public ad by
 				// using the following.
 			if( retVal ) {
-				pvtAd->CopyAttribute( ATTR_MY_ADDRESS, retVal );
-				pvtAd->CopyAttribute( ATTR_NAME, retVal );
+				CopyAttribute( ATTR_MY_ADDRESS, *pvtAd, *retVal );
+				CopyAttribute( ATTR_NAME, *pvtAd, *retVal );
 			}
 
+#ifdef PROFILE_RECEIVE_UPDATE
+			CollectorEngine_rucc_getPvtAd_runtime.Add(rt.tick(rt_last));
+#endif
 
 			// insert the private ad into its hashtable --- use the same
 			// hash key as the public ad
 			(void) updateClassAd (StartdPrivateAds, "StartdPvtAd  ",
 								  "StartdPvt", pvtAd, hk, hashString, insPvt,
 								  from );
+#ifdef PROFILE_RECEIVE_UPDATE
+			if (last_updateClassAd_was_insert) { CollectorEngine_rucc_insertPvtAd_runtime.Add(rt.tick(rt_last));
+			} else { CollectorEngine_rucc_updatePvtAd_runtime.Add(rt.tick(rt_last)); }
+#endif
 		}
 
 		// create fake duplicates of this ad, each with a different name, if
@@ -573,12 +650,12 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 			int n;
 			char newname[150],oldname[130];
 			oldname[0] = '\0';
-			clientAdToRepeat->LookupString("Name",oldname,sizeof(oldname));
+			clientAdToRepeat->LookupString(ATTR_NAME,oldname,sizeof(oldname));
 			for (n=0;n<repeatStartdAds;n++) {
 				fakeAd = new ClassAd(*clientAdToRepeat);
 				snprintf(newname,sizeof(newname),
-						 "Name=\"fake%d-%s\"",n,oldname);
-				fakeAd->Insert(newname);
+						 "fake%d-%s",n,oldname);
+				fakeAd->Assign(ATTR_NAME, newname);
 				makeStartdAdHashKey (hk, fakeAd);
 				hashString.Build( hk );
 				if (! updateClassAd (StartdAds, "StartdAd     ", "Start",
@@ -590,13 +667,13 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 			}
 			delete clientAdToRepeat;
 			clientAdToRepeat = NULL;
+#ifdef PROFILE_RECEIVE_UPDATE
+			CollectorEngine_rucc_repeatAd_runtime.Add(rt.tick(rt_last));
+#endif
 		}
 		break;
 
 	  case MERGE_STARTD_AD:
-#if defined(ADD_TARGET_SCOPING)
-		  clientAd->AddTargetRefs( TargetJobAttrs );
-#endif
 		if (!makeStartdAdHashKey (hk, clientAd))
 		{
 			dprintf (D_ALWAYS, "Could not make hashkey --- ignoring ad\n");
@@ -608,21 +685,6 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 		retVal=mergeClassAd (StartdAds, "StartdAd     ", "Start",
 							  clientAd, hk, hashString, insert, from );
 		break;
-
-#ifdef HAVE_EXT_POSTGRESQL
-	  case UPDATE_QUILL_AD:
-		if (!makeQuillAdHashKey (hk, clientAd))
-		{
-			dprintf (D_ALWAYS, "Could not make hashkey --- ignoring ad\n");
-			insert = -3;
-			retVal = 0;
-			break;
-		}
-		hashString.Build( hk );
-		retVal=updateClassAd (QuillAds, "QuillAd     ", "Quill",
-							  clientAd, hk, hashString, insert, from );
-		break;
-#endif /* HAVE_EXT_POSTGRESQL */
 
 	  case UPDATE_SCHEDD_AD:
 		if (!makeScheddAdHashKey (hk, clientAd))
@@ -637,6 +699,7 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 							  clientAd, hk, hashString, insert, from );
 		break;
 
+	  case UPDATE_OWN_SUBMITTOR_AD: // fallthrough
 	  case UPDATE_SUBMITTOR_AD:
 		// use the same hashkey function as a schedd ad
 		if (!makeScheddAdHashKey (hk, clientAd))
@@ -721,6 +784,19 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 							  clientAd, hk, hashString, insert, from );
 		break;
 
+	  case UPDATE_ACCOUNTING_AD:
+		if (!makeAccountingAdHashKey (hk, clientAd))
+		{
+			dprintf (D_ALWAYS, "Could not make hashkey --- ignoring ad\n");
+			insert = -3;
+			retVal = 0;
+			break;
+		}
+		hashString.Build( hk );
+		retVal=updateClassAd (AccountingAds, "AccountingAd  ", "Accouting",
+							  clientAd, hk, hashString, insert, from );
+		break;
+
 	  case UPDATE_NEGOTIATOR_AD:
 		if (!makeNegotiatorAdHashKey (hk, clientAd))
 		{
@@ -730,10 +806,12 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 			break;
 		}
 		hashString.Build( hk );
+		if (m_allowOnlyOneNegotiator) {
 			// first, purge all the existing negotiator ads, since we
 			// want to enforce that *ONLY* 1 negotiator is in the
 			// collector any given time.
-		purgeHashTable( NegotiatorAds );
+			purgeHashTable( NegotiatorAds );
+		}
 		retVal=updateClassAd (NegotiatorAds, "NegotiatorAd  ", "Negotiator",
 							  clientAd, hk, hashString, insert, from );
 		break;
@@ -783,7 +861,7 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 		  }
 		  if (!makeGenericAdHashKey (hk, clientAd))
 		  {
-			  dprintf(D_ALWAYS, "Could not make haskey --- ignoring ad\n");
+			  dprintf(D_ALWAYS, "Could not make hashkey --- ignoring ad\n");
 			  insert = -3;
 			  retVal = 0;
 			  break;
@@ -794,39 +872,6 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 		  break;
 	  }
 
-	  case UPDATE_XFER_SERVICE_AD:
-		if (!makeXferServiceAdHashKey (hk, clientAd))
-		{
-			dprintf (D_ALWAYS, "Could not make hashkey --- ignoring ad\n");
-			insert = -3;
-			retVal = 0;
-			break;
-		}
-		hashString.Build( hk );
-		retVal=updateClassAd (XferServiceAds, "XferServiceAd  ",
-							  "XferService",
-							  clientAd, hk, hashString, insert, from );
-		break;
-
-	  case UPDATE_LEASE_MANAGER_AD:
-		if (!makeLeaseManagerAdHashKey (hk, clientAd))
-		{
-			dprintf (D_ALWAYS, "Could not make hashkey --- ignoring ad\n");
-			insert = -3;
-			retVal = 0;
-			break;
-		}
-		hashString.Build( hk );
-			// first, purge all the existing LeaseManager ads, since we
-			// want to enforce that *ONLY* 1 manager is in the
-			// collector any given time.
-		purgeHashTable( LeaseManagerAds );
-		retVal=updateClassAd (LeaseManagerAds, "LeaseManagerAd  ",
-							  "LeaseManager",
-							  clientAd, hk, hashString, insert, from );
-		break;
-
-
 	  case QUERY_STARTD_ADS:
 	  case QUERY_SCHEDD_ADS:
 	  case QUERY_MASTER_ADS:
@@ -836,8 +881,6 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 	  case QUERY_COLLECTOR_ADS:
   	  case QUERY_NEGOTIATOR_ADS:
   	  case QUERY_HAD_ADS:
-  	  case QUERY_XFER_SERVICE_ADS:
-  	  case QUERY_LEASE_MANAGER_ADS:
 	  case QUERY_GENERIC_ADS:
 	  case INVALIDATE_STARTD_ADS:
 	  case INVALIDATE_SCHEDD_ADS:
@@ -847,8 +890,6 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 	  case INVALIDATE_COLLECTOR_ADS:
 	  case INVALIDATE_NEGOTIATOR_ADS:
 	  case INVALIDATE_HAD_ADS:
-	  case INVALIDATE_XFER_SERVICE_ADS:
-	  case INVALIDATE_LEASE_MANAGER_ADS:
 	  case INVALIDATE_ADS_GENERIC:
 		// these are not implemented in the engine, but we allow another
 		// daemon to detect that these commands have been given
@@ -861,6 +902,13 @@ collect (int command,ClassAd *clientAd,const condor_sockaddr& from,int &insert,S
 		insert = -1;
 		retVal = 0;
 	}
+
+#ifdef PROFILE_RECEIVE_UPDATE
+	if (command != UPDATE_STARTD_AD && command != UPDATE_STARTD_AD_WITH_ACK) {
+		CollectorEngine_rucc_other_runtime.Add(rt.tick(rt_last));
+	}
+#endif
+
 
 	// return the updated ad
 	return retVal;
@@ -900,7 +948,7 @@ int CollectorEngine::remove (AdTypes t_AddType, const ClassAd & c_query, bool *q
 	{
 		ClassAd * pAd=0;
 		// try to create a hk from the query ad if it is possible.
-		if ( (*makeKey) (hk, const_cast<ClassAd*>(&c_query)) ) {
+		if ( (*makeKey) (hk, &c_query) ) {
 			if( query_contains_hash_key ) {
 				*query_contains_hash_key = true;
 			}
@@ -925,7 +973,7 @@ int CollectorEngine::expire( AdTypes adType, const ClassAd & query, bool * query
     CollectorHashTable * hTable;
     if( LookupByAdType( adType, hTable, hFunc ) ) {
         AdNameHashKey hKey;
-        if( (* hFunc)( hKey, const_cast< ClassAd * >( & query ) ) ) {
+        if( (* hFunc)( hKey, & query ) ) {
             if( queryContainsHashKey ) { * queryContainsHashKey = true; }
 
             ClassAd * cAd = NULL;
@@ -965,8 +1013,15 @@ remove (AdTypes adType, AdNameHashKey &hk)
 	}
 	return !table->remove(hk);
 }
-	
-				
+
+void CollectorEngine::
+identifySelfAd(ClassAd * ad)
+{
+	__self_ad__ = (void*)ad;
+}
+
+extern bool   last_updateClassAd_was_insert;
+
 ClassAd * CollectorEngine::
 updateClassAd (CollectorHashTable &hashTable,
 			   const char *adType,
@@ -978,7 +1033,6 @@ updateClassAd (CollectorHashTable &hashTable,
 			   const condor_sockaddr& /*from*/ )
 {
 	ClassAd		*old_ad, *new_ad;
-	MyString	buf;
 	time_t		now;
 
 		// NOTE: LastHeardFrom will already be in ad if we are loading
@@ -990,21 +1044,24 @@ updateClassAd (CollectorHashTable &hashTable,
 		{
 			EXCEPT ("Error reading system time!");
 		}	
-		buf.formatstr( "%s = %d", ATTR_LAST_HEARD_FROM, (int)now);
-		ad->Insert ( buf.Value() );
+		ad->Assign(ATTR_LAST_HEARD_FROM, (int)now);
 	}
 
 	// this time stamped ad is the new ad
 	new_ad = ad;
+	last_updateClassAd_was_insert = false;
 
 	// check if it already exists in the hash table ...
 	if ( hashTable.lookup (hk, old_ad) == -1)
-    {	 	
+	{
 		// no ... new ad
+		last_updateClassAd_was_insert = true;
 		dprintf (D_ALWAYS, "%s: Inserting ** \"%s\"\n", adType, hashString.Value() );
 
-		// Update statistics
-		collectorStats->update( label, NULL, new_ad );
+		// Update statistics, but not for private ads we can't see
+		if (strcmp(label, "StartdPvt") != 0) {
+			collectorStats->update( label, NULL, new_ad );
+		}
 
 		// Now, store it away
 		if (hashTable.insert (hk, new_ad) == -1)
@@ -1014,6 +1071,10 @@ updateClassAd (CollectorHashTable &hashTable,
 		
 		insert = 1;
 		
+		if ( m_forwardFilteringEnabled && ( strcmp( label, "Start" ) == 0 || strcmp( label, "StartdPvt" ) == 0 || strcmp( label, "Submittor" ) == 0 ) ) {
+			new_ad->Assign( ATTR_LAST_FORWARDED, (int)time(NULL) );
+		}
+
 		return new_ad;
 	}
 	else
@@ -1022,7 +1083,9 @@ updateClassAd (CollectorHashTable &hashTable,
 		dprintf (D_FULLDEBUG, "%s: Updating ... \"%s\"\n", adType, hashString.Value() );
 
 		// Update statistics
-		collectorStats->update( label, old_ad, new_ad );
+		if (strcmp(label, "StartdPvt") != 0) {
+			collectorStats->update( label, old_ad, new_ad );
+		}
 
 		// Now, finally, store the new ClassAd
 		if (hashTable.remove(hk) == -1) {
@@ -1031,6 +1094,35 @@ updateClassAd (CollectorHashTable &hashTable,
 		if (hashTable.insert(hk, new_ad) == -1) {
 			EXCEPT( "Error inserting ad" );
 		}
+
+		if ( m_forwardFilteringEnabled && ( strcmp( label, "Start" ) == 0 || strcmp( label, "StartdPvt" ) == 0 || strcmp( label, "Submittor" ) == 0 ) ) {
+			bool forward = false;
+			int last_forwarded = 0;
+			old_ad->LookupInteger( "LastForwarded", last_forwarded );
+			if ( last_forwarded + m_forwardInterval < time(NULL) ) {
+				forward = true;
+			} else {
+				classad::Value old_val;
+				classad::Value new_val;
+				const char *attr;
+				m_forwardWatchList.rewind();
+				while ( (attr = m_forwardWatchList.next()) ) {
+					// This treats attribute-not-present and
+					// attribute-evaluates-to-UNDEFINED as equivalent.
+					if ( old_ad->EvaluateAttr( attr, old_val ) &&
+						 new_ad->EvaluateAttr( attr, new_val ) &&
+						 !new_val.SameAs( old_val ) )
+					{
+						forward = true;
+						break;
+					}
+				}
+			}
+			new_ad->Assign( ATTR_SHOULD_FORWARD, forward );
+			new_ad->Assign( ATTR_LAST_FORWARDED, forward ? (int)time(NULL) : last_forwarded );
+		}
+
+		if (isSelfAd(old_ad)) { __self_ad__ = new_ad; }
 
 		delete old_ad;
 
@@ -1104,11 +1196,6 @@ housekeeper()
 	dprintf (D_ALWAYS, "\tCleaning StartdPrivateAds ...\n");
 	cleanHashTable (StartdPrivateAds, now, makeStartdAdHashKey);
 
-#ifdef HAVE_EXT_POSTGRESQL
-	dprintf (D_ALWAYS, "\tCleaning QuillAds ...\n");
-	cleanHashTable (QuillAds, now, makeQuillAdHashKey);
-#endif /* HAVE_EXT_POSTGRESQL */
-
 	dprintf (D_ALWAYS, "\tCleaning ScheddAds ...\n");
 	cleanHashTable (ScheddAds, now, makeScheddAdHashKey);
 
@@ -1130,6 +1217,9 @@ housekeeper()
 	dprintf (D_ALWAYS, "\tCleaning StorageAds ...\n");
 	cleanHashTable (StorageAds, now, makeStorageAdHashKey);
 
+	dprintf (D_ALWAYS, "\tCleaning AccountingAds ...\n");
+	cleanHashTable (AccountingAds, now, makeAccountingAdHashKey);
+
 	dprintf (D_ALWAYS, "\tCleaning NegotiatorAds ...\n");
 	cleanHashTable (NegotiatorAds, now, makeNegotiatorAdHashKey);
 
@@ -1138,12 +1228,6 @@ housekeeper()
 
     dprintf (D_ALWAYS, "\tCleaning GridAds ...\n");
 	cleanHashTable (GridAds, now, makeGridAdHashKey);
-
-	dprintf (D_ALWAYS, "\tCleaning XferServiceAds ...\n");
-	cleanHashTable (XferServiceAds, now, makeXferServiceAdHashKey);
-
-	dprintf (D_ALWAYS, "\tCleaning LeaseManagerAds ...\n");
-	cleanHashTable (LeaseManagerAds, now, makeLeaseManagerAdHashKey);
 
 	dprintf (D_ALWAYS, "\tCleaning Generic Ads ...\n");
 	CollectorHashTable *cht;
@@ -1227,12 +1311,6 @@ CollectorEngine::LookupByAdType(AdTypes adType,
 			table = &StartdAds;
 			func = makeStartdAdHashKey;
 			break;
-#ifdef WANT_QUILL
-		case QUILL_AD:
-			table = &QuillAds;
-			func = makeQuillAdHashKey;
-			break;
-#endif /* WANT_QUILL */
 		case SCHEDD_AD:
 			table = &ScheddAds;
 			func = makeScheddAdHashKey;
@@ -1265,6 +1343,10 @@ CollectorEngine::LookupByAdType(AdTypes adType,
 			table = &StorageAds;
 			func = makeStorageAdHashKey;
 			break;
+		case ACCOUNTING_AD:
+			table = &AccountingAds;
+			func = makeAccountingAdHashKey;
+			break;
 		case NEGOTIATOR_AD:
 			table = &NegotiatorAds;
 			func = makeStorageAdHashKey; // XXX
@@ -1276,14 +1358,6 @@ CollectorEngine::LookupByAdType(AdTypes adType,
         case GRID_AD:
 			table = &GridAds;
 			func = makeGridAdHashKey;
-			break;
-		case XFER_SERVICE_AD:
-			table = &XferServiceAds;
-			func = makeXferServiceAdHashKey;
-			break;
-		case LEASE_MANAGER_AD:
-			table = &LeaseManagerAds;
-			func = makeLeaseManagerAdHashKey;
 			break;
 		default:
 			return false;
@@ -1325,5 +1399,5 @@ killGenericHashTable(CollectorHashTable *table)
 	ASSERT(table != NULL);
 	killHashTable(*table);
 	delete table;
-	return 0;
+	return 1;
 }

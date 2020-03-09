@@ -59,6 +59,7 @@ class GenericQuery
 	
 	// make the query expression
 	int makeQuery (ExprTree *&tree);
+	int makeQuery (MyString &expr);
 
 	// overloaded operators
     // friend ostream &operator<< (ostream &, GenericQuery &);  // display
@@ -87,7 +88,7 @@ class GenericQuery
     void clearStringCategory  (List<char> &);
     void clearIntegerCategory (SimpleList<int> &);
     void clearFloatCategory   (SimpleList<float> &);
-    void copyQueryObject      (GenericQuery &);
+    void copyQueryObject      (const GenericQuery &);
     void copyStringCategory   (List<char> &, List<char> &);
     void copyIntegerCategory  (SimpleList<int> &, SimpleList<int> &);
     void copyFloatCategory    (SimpleList<float>&, SimpleList<float>&);

@@ -3,7 +3,6 @@
 #define __EXPRTREE_WRAPPER_H_
 
 #include <classad/exprTree.h>
-#include <boost/python.hpp>
 
 #define THIS_OPERATOR(kind, pykind) \
 ExprTreeHolder __ ##pykind##__(boost::python::object right) const {return apply_this_operator(classad::Operation:: kind, right);}
@@ -25,15 +24,22 @@ struct ExprTreeHolder
 
     bool ShouldEvaluate() const;
 
-    boost::python::object Evaluate(boost::python::object scope=boost::python::object()) const;
+    boost::python::object Evaluate(
+        boost::python::object scope=boost::python::object() ) const;
+    ExprTreeHolder simplify(
+        boost::python::object scope=boost::python::object() ) const;
 
-    std::string toRepr();
+    std::string toRepr() const;
 
-    std::string toString();
+    std::string toString() const;
+
+    long long toLong() const;
+    double toDouble() const;
 
     classad::ExprTree *get() const;
 
     boost::python::object getItem(boost::python::object);
+    ExprTreeHolder subscript(boost::python::object);
 
     bool SameAs(ExprTreeHolder other) const { return m_expr->SameAs(other.m_expr); }
 
@@ -51,6 +57,7 @@ struct ExprTreeHolder
     THIS_ROPERATOR(SUBTRACTION_OP, sub)
     THIS_ROPERATOR(MULTIPLICATION_OP, mul)
     THIS_ROPERATOR(DIVISION_OP, div)
+    THIS_ROPERATOR(DIVISION_OP, truediv)
     THIS_ROPERATOR(MODULUS_OP, mod)
     THIS_OPERATOR(LOGICAL_AND_OP, land)
     THIS_OPERATOR(LOGICAL_OR_OP, lor)
@@ -64,11 +71,13 @@ struct ExprTreeHolder
     UNARY_OPERATOR(BITWISE_NOT_OP, invert)
     UNARY_OPERATOR(LOGICAL_NOT_OP, not)
 
-    bool __nonzero__();
+    bool __bool__();
 
     static void init();
 
 private:
+    void eval( boost::python::object scope, classad::Value & v ) const;
+
     classad::ExprTree *m_expr;
     boost::shared_ptr<classad::ExprTree> m_refcount;
     bool m_owns;

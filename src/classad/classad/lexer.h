@@ -78,10 +78,7 @@ class Lexer
 			LEX_OPEN_PAREN,
 			LEX_CLOSE_PAREN,
 			LEX_OPEN_BRACE,
-			LEX_CLOSE_BRACE,
-			LEX_BACKSLASH,
-			LEX_ABSOLUTE_TIME_VALUE,
-			LEX_RELATIVE_TIME_VALUE
+			LEX_CLOSE_BRACE
 		};
 
 		class TokenValue
@@ -93,9 +90,7 @@ class Lexer
 					intValue             = 0;
 					realValue            = 0.0;
 					boolValue            = false;
-					relative_secs        = 0;
-					absolute_secs.secs   = 0;
-					absolute_secs.offset = 0;
+					quotedExpr           = false;
 				}
 
 				~TokenValue( ) {
@@ -119,16 +114,11 @@ class Lexer
 					boolValue = b;
 				}
 
-				void SetStringValue( const std::string &str) {
+				void SetStringValue( const std::string &str ) {
 					strValue = str;
 				}
-
-				void SetAbsTimeValue( abstime_t asecs ) {
-					absolute_secs = asecs;
-				}
-
-				void SetRelTimeValue( double rsecs ) {
-					relative_secs = rsecs;
+				void SetQuotedExpr( bool quoted ) {
+					quotedExpr = quoted;
 				}
 
 				TokenType GetTokenType( ) {
@@ -151,14 +141,9 @@ class Lexer
 
 				void GetStringValue( std::string &str ) {
 					str = strValue;	
-				}	
-
-				void GetAbsTimeValue( abstime_t& asecs ) {
-					asecs = absolute_secs;
 				}
-
-				void GetRelTimeValue( double& rsecs ) {
-					rsecs = relative_secs;
+				void GetQuotedExpr( bool &quoted ) {
+					quoted = quotedExpr;
 				}
 
 				void CopyFrom( TokenValue &tv ) {
@@ -167,8 +152,7 @@ class Lexer
 					intValue = tv.intValue;
 					realValue = tv.realValue;
 					boolValue = tv.boolValue;
-					relative_secs = tv.relative_secs;
-					absolute_secs = tv.absolute_secs;
+					quotedExpr = tv.quotedExpr;
 					strValue = tv.strValue;
 				}
 					
@@ -178,9 +162,8 @@ class Lexer
 				long long			intValue;
 				double 				realValue;
 				bool 				boolValue;
+				bool				quotedExpr;
 				std::string			strValue;
-				double				relative_secs;
-				abstime_t           absolute_secs;
 		};
 
 		// ctor/dtor
@@ -193,12 +176,16 @@ class Lexer
         
         bool WasInitialized(void);
 
+		bool SetOldClassAdLex( bool do_old );
+		bool SetJsonLex( bool do_json );
+
 		// cleanup function --- purges strings from string space
 		void FinishedParse();
 		
 		// the 'extract token' functions
 		TokenType PeekToken( TokenValue* = 0 );
 		TokenType ConsumeToken( TokenValue* = 0 );
+		TokenType getLastTokenType() { return tokenType; } // return the type last token the lexer saw when it stopped.
 
 		// internal buffer for token accumulation
 		std::string lexBuffer;					    // the buffer itselfw
@@ -228,9 +215,10 @@ class Lexer
 		int    		markedPos;              	// index of marked character
 		char   		savedChar;          		// stores character when cut
 		int    		ch;                     	// the current character
-		unsigned int			lexBufferCount;				// current offset in lexBuffer
 		bool		inString;					// lexing a string constant
 		bool		accumulating;				// are we in a token?
+		bool		jsonLex;
+		bool		oldClassAdLex;
 		int 		debug; 						// debug flag
 
 		// cached last token
@@ -238,15 +226,17 @@ class Lexer
 		bool		tokenConsumed;				// has the token been consumed?
 
 		// internal lexing functions
-		void 		wind(void);					// consume character from source
+		void 		wind(bool fetch = true);	// consume character from source
 		void 		mark(void);					// mark()s beginning of a token
 		void 		cut(void);					// delimits token
+		void		fetch();					// fetch next character if ch is empty
 
 		// to tokenize the various tokens
 		int 		tokenizeNumber (void);		// integer or real
 		int 		tokenizeAlphaHead (void);	// identifiers/reserved strings
 		int 		tokenizePunctOperator(void);// punctuation and operators
 		int         tokenizeString(char delim);//string constants
+		int         tokenizeStringOld(char delim);//string constants
 };
 
 } // classad

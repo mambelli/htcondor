@@ -163,7 +163,7 @@ static void setup() {
 	if ( PATH_MAX >= 4096 ) {
 		long_dir_depth = 10;
 	} else {
-#if defined(AIX) || defined(Solaris)
+#if defined(Solaris)
 		long_dir_depth = 3;
 #else
 		long_dir_depth = 4;
@@ -183,6 +183,9 @@ static void setup() {
 		long_dir[i] = 'a';
 	}
 	long_dir[255] = '\0';
+#ifdef WIN32
+	long_dir[24] = 0;
+#endif
 	
 	//Create some non-existent files
 	cut_assert_gz( sprintf(non_existent, "DoesNotExist%c", DIR_DELIM_CHAR) );
@@ -223,6 +226,7 @@ static void setup() {
 
 static void cleanup() {
 	
+	cut_assert_z( chdir(original_dir.Value()) );
 	cut_assert_z( chdir(deep_dir.Value()) );
 
 	//Remove the directories

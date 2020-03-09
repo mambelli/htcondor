@@ -25,7 +25,6 @@
 #include "env.h"
 #include "condor_environ.h"
 #include "condor_daemon_core.h"
-#include "condor_string.h"
 #include "MyString.h"
 #include "condor_attributes.h"
 #include "condor_vm_universe_types.h"
@@ -106,7 +105,7 @@ unsigned __stdcall pipe_forward_thread(void *)
 #endif
 
 VMGahp::VMGahp(VMGahpConfig* config, const char* iwd)
-	: m_pending_req_table(20, &hashFuncInt)
+	: m_pending_req_table(&hashFuncInt)
 {
 	m_async_mode = true;
 	m_new_results_signaled = false;
@@ -287,8 +286,12 @@ VMGahp::addNewRequest(const char *cmd)
 	VMRequest *new_req = new VMRequest(cmd);
 	ASSERT(new_req);
 
-	m_pending_req_table.insert(new_req->m_reqid, new_req);
-	return new_req;
+	if ( m_pending_req_table.insert(new_req->m_reqid, new_req) == 0 ) {
+		return new_req;
+	} else {
+		delete new_req;
+		return NULL;
+	}
 }
 
 void
@@ -603,7 +606,11 @@ VMGahp::preExecuteCommand(const char* cmd, Gahp_Args *args)
 	} else {
 		VMRequest *new_req;
 		new_req = addNewRequest(cmd);
-		returnOutputSuccess();
+		if ( new_req ) {
+			returnOutputSuccess();
+		} else {
+			returnOutputError();
+		}
 		return new_req;
 	}
 	return NULL;
@@ -652,7 +659,7 @@ VMGahp::executeStart(VMRequest *req)
 		return;
 	}
 
-	MyString vmworkingdir;
+	std::string vmworkingdir;
 	if( m_jobAd->LookupString( "VM_WORKING_DIR", vmworkingdir) != 1 ) {
 		req->m_has_result = true;
 		req->m_is_success = false;
@@ -661,7 +668,7 @@ VMGahp::executeStart(VMRequest *req)
 		return;
 	}
 
-	MyString job_vmtype;
+	std::string job_vmtype;
 	if( m_jobAd->LookupString( ATTR_JOB_VM_TYPE, job_vmtype) != 1 ) {
 		req->m_has_result = true;
 		req->m_is_success = false;
@@ -671,12 +678,12 @@ VMGahp::executeStart(VMRequest *req)
 		return;
 	}
 
-	if(strcasecmp(vmtype, job_vmtype.Value()) != 0 ) {
+	if(strcasecmp(vmtype, job_vmtype.c_str()) != 0 ) {
 		req->m_has_result = true;
 		req->m_is_success = false;
 		req->m_result = VMGAHP_ERR_NO_SUPPORTED_VM_TYPE;
 		vmprintf(D_ALWAYS, "Argument is %s but VM_TYPE in job classAD "
-						"is %s\n", vmtype, job_vmtype.Value());
+						"is %s\n", vmtype, job_vmtype.c_str());
 		return;
 	}
 
@@ -692,18 +699,18 @@ VMGahp::executeStart(VMRequest *req)
 	// TBD: tstclair this totally needs to be re-written
 #if defined (HAVE_EXT_LIBVIRT) && !defined(VMWARE_ONLY)
 	if(strcasecmp(vmtype, CONDOR_VM_UNIVERSE_XEN) == 0 ) {
-		new_vm = new XenType( vmworkingdir.Value(), m_jobAd );
+		new_vm = new XenType( vmworkingdir.c_str(), m_jobAd );
 		ASSERT(new_vm);
 	}else if(strcasecmp(vmtype, CONDOR_VM_UNIVERSE_KVM) == 0) {
 	  new_vm = new KVMType(
-				vmworkingdir.Value(), m_jobAd);
+				vmworkingdir.c_str(), m_jobAd);
 		ASSERT(new_vm);
 	}else
 #endif
 	if(strcasecmp(vmtype, CONDOR_VM_UNIVERSE_VMWARE) == 0 ) {
 		new_vm = new VMwareType(m_gahp_config->m_prog_for_script.Value(),
 				m_gahp_config->m_vm_script.Value(),
-				vmworkingdir.Value(), m_jobAd);
+				vmworkingdir.c_str(), m_jobAd);
 		ASSERT(new_vm);
 	}else
 	  {
@@ -742,8 +749,7 @@ VMGahp::executeStart(VMRequest *req)
 		req->m_is_success = true;
 
 		// Result is set to a new vm_id
-		req->m_result = "";
-		req->m_result += new_vm->getVMId();
+		formatstr( req->m_result, "%d", new_vm->getVMId() );
 
 		addVM(new_vm);
 		vmprintf(D_FULLDEBUG, "executeStart success!\n");
@@ -937,7 +943,8 @@ VMGahp::executeStatus(VMRequest *req)
 	if(vm == NULL) {
 		req->m_has_result = true;
 		req->m_is_success = true;
-		req->m_result = "Stopped";
+		req->m_result = VMGAHP_STATUS_COMMAND_STATUS;
+		req->m_result += "=Stopped";
 		return;
 	}else {
 		int result = vm->Status();
@@ -981,8 +988,7 @@ VMGahp::executeGetpid(VMRequest *req)
 		req->m_is_success = true;
 
 		// Result is set to the pid of actual process for VM
-		req->m_result = "";
-		req->m_result += vm->PidOfVM();
+		formatstr( req->m_result, "%d", vm->PidOfVM() );
 		return;
 	}
 }
@@ -1053,27 +1059,13 @@ VMGahp::make_result_line(VMRequest *req)
 	if(req->m_is_success) {
 		// Success
 		// Format: <req_id> 0 <result string>
-		res_str += req->m_reqid;
-		res_str += " ";
-		res_str += 0;
-		res_str += " ";
-		if( req->m_result.Length() == 0) {
-			res_str += "NULL";
-		} else {
-			res_str += req->m_result.Value();
-		}
+		formatstr( res_str, "%d 0 %s", req->m_reqid,
+		           req->m_result.Length() ? req->m_result.Value() : "NULL" );
 	}else {
 		// Error
 		// Format: <req_id> 1 <result string>
-		res_str += req->m_reqid;
-		res_str += " ";
-		res_str += 1;
-		res_str += " ";
-		if( req->m_result.Length() == 0) {
-			res_str += "NULL";
-		} else {
-			res_str += req->m_result.Value();
-		}
+		formatstr( res_str, "%d 1 %s", req->m_reqid,
+		           req->m_result.Length() ? req->m_result.Value() : "NULL" );
 	}
 	return res_str.Value();
 }
@@ -1099,9 +1091,9 @@ VMGahp::killAllProcess()
 				CONDOR_VM_UNIVERSE_XEN ) == 0 ) {
 		priv_state priv = set_root_priv();
 		if( m_jobAd && XenType::checkXenParams(m_gahp_config) ) {
-			MyString vmname;
+			std::string vmname;
 			if( VMType::createVMName(m_jobAd, vmname) ) {
-				XenType::killVMFast(vmname.Value());
+				XenType::killVMFast(vmname.c_str());
 				vmprintf( D_FULLDEBUG, "killVMFast is called\n");
 			}
 		}
@@ -1110,9 +1102,9 @@ VMGahp::killAllProcess()
 			     CONDOR_VM_UNIVERSE_KVM ) == 0 ) {
 		priv_state priv = set_root_priv();
 		if( m_jobAd && KVMType::checkXenParams(m_gahp_config) ) {
-			MyString vmname;
+			std::string vmname;
 			if( VMType::createVMName(m_jobAd, vmname) ) {
-				KVMType::killVMFast(vmname.Value());
+				KVMType::killVMFast(vmname.c_str());
 				vmprintf( D_FULLDEBUG, "killVMFast is called\n");
 			}
 		}

@@ -141,7 +141,7 @@ DCTransferQueue::Init()
 	m_xfer_queue_pending = false;
 	m_xfer_queue_go_ahead = false;
 
-	m_last_report = 0;
+	timerclear( &m_last_report );
 	m_next_report = 0;
 	m_report_interval = 0;
 	m_recent_bytes_sent = 0;
@@ -214,6 +214,11 @@ DCTransferQueue::RequestTransferQueueSlot(bool downloading,filesize_t sandbox_si
 		if( timeout <= 0 ) {
 			timeout = 1;
 		}
+	}
+
+	if (IsDebugLevel(D_COMMAND)) {
+		int cmd = TRANSFER_QUEUE_REQUEST;
+		dprintf (D_COMMAND, "DCTransferQueue::RequestTransferQueueSlot(%s,...) making connection to %s\n", getCommandStringSafe(cmd), _addr ? _addr : "NULL");
 	}
 
 	bool connected = startCommand(
@@ -345,8 +350,8 @@ DCTransferQueue::PollForTransferQueueSlot(int timeout,bool &pending,MyString &er
 		int report_interval = 0;
 		if( msg.LookupInteger(ATTR_REPORT_INTERVAL,report_interval) ) {
 			m_report_interval = (unsigned)report_interval;
-			m_last_report.getTime();
-			m_next_report = m_last_report.seconds() + m_report_interval;
+			condor_gettimestamp( m_last_report );
+			m_next_report = m_last_report.tv_sec + m_report_interval;
 		}
 	}
 
@@ -418,9 +423,9 @@ void
 DCTransferQueue::SendReport(time_t now,bool disconnect)
 {
 	std::string report;
-	UtcTime now_usec;
-	now_usec.getTime();
-	long interval = now_usec.difference_usec(m_last_report);
+	struct timeval now_usec;
+	condor_gettimestamp( now_usec );
+	long interval = timersub_usec( now_usec, m_last_report );
 	if( interval < 0 ) {
 		interval = 0;
 	}
@@ -443,7 +448,9 @@ DCTransferQueue::SendReport(time_t now,bool disconnect)
 		}
 		if( disconnect ) {
 				// Tell the server we are done.
-			m_xfer_queue_sock->put("");
+			if (!m_xfer_queue_sock->put("")) {
+				dprintf(D_ALWAYS,"Failed to send disconnect request.\n");
+			}
 			m_xfer_queue_sock->end_of_message();
 		}
 	}

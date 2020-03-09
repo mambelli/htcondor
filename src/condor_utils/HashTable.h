@@ -38,6 +38,8 @@ class HashBucket {
 
 template <class Index, class Value> class HashTable;
 
+// Note that the HashIterator only works if both Index and Value are
+// pointer types or can be assigned the value NULL.  wenger 2017-03-08
 template< class Index, class Value >
 class HashIterator : std::iterator<std::input_iterator_tag, std::pair<Index, Value> >
 {
@@ -127,14 +129,6 @@ private:
 
 // a generic hash table class
 
-// various options for what we do when someone tries to insert a new
-// bucket with a key (index) that already exists in the table
-typedef enum {
-	allowDuplicateKeys,   // original (inarguably broken) default behavior
-	rejectDuplicateKeys,
-	updateDuplicateKeys,
-} duplicateKeyBehavior_t;
-
 // IMPORTANT NOTE: Index must be a class on which == works.
 
 template <class Index, class Value>
@@ -143,32 +137,16 @@ class HashTable {
   typedef HashIterator<Index, Value> iterator;
   friend class HashIterator<Index, Value>;
 
-    // the first constructor takes a tableSize that isn't used, it's left in
-	// for compatibility reasons
-  HashTable( int tableSize,
-			 unsigned int (*hashfcn)( const Index &index ),
-			 duplicateKeyBehavior_t behavior = allowDuplicateKeys );
-    // with this constructor, duplicateKeyBehavior_t is ALWAYS set to
-    // rejectDuplicateKeys.  To have it work like updateDuplicateKeys,
-    // use replace() instead of insert().
-  HashTable( unsigned int (*hashfcn)( const Index &index ));
-  void initialize( unsigned int (*hashfcn)( const Index &index ),
-			 duplicateKeyBehavior_t behavior );
+  HashTable( size_t (*hashfcn)( const Index &index ) );
   HashTable( const HashTable &copy);
   const HashTable& operator=(const HashTable &copy);
   ~HashTable();
 
-  int insert(const Index &index, const Value &value);
-  /*
-  Replace the old value with a new one.  Returns the old value, or NULL if it
-  didn't previously exist.
-  */
+  int insert(const Index &index, const Value &value, bool update = false);
   int lookup(const Index &index, Value &value) const;
   int lookup(const Index &index, Value* &value) const;
 	  // returns 0 if exists, -1 otherwise
   int exists(const Index &index) const;
-  int getNext(const Index &index, void *current, Value &value,
-	      void *&next) const;
   int remove(const Index &index);  
   int getNumElements( ) const { return numElems; }
   int getTableSize( ) const { return tableSize; }
@@ -178,6 +156,8 @@ class HashTable {
   int  iterate (Value &value);
   int  getCurrentKey (Index &index);
   int  iterate (Index &index, Value &value);
+  int  iterate_nocopy(const Index ** pindex, Value ** pvalue);
+  int  iterate_stats(int & ix_bucket, int & ix_item);
 
   iterator begin() {return iterator(this, 0);}
   iterator end() {return iterator(this, -1);}
@@ -206,11 +186,6 @@ class HashTable {
   Resize the hash table to the given size, or a default of the next (2^n)-1.
   */
   void resize_hash_table(int newsize = -1);
-  /*
-  Adds an item, ignoring the possibility of duplicates.  Used in insert() and
-  replace() internally.
-  */
-  int addItem(const Index &index, const Value &value);
 #ifdef DEBUGHASH
   void dump();                                  // dump contents of hash table
 #endif
@@ -218,9 +193,8 @@ class HashTable {
   int tableSize;                                // size of hash table
   int numElems; // number of elements in the hashtable
   HashBucket<Index, Value> **ht;                // actual hash table
-  unsigned int (*hashfcn)(const Index &index);  // user-provided hash function
+  size_t (*hashfcn)(const Index &index);  // user-provided hash function
   double maxLoadFactor;			// average number of elements per bucket list
-  duplicateKeyBehavior_t duplicateKeyBehavior;        // duplicate key behavior
   int currentBucket;
   HashBucket<Index, Value> *currentItem;
   std::vector<iterator*> activeIterators;
@@ -230,26 +204,7 @@ class HashTable {
 // In the first constructor, tableSz is ignored as it is no longer used, it is
 // left in for compatability reasons.
 template <class Index, class Value>
-HashTable<Index,Value>::HashTable( int /* tableSz */,
-								   unsigned int (*hashF)( const Index &index ),
-								   duplicateKeyBehavior_t behavior ) {
-	initialize(hashF, behavior);
-}
-
-template <class Index, class Value>
-HashTable<Index,Value>::HashTable( unsigned int (*hashF)( const Index &index )) {
-	initialize(hashF, rejectDuplicateKeys);
-}
-
-
-
-
-// Construct hash table. Allocate memory for hash table and
-// initialize its elements.
-
-template <class Index, class Value>
-void HashTable<Index,Value>::initialize( unsigned int (*hashF)( const Index &index ),
-								         duplicateKeyBehavior_t behavior ) {
+HashTable<Index,Value>::HashTable( size_t (*hashF)( const Index &index ) ) {
   int i;
 
   hashfcn = hashF;
@@ -258,7 +213,7 @@ void HashTable<Index,Value>::initialize( unsigned int (*hashF)( const Index &ind
 
   // You MUST specify a hash function.
   // Try hashFuncInt (int), hashFuncUInt (uint), hashFuncJobIdStr (string of "cluster.proc"),
-  // or MyStringHash (MyString)
+  // or hashFunction(<string type>)
   ASSERT(hashfcn != 0);
 
   // if the value for maxLoadFactor is negative or 0, use the default of 50
@@ -272,10 +227,9 @@ void HashTable<Index,Value>::initialize( unsigned int (*hashF)( const Index &ind
   for(i = 0; i < tableSize; i++) {
     ht[i] = NULL;
   }
-  currentBucket = -1;
-  currentItem = 0;
+  currentBucket = -1; // no current bucket
+  currentItem = 0; // no current item
   numElems = 0;
-  duplicateKeyBehavior = behavior;
 }
 
 // Copy constructor
@@ -365,63 +319,37 @@ void HashTable<Index,Value>::copy_deep( const HashTable<Index,Value>& copy ) {
   currentBucket = copy.currentBucket;
   numElems = copy.numElems;
   hashfcn = copy.hashfcn;
-  duplicateKeyBehavior = copy.duplicateKeyBehavior;
   maxLoadFactor = copy.maxLoadFactor;
 }
 
 // Insert entry into hash table mapping Index to Value.
-// Returns 0 if OK, -1 if rejectDuplicateKeys is set (the default for the
-// single-argument constructor) and the item already exists.
+// Returns 0 if OK, -1 if update is false (the default)
+// and the item already exists.
 
 template <class Index, class Value>
-int HashTable<Index,Value>::insert(const Index &index,const  Value &value)
+int HashTable<Index,Value>::insert(const Index &index,const  Value &value, bool update)
 {
-  int idx = (int)(hashfcn(index) % tableSize);
+  size_t idx = hashfcn(index) % tableSize;
 
   HashBucket<Index, Value> *bucket;
 
-  // if rejectDuplicateKeys is set and a bucket already exists in the
-  // table with this key, return -1
-
-  if ( duplicateKeyBehavior == rejectDuplicateKeys ) {
-	  bucket = ht[idx];
-	  while (bucket) {
-		  if (bucket->index == index) {
-			  // found!  return error because rejectDuplicateKeys is set
-			  return -1;
-		  }
-		  bucket = bucket->next;
-	  }
-  }
-
-  // if updateDuplicateKeys is set and a bucket already exists in the
-  // table with this key, update the bucket's value
-
-  else if( duplicateKeyBehavior == updateDuplicateKeys ) {
-
-    bucket = ht[idx];
-    while( bucket ) {
-      if( bucket->index == index ) {
+  bucket = ht[idx];
+  while( bucket ) {
+    if( bucket->index == index ) {
+      // This key is already in the table, decide what to do about that
+      if ( update ) {
+        //  update the value in the table
         bucket->value = value;
         return 0;
+      } else {
+        // reject as a duplicate
+        return -1;
       }
-      bucket = bucket->next;
     }
+    bucket = bucket->next;
   }
 
-  addItem(index, value);
-  return 0;
-}
-
-template <class Index, class Value>
-int HashTable<Index,Value>::addItem(const Index &index,const  Value &value) {
-  int idx = (int)(hashfcn(index) % tableSize);
-
-  HashBucket<Index, Value> *bucket;
-
-  // don't worry about whether a bucket already exists with this key,
-  // just go ahead and insert another one...
-
+  // This is a new key, add it
   if (!(bucket = new HashBucket<Index, Value>)) {
     EXCEPT("Insufficient memory");
   }
@@ -453,7 +381,7 @@ int HashTable<Index,Value>::lookup(const Index &index, Value &value) const
 	return -1;
   }
 
-  int idx = (int)(hashfcn(index) % tableSize);
+  size_t idx = hashfcn(index) % tableSize;
 
   HashBucket<Index, Value> *bucket = ht[idx];
   while(bucket) {
@@ -485,7 +413,7 @@ int HashTable<Index,Value>::lookup(const Index &index, Value* &value ) const
 	return -1;
   }
 
-  int idx = (int)(hashfcn(index) % tableSize);
+  size_t idx = hashfcn(index) % tableSize;
 
   HashBucket<Index, Value> *bucket = ht[idx];
   while(bucket) {
@@ -517,7 +445,7 @@ int HashTable<Index,Value>::exists(const Index &index) const
 	return -1;
   }
 
-  int idx = (int)(hashfcn(index) % tableSize);
+  size_t idx = hashfcn(index) % tableSize;
 
   HashBucket<Index, Value> *bucket = ht[idx];
   while(bucket) {
@@ -538,51 +466,13 @@ int HashTable<Index,Value>::exists(const Index &index) const
   return -1;
 }
 
-// A function which allows duplicate Indices to be retrieved
-// iteratively. The first match is returned in next if current
-// is NULL. Upon subsequent calls, caller should set
-// current = next before calling again. If Index not found,
-// returns -1.
-/*	This function doesn't appear to be used the the Condor sources,
-	no unit test written.
-*/
-template <class Index, class Value>
-int HashTable<Index,Value>::getNext(const Index &index, void *current,
-				    Value &value, void *&next) const
-{
-  HashBucket<Index, Value> *bucket;
-
-  if (!current) {
-    int idx = (int)(hashfcn(index) % tableSize);
-    bucket = ht[idx];
-  } else {
-    bucket = (HashBucket<Index, Value> *)current;
-    bucket = bucket->next;
-  }
-
-  while(bucket) {
-    if (bucket->index == index) {
-      value = bucket->value;
-      next = bucket;
-      return 0;
-    }
-    bucket = bucket->next;
-  }
-
-#ifdef DEBUGHASH
-  dump();
-#endif
-
-  return -1;
-}
-
 // Delete Index entry from hash table. Return OK (0) if index was found.
 // Else return -1.
 
 template <class Index, class Value>
 int HashTable<Index,Value>::remove(const Index &index)
 {
-  	int idx = (int)(hashfcn(index) % tableSize);
+  	size_t idx = hashfcn(index) % tableSize;
 
   	HashBucket<Index, Value> *bucket = ht[idx];
   	HashBucket<Index, Value> *prevBuc = ht[idx];
@@ -593,6 +483,9 @@ int HashTable<Index,Value>::remove(const Index &index)
 		{
       		if (bucket == ht[idx]) 
 			{
+				// The item we're deleting is the first one for
+				// this index.
+
 				ht[idx] = bucket->next;
 
 				// if the item being deleted is being iterated, ensure that
@@ -600,11 +493,16 @@ int HashTable<Index,Value>::remove(const Index &index)
 				if (bucket == currentItem)
 				{
 					currentItem = 0;
-					if (--currentBucket < 0) currentBucket = 0;
+						// -1 means no current bucket.  (Change here
+						// fixes gittrac #6177.  wenger 2017-03-16)
+					if (--currentBucket < 0) currentBucket = -1;
 				}
 			}
       		else
 			{
+				// The item we're deleting is NOT the first one for
+				// this index.
+
 				prevBuc->next = bucket->next;
 
 				// Again, take care of the iterator
@@ -677,7 +575,9 @@ template <class Index, class Value>
 void HashTable<Index,Value>::
 startIterations (void)
 {
+		// No current bucket.
     currentBucket = -1;
+		// No current item.
 	currentItem = 0;
 }
 
@@ -762,6 +662,77 @@ iterate (Index &index, Value &v)
 
 
 template <class Index, class Value>
+int HashTable<Index,Value>::
+iterate_nocopy (const Index **pindex, Value ** pv)
+{
+    // try to get next item in the current bucket chain ...
+    if (currentItem) {
+        currentItem = currentItem->next;
+    
+        // ... if successful, return OK
+        if (currentItem) {
+            *pindex = &currentItem->index;
+            *pv = &currentItem->value;
+            return 1;
+       }
+    }
+
+		// the current bucket chain is expended, so find the next non-NULL
+		// bucket and continue from there
+	do {
+		currentBucket++;
+		if (currentBucket >= tableSize) {
+			// end of hash table ... no more entries
+			currentBucket = -1;
+			currentItem = 0;
+
+			return 0;
+		}
+		currentItem = ht[currentBucket];
+	} while ( !currentItem );
+
+	*pindex = &currentItem->index;
+	*pv = &currentItem->value;
+	return 1;
+}
+
+// this iterator helps to gather statistics about the hashtable fill ratio
+template <class Index, class Value>
+int HashTable<Index,Value>::
+iterate_stats (int & ix_bucket, int & ix_item)
+{
+	// try to get next item in the current bucket chain ...
+	if (currentItem) {
+		currentItem = currentItem->next;
+
+		// ... if successful, return OK
+		if (currentItem) {
+			++ix_item;
+			return 1;
+		}
+	}
+
+		// the current bucket chain is expended, so find the next non-NULL
+		// bucket and continue from there
+	do {
+		currentBucket++;
+		if (currentBucket >= tableSize) {
+			// end of hash table ... no more entries
+			currentBucket = -1;
+			currentItem = 0;
+			ix_bucket = -1;
+			ix_item = tableSize;
+			return 0;
+		}
+		currentItem = ht[currentBucket];
+	} while ( !currentItem );
+
+	ix_bucket = currentBucket;
+	ix_item = 0;
+	return 1;
+}
+
+template <class Index, class Value>
 int HashTable<Index,Value>::walk( int (*walkfunc) ( Value value ) )
 {
 	HashBucket<Index,Value> *current;
@@ -820,7 +791,7 @@ void HashTable<Index, Value>::resize_hash_table(int newsize) {
 	HashBucket<Index, Value> *cur= NULL;
 	for( i=0; i<tableSize; i++ ) {
 		for( cur=ht[i]; cur; cur=temp ) {
-			int idx = (int)(hashfcn(cur->index) % newsize);
+			size_t idx = hashfcn(cur->index) % newsize;
 				// put it at htcopy[idx]
 				// if htcopy[idx] wasn't NULL then put whatever was there as its next value...
 				// if it was NULL then set current->next to NULL, so I guess just copy the value no matter what
@@ -858,24 +829,23 @@ void HashTable<Index,Value>::dump()
 #endif // DEBUGHASH
 
 /// basic hash function for an unpredictable integer key
-unsigned int hashFuncInt( const int& n );
+size_t hashFuncInt( const int& n );
 
 /// basic hash function for an unpredictable integer key
-unsigned int hashFuncLong( const long& n );
+size_t hashFuncLong( const long& n );
 
 /// basic hash function for an unpredictable unsigned integer key
-unsigned int hashFuncUInt( const unsigned int& n );
+size_t hashFuncUInt( const unsigned int& n );
 
-/// hash function for string versions of job id's ("cluster.proc")
-unsigned int hashFuncJobIdStr( char* const & key );
+/// hash functions for a string
+size_t hashFunction( char const *key );
+size_t hashFunction( const std::string &key );
+size_t hashFunction( const MyString &key );
+size_t hashFunction( const YourString &key );
 
-/// hash function for char* string
-unsigned int hashFuncChars( char const *key );
-
-/// hash function for Mystring string
-unsigned int hashFuncMyString( const MyString &key );
+size_t hashFunction( const YourStringNoCase &key );
 
 /// hash function for a pointer
-unsigned int hashFuncVoidPtr( void* const & pv );
+size_t hashFuncVoidPtr( void* const & pv );
 
 #endif // HASH_H

@@ -514,9 +514,7 @@ BOOL AddTheAceWindowStation(HWINSTA hwinsta, PSID psid)
 			INHERIT_ONLY_ACE      |
 
 			OBJECT_INHERIT_ACE;
-		pace->Header.AceSize  = sizeof(ACCESS_ALLOWED_ACE) +
-
-			GetLengthSid(psid) - sizeof(DWORD);
+		pace->Header.AceSize  = (WORD)(sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(psid) - sizeof(DWORD));
 		pace->Mask            = GENERIC_ACCESS;
 
 		if (!CopySid(GetLengthSid(psid), &pace->SidStart, psid))
@@ -1176,17 +1174,6 @@ BOOL RemoveTheAceDesktop(HDESK hdesk, PSID psid)
 				}
 			}
 		}
-
-		// 
-		// add ace to the dacl
-		// 
-		if (!AddAccessAllowedAce(
-			pNewAcl,
-			ACL_REVISION,
-			DESKTOP_ALL,
-			psid
-			))
-			__leave;
 
 		// 
 		// set new dacl to the new security descriptor

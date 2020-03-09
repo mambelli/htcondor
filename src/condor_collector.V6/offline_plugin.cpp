@@ -49,6 +49,7 @@ int __cdecl expiration ( const char *ad, time_t *ttl );
 
 OfflineCollectorPlugin::OfflineCollectorPlugin () throw ()
 {
+	AbsentReq = NULL;
 	_ads = NULL;
 	_persistent_store = NULL;
 }
@@ -92,13 +93,6 @@ OfflineCollectorPlugin::configure ()
 			EXCEPT ("Error parsing ABSENT_REQUIREMENTS expression: %s",
 					tmp);
 		}
-#if defined(ADD_TARGET_SCOPING)
-		if(AbsentReq){
-			ExprTree *tmp_expr = AddTargetRefs( AbsentReq, TargetMachineAttrs );
-			delete AbsentReq;
-			AbsentReq = tmp_expr;
-		}
-#endif
 		dprintf (D_ALWAYS,"ABSENT_REQUIREMENTS = %s\n", tmp);
 		free( tmp );
 		tmp = NULL;
@@ -135,7 +129,7 @@ OfflineCollectorPlugin::configure ()
 			_ads = NULL;
 		}
 
-		_ads = new ClassAdCollection ( _persistent_store, 2 );
+		_ads = new ClassAdCollection (NULL, _persistent_store, 2 );
 		ASSERT ( _ads );
 
 	} else {
@@ -157,7 +151,7 @@ OfflineCollectorPlugin::makeOfflineKey(
 	AdNameHashKey hashKey;
 	if ( !makeStartdAdHashKey (
 		hashKey,
-		const_cast<ClassAd*>( &ad ) ) ) {
+		&ad ) ) {
 
 		dprintf (
 			D_FULLDEBUG,
@@ -168,7 +162,7 @@ OfflineCollectorPlugin::makeOfflineKey(
 
 	}
 	hashKey.sprint ( s );
-	s.compressSpaces();
+	s.RemoveAllWhitespace();
 	return s.Value();
 }
 
@@ -266,15 +260,16 @@ OfflineCollectorPlugin::update (
 	ClassAd	&ad )
 {
 
+	/* bail out if the plug-in is not enabled */
+	if ( !enabled () ) {
+		return;
+	}
+
 	dprintf (
 		D_FULLDEBUG,
 		"In OfflineCollectorPlugin::update ( %d )\n",
 		command );
 
-	/* bail out if the plug-in is not enabled */
-	if ( !enabled () ) {
-		return;
-	}
 
 	/* make sure the command is relevant to us */
 	if ( UPDATE_STARTD_AD_WITH_ACK != command &&
@@ -289,11 +284,11 @@ OfflineCollectorPlugin::update (
 
 	/* report whether this ad is "off-line" or not and update
 	   the ad accordingly. */		
-	int offline  = FALSE,
-		lifetime = 0;
+	bool offline = false;
+	int lifetime = 0;
 
 	bool offline_explicit = false;
-	if( ad.EvalBool( ATTR_OFFLINE, NULL, offline ) ) {
+	if( ad.LookupBool( ATTR_OFFLINE, offline ) ) {
 		offline_explicit = true;
 	}
 
@@ -306,7 +301,7 @@ OfflineCollectorPlugin::update (
 	if ( UPDATE_STARTD_AD_WITH_ACK == command && !offline_explicit ) {
 
 		/* set the off-line state of the machine */
-		offline = TRUE;
+		offline = true;
 
 		/* get the off-line expiry time (default to INT_MAX) */
 		lifetime = param_integer ( 
@@ -350,7 +345,7 @@ OfflineCollectorPlugin::update (
 			lifetime );
 
 			/* record the new values as specified above */
-		ad.Assign ( ATTR_OFFLINE, (bool)offline );
+		ad.Assign ( ATTR_OFFLINE, offline );
 		if ( lifetime > 0 ) {
 			ad.Assign ( ATTR_CLASSAD_LIFETIME, lifetime );
 		}
@@ -358,7 +353,7 @@ OfflineCollectorPlugin::update (
 
 	/* if it is off-line then add it to the list; otherwise,
 	   remove it. */
-	if ( offline > 0 ) {
+	if ( offline ) {
 		persistentStoreAd(key,ad);
 	} else {
 		persistentRemoveAd(key);
@@ -382,13 +377,14 @@ OfflineCollectorPlugin::mergeClassAd (
 		return;
 	}
 
-	ad.ResetExpr();
 	ExprTree *expr;
 	const char *attr_name;
-	while (ad.NextExpr(attr_name, expr)) {
+	for ( auto itr = ad.begin(); itr != ad.end(); itr++ ) {
 		MyString new_val;
 		MyString old_val;
 
+		attr_name = itr->first.c_str();
+		expr = itr->second;
 		ASSERT( attr_name && expr );
 
 		new_val = ExprTreeToString( expr );
@@ -446,7 +442,7 @@ OfflineCollectorPlugin::expire (
 		type, an incompatibility between startd/negotiator would have to be dealt with.
 		So here we try to distinguish if this ad is really a STARTD_PVT_ADTYPE by seeing
 		if a Capability attr is present and a State attr is not present. */
-	if ( ad.Lookup(ATTR_CAPABILITY) && !ad.Lookup(ATTR_STATE) ) {
+	if ( (ad.Lookup(ATTR_CLAIM_ID) || ad.Lookup(ATTR_CAPABILITY)) && !ad.Lookup(ATTR_STATE) ) {
 		// looks like a private ad, we don't want to store these
 		return false;	// return false tells collector to delete this ad
 	}

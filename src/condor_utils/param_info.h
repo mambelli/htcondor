@@ -135,13 +135,18 @@ extern "C" {
 	const char* param_default_string(const char* param, const char * subsys);
 	// param may be param or subsys.param, will return non-null only on exact name match
 	const char* param_exact_default_string(const char* param);
-	int param_default_get_id(const char*param);
+	int param_default_get_id(const char*param, const char* * pdot);
 	const char* param_default_name_by_id(int ix);
 	const char* param_default_rawval_by_id(int ix);
+	// sets on of imin, dmin, or lmin to point to the min value of the range and returns the type of the param
+	param_info_t_type_t param_default_range_by_id(int ix, const int *&imin, const double*&dmin, const long long*&lmin);
+	// this is in param_info_help.cpp to avoid pulling the help tables in unless this function is used.
+	int param_default_help_by_id(int ix, const char * & descrip, const char * & tags, const char * & used_for);
 	param_info_t_type_t param_default_type_by_id(int ix);
 	bool param_default_ispath_by_id(int ix);
 	MACRO_DEF_ITEM *param_subsys_default_lookup(const char *subsys, const char *name);
 	MACRO_DEF_ITEM *param_default_lookup(const char *name);
+	int param_get_subsys_table(const void* pvdefaults, const char* subsys, MACRO_DEF_ITEM** ppTable);
 
 	MACRO_TABLE_PAIR * param_meta_table(const char * meta);
 	MACRO_DEF_ITEM * param_meta_table_lookup(MACRO_TABLE_PAIR *, const char * param);

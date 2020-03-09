@@ -24,20 +24,12 @@
 
 #include <sstream>
 
-CondorError::CondorError() {
-	init();
-}
-		
-CondorError::~CondorError() {
-	clear();
-}
-
-CondorError::CondorError(CondorError& copy) {
+CondorError::CondorError(const CondorError& copy) {
 	init();
 	deep_copy(copy);
 }
 
-CondorError& CondorError::operator=(CondorError& copy) {
+CondorError& CondorError::operator=(const CondorError& copy) {
 	if (&copy != this) {
 		clear();
 		deep_copy(copy);
@@ -67,6 +59,10 @@ void CondorError::clear() {
 	}
 }
 
+bool CondorError::empty() {
+	return !_message && !_subsys && !_next;
+}
+
 bool CondorError::pop() {
 	if (_next) {
 		CondorError* tmp = _next->_next;
@@ -80,10 +76,10 @@ bool CondorError::pop() {
 
 }
 
-void CondorError::deep_copy(CondorError& copy) {
-	_subsys = strdup(copy._subsys);
+void CondorError::deep_copy(const CondorError& copy) {
+	_subsys = copy._subsys ? strdup(copy._subsys) : NULL;
 	_code = copy._code;
-	_message = strdup(copy._message);
+	_message = copy._message ? strdup(copy._message) : NULL;
 	if(copy._next) {
 		_next = new CondorError();
 		_next->deep_copy(*(copy._next));
@@ -117,7 +113,7 @@ void CondorError::pushf( const char* the_subsys, int the_code, const char* the_f
 }
 
 std::string
-CondorError::getFullText( bool want_newline )
+CondorError::getFullText( bool want_newline ) const
 {
 	std::stringstream err_ss;
 	bool printed_one = false;
@@ -144,7 +140,7 @@ CondorError::getFullText( bool want_newline )
 }
 
 const char*
-CondorError::subsys(int level)
+CondorError::subsys(int level) const
 {
 	int n = 0;
 	CondorError* walk = _next;
@@ -155,12 +151,12 @@ CondorError::subsys(int level)
 	if (walk && walk->_subsys) {
 		return walk->_subsys;
 	} else {
-		return "SUBSYS-NULL";
+		return NULL;
 	}
 }
 
 int
-CondorError::code(int level)
+CondorError::code(int level) const
 {
 	int n = 0;
 	CondorError* walk = _next;
@@ -176,7 +172,7 @@ CondorError::code(int level)
 }
 
 const char*
-CondorError::message(int level)
+CondorError::message(int level) const
 {
 	int n = 0;
 	CondorError* walk = _next;
@@ -184,10 +180,25 @@ CondorError::message(int level)
 		walk = walk->_next;
 		n++;
 	}
-	if (walk && walk->_subsys) {
+	if (walk && walk->_message) {
 		return walk->_message;
 	} else {
-		return "MESSAGE-NULL";
+		return "";
 	}
 }
+
+void CondorError::walk(bool (*fn)(void*pv, int code, const char * subsys, const char * message), void*pv) const
+{
+	if (_code || _subsys || _message) {
+		if ( ! fn(pv, _code, _subsys, _message))
+			return;
+	}
+	CondorError* ce = _next;
+	while (ce) {
+		if ( ! fn(pv, ce->_code, ce->_subsys, ce->_message))
+			break;
+		ce = ce->_next;
+	}
+}
+
 

@@ -37,14 +37,21 @@ SimpleList<HOOK_RUN_INFO*> JobRouterHookMgr::m_job_hook_list;
 
 JobRouterHookMgr::JobRouterHookMgr()
 	: HookClientMgr(),
-	  NUM_HOOKS(4),
+	  m_warn_cleanup(true),
+	  m_warn_update(true),
+	  m_warn_translate(true),
+	  m_warn_exit(true),
+	  NUM_HOOKS(5),
 	  UNDEFINED("UNDEFINED"),
-	  m_hook_paths(MyStringHash)
+	  m_hook_paths(hashFunction)
 {
+	// JOB_EXIT is an old name for JOB_FINALIZE.
+	// Keep both for anyone still using the old name.
 	m_hook_maps[HOOK_TRANSLATE_JOB] = 1;
 	m_hook_maps[HOOK_UPDATE_JOB_INFO] = 2;
 	m_hook_maps[HOOK_JOB_EXIT] = 3;
 	m_hook_maps[HOOK_JOB_CLEANUP] = 4;
+	m_hook_maps[HOOK_JOB_FINALIZE] = 5;
 	m_default_hook_keyword = NULL;
 
 	dprintf(D_FULLDEBUG, "Instantiating a JobRouterHookMgr\n");
@@ -111,12 +118,16 @@ JobRouterHookMgr::reconfig()
 		free(m_default_hook_keyword);
 	}
 	m_default_hook_keyword = param("JOB_ROUTER_HOOK_KEYWORD");
+	m_warn_translate = true;
+	m_warn_exit = true;
+	m_warn_update = true;
+	m_warn_cleanup = true;
 	return true;
 }
 
 
 char*
-JobRouterHookMgr::getHookPath(HookType hook_type, classad::ClassAd ad)
+JobRouterHookMgr::getHookPath(HookType hook_type, const classad::ClassAd &ad)
 {
 	std::string keyword;
 	char** paths;
@@ -166,7 +177,7 @@ JobRouterHookMgr::getHookPath(HookType hook_type, classad::ClassAd ad)
 
 
 std::string
-JobRouterHookMgr::getHookKeyword(classad::ClassAd ad)
+JobRouterHookMgr::getHookKeyword(const classad::ClassAd &ad)
 {
 	std::string hook_keyword;
 
@@ -189,7 +200,10 @@ JobRouterHookMgr::hookTranslateJob(RoutedJob* r_job, std::string &route_info)
 	if (NULL == hook_translate)
 	{
 		// hook not defined, which is ok
-		dprintf(D_FULLDEBUG, "HOOK_TRANSLATE_JOB not configured.\n");
+		if (m_warn_translate) {
+			dprintf(D_FULLDEBUG, "HOOK_TRANSLATE_JOB not configured.\n");
+			m_warn_translate = false;
+		}
 		return 0;
 	}
 
@@ -220,7 +234,11 @@ JobRouterHookMgr::hookTranslateJob(RoutedJob* r_job, std::string &route_info)
 		return -1;
 	}
 
-	set_user_priv_from_ad(r_job->src_ad);
+	TemporaryPrivSentry sentry(true);
+	if (init_user_ids_from_ad(r_job->src_ad) == false) {
+		delete translate_client;
+		return -1;
+	}
 	if (0 == spawn(translate_client, NULL, &hook_stdin, PRIV_USER_FINAL))
 	{
 		dprintf(D_ALWAYS|D_FAILURE,
@@ -229,7 +247,6 @@ JobRouterHookMgr::hookTranslateJob(RoutedJob* r_job, std::string &route_info)
 		delete translate_client;
 		return -1;
 	}
-	uninit_user_ids();
 	
 	// Add our info to the list of hooks currently running for this job.
 	if (false == JobRouterHookMgr::addKnownHook(key.c_str(), HOOK_TRANSLATE_JOB))
@@ -254,7 +271,10 @@ JobRouterHookMgr::hookUpdateJobInfo(RoutedJob* r_job)
 	if (NULL == hook_update_job_info)
 	{
 		// hook not defined
-		dprintf(D_FULLDEBUG, "HOOK_UPDATE_JOB_INFO not configured.\n");
+		if (m_warn_update) {
+			dprintf(D_FULLDEBUG, "HOOK_UPDATE_JOB_INFO not configured.\n");
+			m_warn_update = false;
+		}
 		return 0;
 	}
 
@@ -284,7 +304,11 @@ JobRouterHookMgr::hookUpdateJobInfo(RoutedJob* r_job)
 		return -1;
 	}
 
-	set_user_priv_from_ad(r_job->src_ad);
+	TemporaryPrivSentry sentry(true);
+	if (init_user_ids_from_ad(r_job->src_ad) == false) {
+		delete status_client;
+		return -1;
+	}
 	if (0 == spawn(status_client, NULL, &hook_stdin, PRIV_USER_FINAL))
 	{
 		dprintf(D_ALWAYS|D_FAILURE,
@@ -294,7 +318,6 @@ JobRouterHookMgr::hookUpdateJobInfo(RoutedJob* r_job)
 		return -1;
 
 	}
-	uninit_user_ids();
 
 	// Add our info to the list of hooks currently running for this job.
 	if (false == JobRouterHookMgr::addKnownHook(key.c_str(), HOOK_UPDATE_JOB_INFO))
@@ -314,19 +337,27 @@ int
 JobRouterHookMgr::hookJobExit(RoutedJob* r_job)
 {
 	ClassAd temp_ad;
-	char* hook_job_exit = getHookPath(HOOK_JOB_EXIT, r_job->src_ad);
+	char* hook_job_exit = getHookPath(HOOK_JOB_FINALIZE, r_job->src_ad);
 
+	// JOB_EXIT is an old name for the JOB_FINALIZE hook.
+	// CRUFT Remove this check of the old name in a future release.
+	if ( NULL == hook_job_exit ) {
+		hook_job_exit = getHookPath(HOOK_JOB_EXIT, r_job->src_ad);
+	}
 	if (NULL == hook_job_exit)
 	{
 		// hook not defined
-		dprintf(D_FULLDEBUG, "HOOK_JOB_EXIT not configured.\n");
+		if (m_warn_exit) {
+			dprintf(D_FULLDEBUG, "HOOK_JOB_FINALIZE not configured.\n");
+			m_warn_exit = false;
+		}
 		return 0;
 	}
 
 	// Verify the exit hook hasn't already been spawned and that
 	// we're not waiting for it to return.
 	std::string key = r_job->dest_key;
-	if (true == JobRouterHookMgr::checkHookKnown(key.c_str(),HOOK_JOB_EXIT))
+	if (true == JobRouterHookMgr::checkHookKnown(key.c_str(),HOOK_JOB_FINALIZE))
 	{
 		dprintf(D_FULLDEBUG, "JobRouterHookMgr::hookJobExit "
 			"retried while still waiting for exit hook to return "
@@ -352,27 +383,30 @@ JobRouterHookMgr::hookJobExit(RoutedJob* r_job)
 		return -1;
 	}
 
-	set_user_priv_from_ad(r_job->src_ad);
+	TemporaryPrivSentry sentry(true);
+	if (init_user_ids_from_ad(r_job->src_ad) == false) {
+		delete exit_client;
+		return -1;
+	}
 	if (0 == spawn(exit_client, NULL, &hook_stdin, PRIV_USER_FINAL))
 	{
 		dprintf(D_ALWAYS|D_FAILURE,
 				"ERROR in JobRouterHookMgr::hookJobExit: "
-				"failed to spawn HOOK_JOB_EXIT (%s)\n", hook_job_exit);
+				"failed to spawn HOOK_JOB_FINALIZE (%s)\n", hook_job_exit);
 		delete exit_client;
 		return -1;
 
 	}
-	uninit_user_ids();
 	
 	// Add our info to the list of hooks currently running for this job.
-	if (false == JobRouterHookMgr::addKnownHook(key.c_str(), HOOK_JOB_EXIT))
+	if (false == JobRouterHookMgr::addKnownHook(key.c_str(), HOOK_JOB_FINALIZE))
 	{
 		dprintf(D_ALWAYS, "ERROR in JobRouterHookMgr::hookJobExit: "
-				"failed to add HOOK_JOB_EXIT to list of "
+				"failed to add HOOK_JOB_FINALIZE to list of "
 				"hooks running for job key %s\n", key.c_str());
 	}
 
-	dprintf(D_FULLDEBUG, "HOOK_JOB_EXIT (%s) invoked.\n", hook_job_exit);
+	dprintf(D_FULLDEBUG, "HOOK_JOB_FINALIZE (%s) invoked.\n", hook_job_exit);
 	return 1;
 }
 
@@ -386,7 +420,10 @@ JobRouterHookMgr::hookJobCleanup(RoutedJob* r_job)
 	if (NULL == hook_cleanup)
 	{
 		// hook not defined
-		dprintf(D_FULLDEBUG, "HOOK_JOB_CLEANUP not configured.\n");
+		if (m_warn_cleanup) {
+			dprintf(D_FULLDEBUG, "HOOK_JOB_CLEANUP not configured.\n");
+			m_warn_cleanup = false;
+		}
 		return 0;
 	}
 
@@ -421,7 +458,11 @@ JobRouterHookMgr::hookJobCleanup(RoutedJob* r_job)
 		return -1;
 	}
 
-	set_user_priv_from_ad(r_job->src_ad);
+	TemporaryPrivSentry sentry(true);
+	if (init_user_ids_from_ad(r_job->src_ad) == false) {
+		delete cleanup_client;
+		return -1;
+	}
 	if (0 == spawn(cleanup_client, NULL, &hook_stdin, PRIV_USER_FINAL))
 	{
 		dprintf(D_ALWAYS|D_FAILURE,
@@ -431,7 +472,6 @@ JobRouterHookMgr::hookJobCleanup(RoutedJob* r_job)
 		return -1;
 
 	}
-	uninit_user_ids();
 
 	// Add our info to the list of hooks currently running for this job.
 	if (false == JobRouterHookMgr::addKnownHook(key.c_str(), HOOK_JOB_CLEANUP))
@@ -458,6 +498,7 @@ JobRouterHookMgr::addKnownHook(const char* key, HookType hook)
 	ASSERT( hook_info != NULL );
 	hook_info->hook_type = hook;
 	hook_info->key = strdup(key);
+	ASSERT( hook_info->key );
 	return(m_job_hook_list.Append(hook_info));
 }
 
@@ -567,8 +608,9 @@ TranslateClient::hookExited(int exit_status)
 		ClassAd job_ad;
 		const char* hook_line = NULL;
 
-		m_std_out.Tokenize();
-		while ((hook_line = m_std_out.GetNextToken("\n", true)))
+		MyStringTokener tok;
+		tok.Tokenize(m_std_out.Value());
+		while ((hook_line = tok.GetNextToken("\n", true)))
 		{
 			if (!job_ad.Insert(hook_line))
 			{
@@ -654,8 +696,9 @@ StatusClient::hookExited(int exit_status)
 			ATTR_TARGET_TYPE,
 			NULL };
 
-		m_std_out.Tokenize();
-		while ((hook_line = m_std_out.GetNextToken("\n", true)))
+		MyStringTokener tok;
+		tok.Tokenize(m_std_out.Value());
+		while ((hook_line = tok.GetNextToken("\n", true)))
 		{
 			if (!job_ad.Insert(hook_line))
 			{
@@ -703,7 +746,7 @@ StatusClient::hookExited(int exit_status)
 // // // // // // // // // // // // 
 
 ExitClient::ExitClient(const char* hook_path, RoutedJob* r_job)
-	: HookClient(HOOK_JOB_EXIT, hook_path, true)
+	: HookClient(HOOK_JOB_FINALIZE, hook_path, true)
 {
 	m_routed_job = r_job;
 }
@@ -712,7 +755,7 @@ ExitClient::ExitClient(const char* hook_path, RoutedJob* r_job)
 void
 ExitClient::hookExited(int exit_status) {
 	std::string key = m_routed_job->dest_key;
-	if (false == JobRouterHookMgr::removeKnownHook(key.c_str(), HOOK_JOB_EXIT))
+	if (false == JobRouterHookMgr::removeKnownHook(key.c_str(), HOOK_JOB_FINALIZE))
 	{
 		dprintf(D_ALWAYS|D_FAILURE, "ExitClient::hookExited (%s): "
 			"Failed to remove hook info for job key %s.\n",
@@ -741,8 +784,9 @@ ExitClient::hookExited(int exit_status) {
 			classad::ClassAdCollection *ad_collection = job_router->GetScheduler()->GetClassAds();
 			classad::ClassAd *orig_ad = ad_collection->GetClassAd(m_routed_job->src_key);
 
-			m_std_out.Tokenize();
-			while ((hook_line = m_std_out.GetNextToken("\n", true)))
+			MyStringTokener tok;
+			tok.Tokenize(m_std_out.Value());
+			while ((hook_line = tok.GetNextToken("\n", true)))
 			{
 				if (!job_ad.Insert(hook_line))
 				{

@@ -49,7 +49,7 @@ if ( WITH_BLAHP )
 		endif()
 
 
-		condor_pre_external( BLAHP blahp-1.16.5.1-p14 "lib;include" "done")
+		condor_pre_external( BLAHP blahp-1.16.5.1-p26 "lib;include" "done")
 		
 		ExternalProject_Add(blahp
 						DEPENDS ${BLAHP_DEPENDS}
@@ -83,14 +83,28 @@ if ( WITH_BLAHP )
 							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/ld-library-path.patch -p1 &&
 							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/run-dir.patch -p1 &&
 							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/request-memory.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/condor-multicore.patch -p1 &&
 							cp ${CMAKE_CURRENT_SOURCE_DIR}/classads.m4 project/ &&
 							cp ${CMAKE_CURRENT_SOURCE_DIR}/${GLOBUS_M4_FILE} project/globus.m4 &&
 							cp ${CMAKE_CURRENT_SOURCE_DIR}/glite.m4 project/ &&
 							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/name-change.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/lsf-status.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/lsf-submit-conf.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/pbs-empty-jobid.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/job_registry.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/nolimit-proxies.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/pbs-bulk-status.patch -p1 &&
+							cp ${CMAKE_CURRENT_SOURCE_DIR}/pbs_status.py src/scripts/ &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/escape-args2.patch -p0 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/condor-args.patch -p0 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/condor-proxy.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/runtime-project.patch -p1 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/bash-source.patch -p0 &&
+							patch -N -i ${CMAKE_CURRENT_SOURCE_DIR}/kill-job.patch -p0 &&
 							mv config/blah.config.template config/batch_gahp.config.template
 						#--Configure step ----------
 						CONFIGURE_COMMAND export CPPFLAGS=${CPP11_FLAG} &&
-							./bootstrap && ./configure --with-classads-prefix=${CLASSADS_INSTALL_LOC}
+							./bootstrap && ./configure --with-classads-prefix=$<TARGET_FILE_DIR:classads>/..
 							${OPENSSL_FLAG}
 							--with-globus-prefix=${GLOBUS_INSTALL_LOC}
 							--with-globus-nothr-flavor=gcc${BIT_MODE}dbg
@@ -107,7 +121,7 @@ if ( WITH_BLAHP )
 
 		### set the install
 		install ( DIRECTORY ${BLAHP_INSTALL_LOC}/opt/glite DESTINATION ${C_LIBEXEC} USE_SOURCE_PERMISSIONS )
-		install ( CODE "execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink ../../lib ${CMAKE_INSTALL_PREFIX}/${C_LIBEXEC}/glite/lib)" )
+		install ( CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink ../../lib ${CMAKE_INSTALL_PREFIX}/${C_LIBEXEC}/glite/lib)" )
 		if ( CONDOR_STRIP_PACKAGES AND NOT CONDOR_PACKAGE_BUILD )
 			# Strip the libraries manually.
 			# Since cmake didn't create the libraries
@@ -116,7 +130,7 @@ if ( WITH_BLAHP )
 				COMMAND xargs strip)" )
 		endif()
 
-		condor_post_external( blahp OFF OFF )
+		condor_post_external( blahp OFF OFF "" )
 
 		set(BLAHP_FOUND ON)
 

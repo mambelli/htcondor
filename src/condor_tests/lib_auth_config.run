@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -18,12 +19,21 @@
 ##
 ##**************************************************************
 
+use CondorUtils;
+use Cwd;
 
 my @got;
 $testdesc =  'lib_auth_config - runs tests of IpVerify';
 $testname = "lib_auth_config";
-$test = "condor_test_auth";
+if(is_windows()) {
+	$test = "condor_test_auth.exe";
+} else {
+	$test = "condor_test_auth";
+}
 $inputdir = "lib_auth_config_tests";
+
+@inputfiles = ();
+$topdir = getcwd();
 
 print scalar localtime() . "\n";
 
@@ -32,8 +42,33 @@ if(!(-f $test)) {
 	exit(1);
 }
 
-my $input;
-foreach $input ( glob($inputdir . "/test_auth_*_input") ) {
+# get input list by reading directory in perl
+my $fullpath = "";
+
+chdir("$inputdir");
+opendir(GD,".") or die "failed to open .:$!\n";
+foreach my $subfile (readdir GD) {
+	next if $subfile =~ /^\.\.?$/;
+	if($subfile =~ /_input/) {
+		#print "saving:$subfile:\n";
+		$fullpath = "";
+		if(is_windows()) {
+			$fullpath = "$inputdir" . "\\" . "$subfile";
+		} else {
+			$fullpath = "$inputdir" . "/$subfile";
+		}
+		push @inputfiles,$fullpath;
+	}
+}
+#foreach my $input ( @inputfiles ) {
+	#print "input:$input\n"
+#}
+
+my $total_failures = 0;
+
+chdir("$topdir");
+#foreach $input ( glob($inputdir . "/test_auth_*_input") ) {
+foreach my $input ( @inputfiles ) {
   my $config = $input;
   $config =~ s/_input/_config/;
 
@@ -65,11 +100,13 @@ foreach $input ( glob($inputdir . "/test_auth_*_input") ) {
 
   if ( $result != 0 ) {
     print "Authorization test Failure: condor_test_auth < $input\n";
-    exit(1);
   }
+  $total_failures += $result;
 }
 
-print "\n";
-print "Authorization test Success\n";
+  if ($total_failures == 0) {
+    print "\n";
+    print "Authorization test Success\n";
+  }
 
-exit(0);
+exit($total_failures);

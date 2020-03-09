@@ -35,9 +35,9 @@ Condor_Crypt_3des :: Condor_Crypt_3des(const KeyInfo& key)
 	unsigned char * keyData = k.getPaddedKeyData(24);
 	ASSERT(keyData);
 
-    des_set_key((des_cblock *)  keyData    , keySchedule1_);
-    des_set_key((des_cblock *) (keyData+8) , keySchedule2_);
-    des_set_key((des_cblock *) (keyData+16), keySchedule3_);
+    DES_set_key((DES_cblock *)  keyData    , &keySchedule1_);
+    DES_set_key((DES_cblock *) (keyData+8) , &keySchedule2_);
+    DES_set_key((DES_cblock *) (keyData+16), &keySchedule3_);
 
     // initialize ivsec
     resetState();
@@ -60,7 +60,7 @@ void Condor_Crypt_3des:: resetState()
      num_=0;
 }
 
-bool Condor_Crypt_3des :: encrypt(unsigned char *  input, 
+bool Condor_Crypt_3des :: encrypt(const unsigned char *  input,
                                   int              input_len, 
                                   unsigned char *& output, 
                                   int&             output_len)
@@ -71,9 +71,9 @@ bool Condor_Crypt_3des :: encrypt(unsigned char *  input,
     output = (unsigned char *) malloc(input_len);
 
     if (output) {
-        des_ede3_cfb64_encrypt(input, output, output_len,
-                               keySchedule1_, keySchedule2_, keySchedule3_,
-                               (des_cblock *)ivec_, &num_, DES_ENCRYPT);
+        DES_ede3_cfb64_encrypt(input, output, output_len,
+                               &keySchedule1_, &keySchedule2_, &keySchedule3_,
+                               (DES_cblock *)ivec_, &num_, DES_ENCRYPT);
         return true;   
     }
     else {
@@ -84,7 +84,7 @@ bool Condor_Crypt_3des :: encrypt(unsigned char *  input,
 #endif
 }
 
-bool Condor_Crypt_3des :: decrypt(unsigned char *  input, 
+bool Condor_Crypt_3des :: decrypt(const unsigned char *  input,
                                   int              input_len, 
                                   unsigned char *& output, 
                                   int&             output_len)
@@ -95,9 +95,9 @@ bool Condor_Crypt_3des :: decrypt(unsigned char *  input,
     if (output) {
         output_len = input_len;
 
-        des_ede3_cfb64_encrypt(input, output, output_len,
-                               keySchedule1_, keySchedule2_, keySchedule3_,
-                               (des_cblock *)ivec_, &num_, DES_DECRYPT);
+        DES_ede3_cfb64_encrypt(input, output, output_len,
+                               &keySchedule1_, &keySchedule2_, &keySchedule3_,
+                               (DES_cblock *)ivec_, &num_, DES_DECRYPT);
         
         return true;           // Should be changed
     }
@@ -111,6 +111,9 @@ bool Condor_Crypt_3des :: decrypt(unsigned char *  input,
 
 Condor_Crypt_3des :: Condor_Crypt_3des()
 {
+	memset(&keySchedule1_.ks,0,sizeof(keySchedule1_));
+	memset(&keySchedule2_.ks,0,sizeof(keySchedule2_));
+	memset(&keySchedule3_.ks,0,sizeof(keySchedule3_));
 	resetState();
 }
 

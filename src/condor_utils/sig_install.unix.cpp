@@ -56,15 +56,29 @@ install_sig_handler_with_mask( int sig, sigset_t* set, SIG_HANDLER handler )
 }
 
 void
+install_sig_action_with_mask( int sig, sigset_t* set, SIG_ACTION handler )
+{
+	struct sigaction act;
+
+	act.sa_sigaction = handler;
+	act.sa_mask = *set;
+	act.sa_flags = SA_SIGINFO;
+
+	if( sigaction(sig,&act,0) < 0 ) {
+		EXCEPT( "sigaction" );
+	}
+}
+
+void
 unblock_signal( int sig)
 {
     sigset_t    set;
     if ( sigprocmask(SIG_SETMASK,0,&set)  == -1 ) {
-        EXCEPT("Error in reading procmask, errno = %d\n", errno);
+        EXCEPT("Error in reading procmask, errno = %d", errno);
     }
     sigdelset(&set, sig);
     if ( sigprocmask(SIG_SETMASK,&set, 0)  == -1 ) {
-        EXCEPT("Error in setting procmask, errno = %d\n", errno);
+        EXCEPT("Error in setting procmask, errno = %d", errno);
     }
 }	
 
@@ -73,11 +87,11 @@ block_signal( int sig)
 {
     sigset_t    set;
     if ( sigprocmask(SIG_SETMASK,0,&set)  == -1 ) {
-        EXCEPT("block_signal:Error in reading procmask, errno = %d\n", errno);
+        EXCEPT("block_signal:Error in reading procmask, errno = %d", errno);
     }
     sigaddset(&set, sig);
     if ( sigprocmask(SIG_SETMASK,&set, 0)  == -1 ) {
-        EXCEPT("block_signal:Error in setting procmask, errno = %d\n", errno);
+        EXCEPT("block_signal:Error in setting procmask, errno = %d", errno);
     }
 }	
 

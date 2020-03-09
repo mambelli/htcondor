@@ -23,9 +23,8 @@
 
 #include "condor_common.h"
 #include "condor_classad.h"
-#include "write_user_log.h"
 #include "user_job_policy.h"
-#include "classad_hashtable.h"
+#include "HashTable.h"
 #include "baseresource.h"
 
 class BaseResource;
@@ -82,7 +81,7 @@ class BaseJob : public Service
 	virtual void NotifyResourceUp();
 
 	static HashTable<PROC_ID, BaseJob *> JobsByProcId;
-	static HashTable<HashKey, BaseJob *> JobsByRemoteId;
+	static HashTable<std::string, BaseJob *> JobsByRemoteId;
 
 	ClassAd *jobAd;
 	PROC_ID procID;
@@ -105,9 +104,9 @@ class BaseJob : public Service
 	bool deleteFromGridmanager;
 	bool deleteFromSchedd;
 
-	int wantResubmit;
+	bool wantResubmit;
 	int doResubmit;
-	int wantRematch;
+	bool wantRematch;
 
 	bool resourceDown;
 	bool resourceStateKnown;
@@ -128,7 +127,6 @@ class BaseJob : public Service
 	int jobLeaseReceivedExpiredTid;
 };
 
-WriteUserLog *InitializeUserLog( ClassAd *job_ad );
 bool WriteExecuteEventToUserLog( ClassAd *job_ad );
 bool WriteAbortEventToUserLog( ClassAd *job_ad );
 bool WriteTerminateEventToUserLog( ClassAd *job_ad );

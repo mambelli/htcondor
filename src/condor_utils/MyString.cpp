@@ -21,10 +21,10 @@
 #include "condor_common.h"
 #include "MyString.h"
 #include "condor_snutils.h"
-#include "condor_string.h"
-#include "condor_random_num.h"
+#include "condor_debug.h"
 #include "strupr.h"
-#include "simplelist.h"
+#include <limits>
+#include <vector>
 
 /*--------------------------------------------------------------------
  *
@@ -37,12 +37,6 @@ MyString::MyString()
 	init();
     return;
 }
-  
-MyString::MyString(int i) 
-{
-	init();
-	*this += i;
-};
 
 MyString::MyString(const char* S) 
 {
@@ -67,12 +61,13 @@ MyString::~MyString()
     if (Data) {
 		delete[] Data;
 	}
+#if 0
 	delete [] tokenBuf;
+#endif
 	init(); // for safety -- errors if you try to re-use this object
 }
 
-
-MyString::operator std::string()
+MyString::operator std::string() const
 {
     std::string r = this->Value();
     return r;
@@ -91,6 +86,7 @@ MyString::operator[](int pos) const
     return Data[pos];
 }
 
+#if 0
 const char&
 MyString::operator[](int pos)
 {
@@ -100,15 +96,27 @@ MyString::operator[](int pos)
 	}	
 	return Data[pos];
 }
+#endif
 
 void
-MyString::setChar(int pos, char value)
+MyString::setAt(int pos, char value)
 {
 	if ( pos >= 0 && pos < Len ) {
 		Data[pos] = value;
 		if ( value == '\0' ) {
 			Len = pos;
 		}
+	} else {
+		// No op.
+	}
+}
+
+void
+MyString::truncate(int pos)
+{
+	if ( pos >= 0 && pos < Len ) {
+		Data[pos] = '\0';
+		Len = pos;
 	} else {
 		// No op.
 	}
@@ -127,20 +135,33 @@ operator=(const MyString& S)
     return *this;
 }
 
+/** Destructively moves a MyString guts from rhs to this */
+MyString& 
+MyString::operator=(MyString &&rhs) {
+	delete Data;
+	this->Data     = rhs.Data;
+	this->Len      = rhs.Len;
+	this->capacity = rhs.capacity;
+	rhs.init();
+	return *this;
+}
+
 MyString& MyString::
 operator=(const std::string& S) 
 {
-	assign_str(S.c_str(), S.length());
+	assign_str(S.c_str(), (int)S.length());
     return *this;
 }
 
 MyString& 
 MyString::operator=( const char *s ) 
 {
-	int s_len = s ? strlen(s) : 0;
-	assign_str(s, s_len);
+	size_t s_len = s ? strlen(s) : 0;
+	assign_str(s, (int)s_len);
     return *this;
 }
+
+
 
 void
 MyString::assign_str( const char *s, int s_len ) 
@@ -158,7 +179,8 @@ MyString::assign_str( const char *s, int s_len )
 			capacity = s_len;
 			Data = new char[capacity+1];
 		}
-		strcpy( Data, s );
+		strncpy( Data, s, s_len );
+		Data[s_len] = 0;
 		Len = s_len;
 	}
 }
@@ -175,20 +197,20 @@ MyString::reserve( const int sz )
 	if (sz < 0) {
 		return false;
 	}
+	if (sz <= Len && Data) {
+		return true;
+	}
     char *buf = new char[ sz+1 ];
     if (!buf) {
 		return false;
 	}
     buf[0] = '\0';
     if (Data) {
-	  // newlen is needed in case we are shortening the string.
-	  int newlen = MIN(sz, Len);
       // Only copy over existing data into the new buffer.
-      strncpy( buf, Data, newlen ); 
+      strncpy( buf, Data, Len );
 	  // Make sure it's NULL terminated. strncpy won't make sure of it.
-	  buf[newlen] = '\0'; 
+	  buf[Len] = '\0';
       delete [] Data;
-	  Len = newlen;
     }
     // Len will be the same, since we didn't add new text
     capacity = sz;
@@ -213,7 +235,9 @@ MyString::reserve_at_least(const int sz)
 	bool success;
 
 	twice_as_much = 2 * capacity;
-	if (twice_as_much > sz) {
+	if (sz <= capacity && capacity > 0 && Data) {
+		success = true;
+	} else if (twice_as_much > sz) {
 		success = reserve(twice_as_much);
 		if (!success) { // allocate failed, get just enough?
 			success = reserve(sz);
@@ -242,7 +266,7 @@ MyString&
 MyString::operator+=(const std::string& S) 
 {
 	
-    append_str( S.c_str(), S.length() );
+    append_str( S.c_str(), (int)S.length() );
     return *this;
 }
 
@@ -253,7 +277,7 @@ MyString::operator+=(const char *s)
     if( !s || *s == '\0' ) {
 		return *this;
 	}
-    append_str( s, strlen( s ) );
+    append_str( s, (int)strlen( s ) );
     return *this;
 }
 
@@ -275,13 +299,16 @@ MyString::append_str( const char *s, int s_len )
 
 	if (pCopy)
 	{
-		strcpy( Data + Len, pCopy); // b/c you invalided s w/reserve_at_least
+		strncpy( Data + Len, pCopy, s_len); // b/c you invalided s w/reserve_at_least
 		delete [] pCopy; 
 	}
 	else
-		strcpy( Data + Len, s);
+	{
+		strncpy( Data + Len, s, s_len);
+	}
 
 	Len += s_len;
+	Data[Len] = 0;
 }
 
 void
@@ -322,71 +349,150 @@ MyString operator+(const MyString& S1, const MyString& S2)
 // the buffers below are all sufficiently large that this is no danger of non-null termination.
 MSC_DISABLE_WARNING(6053) // call to snprintf might not null terminate string.
 
-MyString& 
-MyString::operator+=( int i )
-{
-	const int bufLen = 64;
-	char tmp[bufLen];
-	::snprintf( tmp, bufLen, "%d", i );
-    int s_len = strlen( tmp );
-	ASSERT(s_len < bufLen);
-	append_str( tmp, s_len );
-    return *this;
+// ----------------------------------------
+//           Serialization helpers
+// ----------------------------------------
+// (see YourStringDeserializer for corresponding deserialization)
+
+// append an integer for serialization
+template <class T> bool MyString::serialize_int(T val) {
+	char buf[65];
+	if (std::numeric_limits<T>::is_signed) {
+		::snprintf(buf, COUNTOF(buf), "%lld", (long long)val);
+	} else {
+		::snprintf(buf, COUNTOF(buf), "%llu", (unsigned long long)val);
+	}
+	return serialize_string(buf);
 }
 
+// bool specialization of serialize_int
+template <> bool MyString::serialize_int<bool>(bool val) { append_str(val ? "1" : "0", 1); return true; }
 
-MyString& 
-MyString::operator+=( unsigned int ui )
+#ifdef WIN32
+#define strtoull _strtoui64
+#endif
+
+// deserialize an int into the given value, and advance the deserialization pointer.
+// returns true if a valid in-range int was found at the current deserialize position
+// if true is returned, the internal buffer pointer is advanced past the parsed int
+// returns false and does NOT advance the deserialization pointer if there is no int
+// at the current position, or the int is out of range.
+template <class T> bool YourStringDeserializer::deserialize_int(T* val)
 {
-	const int bufLen = 64;
-	char tmp[bufLen];
-	::snprintf( tmp, bufLen, "%u", ui );
-	int s_len = strlen( tmp );
-	ASSERT(s_len < bufLen);
-	append_str( tmp, s_len );
-	return *this;
+	if ( ! m_p) m_p = m_str;
+	if ( ! m_p) return false;
+
+	char * endp = const_cast<char*>(m_p);
+	if (std::numeric_limits<T>::is_signed) {
+		long long tmp;
+		tmp = strtoll(m_p, &endp, 10);
+		if (tmp < (long long)std::numeric_limits<T>::min() || tmp > (long long)std::numeric_limits<T>::max()) return false;
+		if (endp == m_p) return false;
+		*val = (T)tmp;
+	} else {
+		unsigned long long tmp;
+		tmp = strtoull(m_p, &endp, 10);
+		if (tmp > (unsigned long long)std::numeric_limits<T>::max()) return false;
+		if (endp == m_p) return false;
+		*val = (T)tmp;
+	}
+	m_p = endp;
+	return true;
+}
+// bool specialization for deserialize_int
+template <> bool YourStringDeserializer::deserialize_int<bool>(bool* val)
+{
+	if ( ! m_p) m_p = m_str;
+	if ( ! m_p) return false;
+	if (*m_p == '0') { ++m_p; *val = false; return true; }
+	if (*m_p == '1') { ++m_p; *val = true; return true; }
+	return false;
 }
 
-
-MyString& 
-MyString::operator+=( long l )
+// check for the given separator at the current position and advance past it if found
+// returns true if the current position has the given separator
+bool YourStringDeserializer::deserialize_sep(const char * sep)
 {
-	const int bufLen = 64;
-	char tmp[bufLen];
-	::snprintf( tmp, bufLen, "%ld", l );
-	int s_len = strlen( tmp );
-	ASSERT(s_len < bufLen);
-	append_str( tmp, s_len );
-	return *this;
+	if ( ! m_p) m_p = m_str;
+	if ( ! m_p) return false;
+	const char * p1 = m_p;
+	const char * p2 = sep;
+	while (*p2 && (*p1 == *p2)) { ++p1; ++p2; }
+	if (!*p2) { m_p = p1; return true; }
+	return false;
 }
 
-
-MyString&
-MyString::operator+=( long long l )
+// return pointer and length of the string between the current deserialize position
+// and the next instance of the given separator character.
+// returns true if the separator was found, false if not.
+// if separator occurrs at current position, returned length will be 0.
+bool YourStringDeserializer::deserialize_string(const char *& start, size_t & len, const char * sep)
 {
-        const int bufLen = 64;
-        char tmp[bufLen];
-        ::snprintf( tmp, bufLen, "%lld", l );
-        int s_len = strlen( tmp );
-        ASSERT(s_len < bufLen);
-        append_str( tmp, s_len );
-        return *this;
+	if ( ! m_p) m_p = m_str;
+	if ( ! m_p) return false;
+	const char * p = strstr(m_p, sep);
+	if (p) { start = m_p; len = (p - m_p); m_p = p; return true; }
+	return false;
 }
 
-
-MyString& 
-MyString::operator+=( double d )
+// Copy a string from the current deserialize position to the next separator into the given MyString
+// returns true if the separator was found, false if not.
+// if return value is true, the val will be set to the string, if false val is unchanged.
+bool YourStringDeserializer::deserialize_string(MyString & val, const char * sep)
 {
-	const int bufLen = 128;
-	char tmp[bufLen];
-	::snprintf( tmp, bufLen, "%f", d );
-    int s_len = strlen( tmp );
-	ASSERT(s_len < bufLen);
-	append_str( tmp, s_len );
-    return *this;
+	const char * p; size_t len;
+	if ( ! deserialize_string(p, len, sep)) return false;
+	val.set(p, (int)len);
+	return true;
 }
+
+// force instantiation of the serialize and deserialize functions that users of condor_utils will need
+template bool MyString::serialize_int<int>(int val);
+template bool MyString::serialize_int<long>(long val);
+template bool MyString::serialize_int<long long>(long long val);
+template bool MyString::serialize_int<unsigned int>(unsigned int val);
+template bool MyString::serialize_int<unsigned long>(unsigned long val);
+template bool MyString::serialize_int<unsigned long long>(unsigned long long val);
+
+template bool YourStringDeserializer::deserialize_int<int>(int* val);
+template bool YourStringDeserializer::deserialize_int<long>(long* val);
+template bool YourStringDeserializer::deserialize_int<long long>(long long* val);
+template bool YourStringDeserializer::deserialize_int<unsigned int>(unsigned int* val);
+template bool YourStringDeserializer::deserialize_int<unsigned long>(unsigned long* val);
+template bool YourStringDeserializer::deserialize_int<unsigned long long>(unsigned long long* val);
+
+#if 0
+void force_mystring_templates() {
+	MyString str;
+	str.serialize_int(false);
+	//str.serialize_int((char)0);
+	//str.serialize_int((short)0);
+	str.serialize_int((int)0);
+	str.serialize_int((long)0);
+	str.serialize_int((long long)0);
+	//str.serialize_int((unsigned char)0);
+	//str.serialize_int((unsigned short)0);
+	str.serialize_int((unsigned int)0);
+	str.serialize_int((unsigned long)0);
+	str.serialize_int((unsigned long long)0);
+
+	YourStringDeserializer buf("0*0*0*");
+	bool b;
+	int i; long l; long long ll;
+	unsigned int ui; unsigned long ul; unsigned long long ull;
+	buf.deserialize_int(&b);
+	buf.deserialize_int(&i);
+	buf.deserialize_int(&l);
+	buf.deserialize_int(&ll);
+	buf.deserialize_int(&ui);
+	buf.deserialize_int(&ul);
+	buf.deserialize_int(&ull);
+}
+#endif
 
 MSC_RESTORE_WARNING(6052) // call to snprintf might not null terminate string.
+
+
 
 /*--------------------------------------------------------------------
  *
@@ -395,32 +501,26 @@ MSC_RESTORE_WARNING(6052) // call to snprintf might not null terminate string.
  *--------------------------------------------------------------------*/
 
 MyString 
-MyString::Substr(int pos1, int pos2) const 
+MyString::substr(int pos, int len) const
 {
     MyString S;
 
-	if (Len <= 0) {
+	if ( pos >= Len || len <= 0 ) {
 	    return S;
 	}
-
-    if (pos2 >= Len) {
-		pos2 = Len - 1;
+	if ( pos < 0 ) {
+		pos = 0;
 	}
-    if (pos1 < 0) {
-		pos1=0;
+	if ( len > Len - pos ) {
+		len = Len - pos;
 	}
-    if (pos1 > pos2) {
-		return S;
-	}
-    int len = pos2-pos1+1;
-    char* tmp = new char[len+1];
-    strncpy(tmp,Data+pos1,len);
-    tmp[len]='\0';
-    S=tmp;
-    delete[] tmp;
+	S.reserve( len );
+	strncpy( S.Data, Data+pos, len );
+	S.Data[len] = '\0';
+	S.Len = len;
     return S;
 }
-    
+
 // this function escapes characters by putting some other
 // character before them.  it does NOT convert newlines to
 // the two chars '\n'.
@@ -467,17 +567,6 @@ MyString::FindChar(int Char, int FirstPos) const
     return tmp-Data;
 }
 
-unsigned int 
-MyString::Hash() const 
-{
-	int i;
-	unsigned int result = 0;
-	for(i = 0; i < Len; i++) {
-		result = (result<<5) + result + (unsigned char)Data[i];
-	}
-	return result;
-}	  
- 
 // returns the index of the first match, or -1 for no match found
 int 
 MyString::find(const char *pszToFind, int iStartPos) const
@@ -514,33 +603,33 @@ MyString::replaceString(
 	const char *pszReplaceWith, 
 	int iStartFromPos) 
 {
-	SimpleList<int> listMatchesFound; 		
+	std::vector<int> listMatchesFound;
 	
-	int iToReplaceLen = strlen(pszToReplace);
+	int iToReplaceLen = (int)strlen(pszToReplace);
 	if (!iToReplaceLen) {
 		return false;
 	}
 	
-	int iWithLen = strlen(pszReplaceWith);
+	int iWithLen = (int)strlen(pszReplaceWith);
 	while (iStartFromPos <= Len){
 		iStartFromPos = find(pszToReplace, iStartFromPos);
 		if (iStartFromPos == -1)
 			break;
-		listMatchesFound.Append(iStartFromPos);
+		listMatchesFound.push_back(iStartFromPos);
 		iStartFromPos += iToReplaceLen;
 	}
-	if (!listMatchesFound.Number())
+	if (!listMatchesFound.size())
 		return false;
 	
 	int iLenDifPerMatch = iWithLen - iToReplaceLen;
-	int iNewLen = Len + iLenDifPerMatch * listMatchesFound.Number();
+	int iNewLen = Len + iLenDifPerMatch * listMatchesFound.size();
 	char *pNewData = new char[iNewLen+1];
 		
 	int iItemStartInData;
 	int iPosInNewData = 0;
 	int iPreviousEnd = 0;
-	listMatchesFound.Rewind();
-	while(listMatchesFound.Next(iItemStartInData)) {
+	for(size_t i = 0; i < listMatchesFound.size(); i++) {
+		iItemStartInData = listMatchesFound[i];
 		memcpy(pNewData + iPosInNewData, 
 			   Data + iPreviousEnd, 
 			   iItemStartInData - iPreviousEnd);
@@ -560,19 +649,19 @@ MyString::replaceString(
 	return true;
 }
 
-bool
+const char *
 MyString::vformatstr_cat(const char *format,va_list args) 
 {
 	char *buffer = NULL;
 	int s_len;
 
     if( !format || *format == '\0' ) {
-		return true;
+		return Value();
 	}
 #ifdef HAVE_VASPRINTF
 	s_len = vasprintf(&buffer, format, args);
 	if (-1 == s_len) { // if alloc not possible or other error
-		return false;
+		return NULL;
 	}
 #else
     s_len = vprintf_length(format,args);
@@ -580,7 +669,7 @@ MyString::vformatstr_cat(const char *format,va_list args)
     if( Len + s_len > capacity || !Data ) {
 		if(!reserve_at_least( Len + s_len )) {
 			free(buffer);
-			return false;
+			return NULL;
 		}
     }
 #ifdef HAVE_VASPRINTF
@@ -593,13 +682,13 @@ MyString::vformatstr_cat(const char *format,va_list args)
 	::vsprintf(Data + Len, format, args);
 #endif
 	Len += s_len;
-    return true;
+    return Value();
 }
 
-bool 
+const char *
 MyString::formatstr_cat(const char *format,...)
 {
-	bool    succeeded;
+	const char *succeeded;
 	va_list args;
 
 	va_start(args, format);
@@ -609,7 +698,7 @@ MyString::formatstr_cat(const char *format,...)
 	return succeeded;
 }
 
-bool
+const char *
 MyString::vformatstr(const char *format,va_list args)
 {
 	Len = 0;
@@ -617,10 +706,10 @@ MyString::vformatstr(const char *format,va_list args)
 	return vformatstr_cat(format,args);
 }
 
-bool
+const char *
 MyString::formatstr(const char *format,...)
 {
-	bool    succeeded;
+	const char *succeeded;
 	va_list args;
 
 	va_start(args, format);
@@ -667,12 +756,38 @@ MyString::chomp( void )
 	return chomped;
 }
 
+// Trim leading and trailing whitespace in place in the given buffer
+// returns the new size of data in the buffer
+// this does NOT \0 terminate the resulting buffer
+// but you can insure that it is \0 terminated by:
+//   buf[trim_in_place(buf, strlen(buf))] = 0;
+// Because of the way this is coded, if length includes the terminating \0
+// then this will trim only leading whitespace.
+// note: this is here rather than in a string utils because of condorapi
+int trim_in_place(char* buf, int length)
+{
+	int pos = length;
+	while (pos > 1 && isspace(buf[pos-1])) { --pos; }
+	if (pos < length) { length = pos; }
+	pos = 0;
+	while (pos < length && isspace(buf[pos])) { ++pos; }
+	if (pos > 0) {
+		length -= pos;
+		if (length > 0) { memmove(buf, &buf[pos], length); }
+	}
+	return length;
+}
+
 void
 MyString::trim( void )
 {
 	if( Len == 0 ) {
 		return;
 	}
+#if 1 // inline trim
+	Len = trim_in_place(Data, Len);
+	Data[Len] = '\0';
+#else
 	int		begin = 0;
 	while ( begin < Len && isspace(Data[begin]) ) { ++begin; }
 
@@ -680,66 +795,73 @@ MyString::trim( void )
 	while ( end >= 0 && isspace(Data[end]) ) { --end; }
 
 	if ( begin != 0 || end != Length() - 1 ) {
-		*this = Substr(begin, end);
+		*this = substr(begin, 1 + end - begin);
 	}
+#endif
 }
 
-void
-MyString::compressSpaces( void )
+char
+MyString::trim_quotes(const char * quote_chars)
 {
-	if( Len == 0 ) {
-		return;
+	if ( ! quote_chars) quote_chars = "\"";
+	if( Len < 2 ) {
+		return 0;
 	}
-	for ( int i = 0, j = 0; i <= Length(); ++i, ++j ) {
-		if ( isspace ( Data[i] ) ) {
-			i++;
+	char ch = Data[0];
+	if (strchr(quote_chars, ch)) {
+		if (Data[Len - 1] == ch) {
+#if 1 // inline trime
+			if (remove_prefix(&Data[Len-1])) {
+				Len -= 1;
+				Data[Len] = '\0';
+			}
+#else
+			*this = substr(1, Len - 2);
+#endif
+			return ch;
 		}
-		setChar ( j, Data[i] );
 	}
+	return 0;
 }
 
-// if len is 10, this means 10 random ascii characters from the set.
+bool
+MyString::remove_prefix(const char * prefix)
+{
+	if (Len <= 0)
+		return false;
+
+	int pos = 0;
+	for (const char * p = prefix; *p; ++p, ++pos) {
+		if (pos >= Len || *p != Data[pos]) {
+			return false;
+		}
+	}
+
+	if (pos <= 0) {
+		return false;
+	}
+
+	Len -= pos;
+	if (Len > 0) { memmove(Data, &Data[pos], Len); }
+	Data[Len] = 0;
+	return true;
+}
+
 void
-MyString::randomlyGenerate(const char *set, int len)
+MyString::RemoveAllWhitespace( void )
 {
 	int i;
-	int idx;
-	int set_len;
-
-    if (!set || len <= 0) {
-		// passed in NULL set, so automatically MyString is empty
-		// or told the string size is negative or nothing, again empty string.
-		if (Data) {
-			Data[0] = '\0';
+	int j;
+	for ( i = 0, j = 0; i < Length(); i++ ) {
+		if ( !isspace( Data[i] ) ) {
+			if ( i != j ) {
+				Data[j] = Data[i];
+			}
+			j++;
 		}
-		Len = 0;
-		// leave capacity alone.
-		return;
 	}
-
-	// start over from scratch with this string.
-    if (Data) {
-		delete[] Data;
-	}
-
-	Data = new char[len+1]; 
-	Data[len] = '\0';
-	Len = len;
-	capacity = len;
-
-	set_len = strlen(set);
-
-	// now pick randomly from the set and fill stuff in
-	for (i = 0; i < len ; i++) {
-		idx = get_random_int() % set_len;
-		Data[i] = set[idx];
-	}
-}
-
-void
-MyString::randomlyGenerateHex(int len)
-{
-	randomlyGenerate("0123456789abcdef", len);
+	Data[j] = '\0';
+	Len = j;
 }
 
 void
@@ -748,9 +870,11 @@ MyString::init()
     Data=NULL;
     Len=0;
     capacity = 0;
+#if 0
 	tokenBuf = NULL;
 	nextToken = NULL;
 	dummy = '\0';
+#endif
 }
 
 /*--------------------------------------------------------------------
@@ -876,12 +1000,76 @@ MyString::readLine( FILE* fp, bool append )
 		} else {
 			*this += buf;
 		}
-		if( Len && Data[Len-1] == '\n' ) {
+		if( Len && Data[Len-1] == '\n' )
+		{
 				// we found a newline, return success
 			return true;
 		}
 	}
 }
+
+// the MyStringFpSource can just use MyString::readLine
+bool
+MyStringFpSource::readLine(MyString & str, bool append /* = false*/)
+{
+	return str.readLine(fp, append);
+}
+
+bool
+MyStringFpSource::isEof()
+{
+	return feof(fp) != 0;
+}
+
+
+// the MyStringCharSource scans a string buffer returning
+// whenver it sees a \n
+bool
+MyStringCharSource::readLine(MyString & str, bool append /* = false*/)
+{
+	ASSERT(ptr || ! ix);
+	char * p = ptr+ix;
+
+	// if no buffer, we are at EOF
+	if ( ! p) {
+		if ( ! append) str.clear();
+		return false;
+	}
+
+	// scan for the next \n and return it plus all the chars up until it
+	int cch = 0;
+	while (p[cch] && p[cch] != '\n') ++cch;
+	if (p[cch] == '\n') ++cch;
+
+	// if we did not advance, then we are at EOF
+	if ( ! cch) {
+		if ( ! append) str.clear();
+		return false;
+	}
+
+	if (append) {
+		str.append_str(p, cch);
+	} else {
+		str.assign_str(p, cch);
+	}
+
+	// advance the current position past what we returned.
+	ix += cch;
+	return true;
+}
+
+bool
+MyStringCharSource::isEof()
+{
+	return !ptr || !ptr[ix];
+}
+
+// populate a MyString from any MyStringSource
+//
+bool MyString::readLine( MyStringSource & src, bool append /*= false*/) {
+	return src.readLine(*this, append);
+}
+
 
 /*--------------------------------------------------------------------
  *
@@ -889,8 +1077,95 @@ MyString::readLine( FILE* fp, bool append )
  *
  *--------------------------------------------------------------------*/
 
+MyStringTokener::MyStringTokener() : tokenBuf(NULL), nextToken(NULL) {}
+
+MyStringTokener &
+MyStringTokener::operator=(MyStringTokener &&rhs) {
+	free(tokenBuf);
+	this->tokenBuf = rhs.tokenBuf;
+	this->nextToken = rhs.nextToken;
+	rhs.tokenBuf = nullptr;
+	rhs.nextToken = nullptr;
+	return *this;
+}
+
+MyStringTokener::~MyStringTokener()
+{
+	if (tokenBuf) {
+		free(tokenBuf);
+		tokenBuf = NULL;
+	}
+	nextToken = NULL;
+}
+
+void MyStringTokener::Tokenize(const char *str)
+{
+	if (tokenBuf) { 
+		free( tokenBuf );
+		tokenBuf = NULL;
+	}
+	nextToken = NULL;
+	if ( str ) {
+		tokenBuf = strdup( str );
+		if ( strlen( tokenBuf ) > 0 ) {
+			nextToken = tokenBuf;
+		}
+	}
+}
+
+const char *MyStringTokener::GetNextToken(const char *delim, bool skipBlankTokens)
+{
+	const char *result = nextToken;
+
+	if ( !delim || strlen(delim) == 0 ) {
+		result = NULL;
+	}
+
+	if ( result != NULL ) {
+		while ( *nextToken != '\0' && index(delim, *nextToken) == NULL ) {
+			nextToken++;
+		}
+
+		if ( *nextToken != '\0' ) {
+			*nextToken = '\0';
+			nextToken++;
+		} else {
+			nextToken = NULL;
+		}
+	}
+
+	if ( skipBlankTokens && result && strlen(result) == 0 ) {
+		result = GetNextToken(delim, skipBlankTokens);
+	}
+
+	return result;
+}
+
+
+MyStringWithTokener::MyStringWithTokener(const MyString &S)
+{
+	init();
+	assign_str(S.Value(), S.Len);
+}
+
+MyStringWithTokener::MyStringWithTokener(const char *s)
+{
+	init();
+	size_t s_len = s ? strlen(s) : 0;
+	assign_str(s, (int)s_len);
+}
+
+MyStringWithTokener &
+MyStringWithTokener::operator=(MyStringWithTokener &&rhs) {
+	MyString::operator=(rhs);
+	this->tok = std::move(rhs.tok);
+	return *this;
+}
+
+#if 1
+#else
 void
-MyString::Tokenize()
+MyStringWithTokener::Tokenize()
 {
 	delete [] tokenBuf;
 	tokenBuf = new char[strlen(Value()) + 1];
@@ -903,7 +1178,7 @@ MyString::Tokenize()
 }
 
 const char *
-MyString::GetNextToken(const char *delim, bool skipBlankTokens)
+MyStringTokener::GetNextToken(const char *delim, bool skipBlankTokens)
 {
 	const char *result = nextToken;
 
@@ -928,17 +1203,58 @@ MyString::GetNextToken(const char *delim, bool skipBlankTokens)
 
 	return result;
 }
+#endif
 
 
 /*--------------------------------------------------------------------
  *
- * Private
+ * YourString
  *
  *--------------------------------------------------------------------*/
 
-unsigned int MyStringHash( const MyString &str )
-{
-	return str.Hash();
+// Note that the comparison operators here treat a NULL in YourString as valid
+// NULL is < than all other strings, equal to itself and NOT equal to ""
+//
+
+bool YourString::operator ==(const char * str) const {
+	if (m_str == str) return true;
+	if ((!m_str) || (!str)) return false;
+	return strcmp(m_str,str) == 0;
 }
+bool YourString::operator ==(const YourString &rhs) const {
+	if (m_str == rhs.m_str) return true;
+	if ((!m_str) || (!rhs.m_str)) return false;
+	return strcmp(m_str,rhs.m_str) == 0;
+}
+bool YourString::operator<(const char * str) const {
+	if ( ! m_str) { return str ? true : false; }
+	else if ( ! str) { return false; }
+	return strcmp(m_str, str) < 0;
+}
+bool YourString::operator<(const YourString &rhs) const {
+	if ( ! m_str) { return rhs.m_str ? true : false; }
+	else if ( ! rhs.m_str) { return false; }
+	return strcmp(m_str, rhs.m_str) < 0;
+}
+
+
+bool YourStringNoCase::operator ==(const char * str) const {
+	if (m_str == str) return true;
+	if ((!m_str) || (!str)) return false;
+	return strcasecmp(m_str,str) == 0;
+}
+bool YourStringNoCase::operator ==(const YourStringNoCase &rhs) const {
+	if (m_str == rhs.m_str) return true;
+	if ((!m_str) || (!rhs.m_str)) return false;
+	return strcasecmp(m_str,rhs.m_str) == 0;
+}
+bool YourStringNoCase::operator <(const char * str) const {
+	if ( ! m_str) { return str ? true : false; }
+	else if ( ! str) { return false; }
+	return strcasecmp(m_str, str) < 0;
+}
+
+
+
 
 

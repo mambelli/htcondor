@@ -41,25 +41,18 @@ const std::string netgroup_detected = "***";
 #endif
 
 // Hash function for Permission hash table
-static unsigned int
+static size_t
 compute_perm_hash(const in6_addr &in_addr)
 {
 		// the hash function copied from MyString::Hash()
 	int Len = sizeof(in6_addr);
 	const unsigned char* Data = (const unsigned char*)&in_addr;
 	int i;
-	unsigned int result = 0;
+	size_t result = 0;
 	for(i = 0; i < Len; i++) {
 		result = (result<<5) + result + Data[i];
 	}
 	return result;
-}
-
-// Hash function for HolePunchTable_t hash tables
-static unsigned int
-compute_host_hash( const MyString & str )
-{
-	return ( str.Hash() );
 }
 
 // == operator for struct in_addr, also needed for hash table template
@@ -78,7 +71,7 @@ IpVerify::IpVerify()
 		PunchedHoleArray[perm] = NULL;
 	}
 
-	PermHashTable = new PermHashTable_t(797, compute_perm_hash);
+	PermHashTable = new PermHashTable_t(compute_perm_hash);
 }
 
 
@@ -114,8 +107,10 @@ IpVerify::~IpVerify()
 int
 IpVerify::Init()
 {
-	char *pAllow = NULL, *pDeny = NULL, *pOldAllow = NULL, *pOldDeny = NULL,
-		*pNewAllow = NULL, *pNewDeny = NULL;
+	if (did_init) {
+		return TRUE;
+	}
+	char *pAllow = NULL, *pDeny = NULL;
 	DCpermission perm;
 	const char* const ssysname = get_mySubSystem()->getName();	
 
@@ -161,63 +156,52 @@ IpVerify::Init()
 			// subsystems only load the CLIENT lists, since they have no
 			// command port and don't need the other authorization lists.
 			if(strcmp(PermString(perm),"CLIENT")==0){ 
-				pNewAllow = SecMan::getSecSetting("ALLOW_%s",perm,&allow_param, ssysname );
-				pOldAllow = SecMan::getSecSetting("HOSTALLOW_%s",perm,&allow_param, ssysname );
-				pNewDeny = SecMan::getSecSetting("DENY_%s",perm,&deny_param, ssysname );
-				pOldDeny = SecMan::getSecSetting("HOSTDENY_%s",perm,&deny_param, ssysname );
+				pAllow = SecMan::getSecSetting("ALLOW_%s",perm,&allow_param, ssysname );
+				pDeny = SecMan::getSecSetting("DENY_%s",perm,&deny_param, ssysname );
 			}
 		} else {
-			pNewAllow = SecMan::getSecSetting("ALLOW_%s",perm,&allow_param, ssysname );
-			pOldAllow = SecMan::getSecSetting("HOSTALLOW_%s",perm,&allow_param, ssysname );
-			pNewDeny = SecMan::getSecSetting("DENY_%s",perm,&deny_param, ssysname );
-			pOldDeny = SecMan::getSecSetting("HOSTDENY_%s",perm,&deny_param, ssysname );
+			pAllow = SecMan::getSecSetting("ALLOW_%s",perm,&allow_param, ssysname );
+			pDeny = SecMan::getSecSetting("DENY_%s",perm,&deny_param, ssysname );
 		}
-		// concat the two
-		pAllow = merge(pNewAllow, pOldAllow);
-		// concat the two
-		pDeny = merge(pNewDeny, pOldDeny);
 		if( pAllow ) {
 			dprintf ( D_SECURITY, "IPVERIFY: allow %s: %s (from config value %s)\n", PermString(perm),pAllow,allow_param.Value());
 		}
 		if( pDeny ) {
 			dprintf ( D_SECURITY, "IPVERIFY: deny %s: %s (from config value %s)\n", PermString(perm),pDeny,deny_param.Value());
 		}
-		// Treat a "*", "*/*" for ALLOW_XXX as if it's just undefined,
-		// because that's the optimized default, except for
-		// CONFIG_PERM which has a different default (see below).
-		if( perm != CONFIG_PERM ) {
-			if(pAllow && (!strcmp(pAllow, "*") || !strcmp(pAllow, "*/*"))) {
-				free( pAllow );
-				pAllow = NULL;
+
+		// Treat "*" or "*/*" specially, because that's an optimized default.
+		bool allowAll = pAllow && (!strcmp(pAllow, "*") || !strcmp(pAllow, "*/*"));
+		bool denyAll = pDeny && (!strcmp(pDeny, "*") || !strcmp(pDeny, "*/*"));
+
+		// Optimized cases
+		if (perm == ALLOW) {
+			pentry->behavior = USERVERIFY_ALLOW;
+		} else if (denyAll || (!pAllow && (perm != READ && perm != WRITE))) { // Deny everyone
+			// READ or WRITE may be implicitly allowed by other permissions
+			pentry->behavior = USERVERIFY_DENY;
+			dprintf( D_SECURITY, "ipverify: %s optimized to deny everyone\n", PermString(perm) );
+		} else if (allowAll) {
+			if (!pDeny) { // Allow anyone
+				pentry->behavior = USERVERIFY_ALLOW;
+				dprintf( D_SECURITY, "ipverify: %s optimized to allow anyone\n", PermString(perm) );
+			} else {
+				pentry->behavior = USERVERIFY_ONLY_DENIES;
+				fill_table( pentry, pDeny, false );
 			}
 		}
-		if ( !pAllow && !pDeny ) {
-			if (perm == CONFIG_PERM) { 	  // deny all CONFIG requests 
-				pentry->behavior = USERVERIFY_DENY; // by default
-				dprintf( D_SECURITY, "ipverify: %s optimized to deny everyone\n", PermString(perm) );
-			} else {
-				pentry->behavior = USERVERIFY_ALLOW;
-				if( perm != ALLOW ) {
-					dprintf( D_SECURITY, "ipverify: %s optimized to allow anyone\n", PermString(perm) );
-				}
-			}
-		} else {
-			if ( pDeny && !pAllow && perm != CONFIG_PERM ) {
-				pentry->behavior = USERVERIFY_ONLY_DENIES;
-			} else {
-				pentry->behavior = USERVERIFY_USE_TABLE;
-			}
+
+		// Only load table entries if necessary
+		if (pentry->behavior == USERVERIFY_USE_TABLE) {
 			if ( pAllow ) {
 				fill_table( pentry, pAllow, true );
-				free(pAllow);
-				pAllow = NULL;
 			}
 			if ( pDeny ) {
-				fill_table( pentry,	pDeny, false );
-				free(pDeny);
-				pDeny = NULL;
+				fill_table( pentry, pDeny, false );
 			}
 		}
+
+        // Free up strings for next time around the loop
 		if (pAllow) {
 			free(pAllow);
 			pAllow = NULL;
@@ -226,49 +210,11 @@ IpVerify::Init()
 			free(pDeny);
 			pDeny = NULL;
 		}
-		if (pOldAllow) {
-			free(pOldAllow);
-			pOldAllow = NULL;
-		}
-		if (pOldDeny) {
-			free(pOldDeny);
-			pOldDeny = NULL;
-		}
-		if (pNewAllow) {
-			free(pNewAllow);
-			pNewAllow = NULL;
-		}
-		if (pNewDeny) {
-			free(pNewDeny);
-			pNewDeny = NULL;
-		}
 	}
 	dprintf(D_FULLDEBUG|D_SECURITY,"Initialized the following authorization table:\n");
 	if(PermHashTable)	
 		PrintAuthTable(D_FULLDEBUG|D_SECURITY);
 	return TRUE;
-}
-
-char * IpVerify :: merge(char * pNewList, char * pOldList)
-{
-    char * pList = NULL;
-
-    if (pOldList) {
-        if (pNewList) {
-            pList = (char *)malloc(strlen(pOldList) + strlen(pNewList) + 2);
-            ASSERT( pList );
-            sprintf(pList, "%s,%s", pNewList, pOldList);
-        }
-        else {
-            pList = strdup(pOldList);
-        }
-    }
-    else {
-        if (pNewList) {
-            pList = strdup(pNewList);
-        }
-    }
-    return pList;
 }
 
 bool IpVerify :: has_user(UserPerm_t * perm, const char * user, perm_mask_t & mask )
@@ -326,7 +272,7 @@ IpVerify::add_hash_entry(const struct in6_addr & sin6_addr, const char * user, p
         }
 	}
     else {
-        perm = new UserPerm_t(42, compute_host_hash);
+        perm = new UserPerm_t(hashFunction);
         if (PermHashTable->insert(sin6_addr, perm) != 0) {
             delete perm;
             return FALSE;
@@ -475,19 +421,64 @@ IpVerify::PrintAuthTable(int dprintf_level) {
 	}
 }
 
-// If host is a valid hostname, add its IP addresses to the list.
-// Always add host itself to the list.
 static void
-ExpandHostAddresses(char const *host,StringList *list)
+ExpandHostAddresses( char const * entry, StringList * list )
 {
-	list->append(host);
-	condor_netaddr netaddr;
+	//
+	// What we're actually passed are entries in a security list.  An entry
+	// may be: an IP literal, a network literal or wildcard, a hostname
+	// literal or wildcard, a fully-qualified HTCondor user name (as resulting
+	// from the unified map file and including a '/'), or a (semi-)sinful
+	// string.
+	//
+	// Nothing aside from a sinful allows '?', but we do have to check for
+	// <host|ip>:<port> semi-sinful strings.
+	//
+	// It's not all clear that it's wise to include entries that we don't
+	// recognize in the StringList, but for backwards-compatibility, we'll
+	// try it.
+	//
+	list->append( entry );
 
-	if (strchr(host,'*') || strchr(host,'/') || netaddr.from_net_string(host)) {
-		return; // not a valid hostname, so don't bother trying to look it up
+	//
+	// Because we allow hostnames in sinfuls, and allow unbracketed sinfuls,
+	// the sinful parser is considerably more lax than I would like.  Detect
+	// wildcards and FQUNs first; if the entry is wildcarded or a FQUN,
+	// we're done.  (Determining if the entry is valid must be done later.)
+	//
+	// As far as I know, valid original and v1 Sinfuls don't use either of
+	// these characters in their serialization.  This is something of a gotcha
+	// waiting to happen, but doing things in the other order would require
+	// doing DNS lookups during Sinful parsing, which is probably a Bad Idea.
+	//
+	if( strchr( entry, '*' ) || strchr( entry, '/' ) ) {
+		return;
 	}
 
-	std::vector<condor_sockaddr> addrs = resolve_hostname(host);
+	//
+	// If it's a valid network specifier, we're done.  This includes IPv4
+	// and IPv6 literals (which makes the ':' in the next test safe).
+	//
+	condor_netaddr netaddr;
+	if( netaddr.from_net_string( entry ) ) {
+		return;
+	}
+
+	//
+	// If it's a Sinful string, we're done.
+	//
+	if(	   strchr( entry, '<' ) || strchr( entry, '>' )
+		|| strchr( entry, '?' ) || strchr( entry, ':' ) ) {
+		dprintf( D_ALWAYS, "WARNING: Not attempting to resolve '%s' from the "
+			"security list: it looks like a Sinful string.  A Sinful string "
+			"specifies how to contact a daemon, but not which address it "
+			"uses when contacting others.  Use the bare hostname of the "
+			"trusted machine, or an IP address (if known and unique).\n",
+			entry );
+		return;
+	}
+
+	std::vector<condor_sockaddr> addrs = resolve_hostname(entry);
 	for (std::vector<condor_sockaddr>::iterator iter = addrs.begin();
 		 iter != addrs.end();
 		 ++iter) {
@@ -502,7 +493,7 @@ IpVerify::fill_table(PermTypeEntry * pentry, char * list, bool allow)
     assert(pentry);
 
 	NetStringList * whichHostList = new NetStringList();
-    UserHash_t * whichUserHash = new UserHash_t(1024, compute_host_hash);
+    UserHash_t * whichUserHash = new UserHash_t(hashFunction);
 
     StringList slist(list);
 	char *entry, * host, * user;
@@ -652,7 +643,6 @@ void IpVerify :: split_entry(const char * perm_entry, char ** host, char** user)
 			} else {
 				condor_netaddr netaddr;
 				if (netaddr.from_net_string(permbuf)) {
-				//if (is_valid_network(permbuf, NULL, NULL)) {
 					*user = strdup("*");
 					*host = strdup(permbuf);
 				} else {
@@ -718,7 +708,7 @@ IpVerify::Verify( DCpermission perm, const condor_sockaddr& addr, const char * u
     }
 
 	if ( perm >= LAST_PERM || !PermTypeArray[perm] ) {
-		EXCEPT("IpVerify::Verify: called with unknown permission %d\n",perm);
+		EXCEPT("IpVerify::Verify: called with unknown permission %d",perm);
 	}
 
 
@@ -771,7 +761,7 @@ IpVerify::Verify( DCpermission perm, const condor_sockaddr& addr, const char * u
 	}
 
 	if ( PermTypeArray[perm]->behavior == USERVERIFY_ALLOW ) {
-			// allow if no HOSTALLOW_* or HOSTDENY_* restrictions 
+			// allow if no ALLOW_* or DENY_* restrictions 
 			// specified.
 		if( allow_reason ) {
 			allow_reason->formatstr(
@@ -871,7 +861,7 @@ IpVerify::Verify( DCpermission perm, const condor_sockaddr& addr, const char * u
 			// (perhaps because this host doesn't appear in any list), create one
 			// and then add to the table.
 			// But first, check our parent permission levels in the
-			// authorization heirarchy.
+			// authorization hierarchy.
 			// DAEMON and ADMINISTRATOR imply WRITE.
 			// WRITE, NEGOTIATOR, and CONFIG_PERM imply READ.
 		bool determined_by_parent = false;
@@ -1047,12 +1037,12 @@ IpVerify::lookup_user(NetStringList *hosts, UserHash_t *users, netgroup_list_t& 
 // granted to a remote startd host when a shadow starts up.)
 //
 bool
-IpVerify::PunchHole(DCpermission perm, MyString& id)
+IpVerify::PunchHole(DCpermission perm, const MyString& id)
 {
 	int count = 0;
 	if (PunchedHoleArray[perm] == NULL) {
 		PunchedHoleArray[perm] =
-			new HolePunchTable_t(compute_host_hash);
+			new HolePunchTable_t(hashFunction);
 		ASSERT(PunchedHoleArray[perm] != NULL);
 	}
 	else {
@@ -1100,7 +1090,7 @@ IpVerify::PunchHole(DCpermission perm, MyString& id)
 // FillHole - plug up a dynamically punched authorization hole
 //
 bool
-IpVerify::FillHole(DCpermission perm, MyString& id)
+IpVerify::FillHole(DCpermission perm, const MyString& id)
 {
 	HolePunchTable_t* table = PunchedHoleArray[perm];
 	if (table == NULL) {
@@ -1176,71 +1166,3 @@ IpVerify::PermTypeEntry::~PermTypeEntry() {
 	}
 }
 
-
-#ifdef WANT_STANDALONE_TESTING
-#include "condor_io.h"
-#ifdef WIN32
-#	include <crtdbg.h>
-   _CrtMemState s1, s2, s3;
-#endif
-int
-main()
-{
-	char buf[50];
-	char buf1[50];
-	struct sockaddr_in sin;
-	SafeSock ssock;
-	IpVerify* userverify;
-
-	set_mySubSystem( "COLLECTOR", SUBSYSTEM_TYPE_COLLECTOR );
-
-	config();
-
-#ifdef WIN32
-	_CrtMemCheckpoint( &s1 );
-#endif
-
-	userverify = new IpVerify();
-
-	userverify->Init();
-
-	buf[0] = '\0';
-
-	while( 1 ) {
-		printf("Enter test:\n");
-		scanf("%s",buf);
-		if ( strncmp(buf,"exit",4) == 0 )
-			break;
-		if ( strncmp(buf,"reinit",6) == 0 ) {
-			config();
-			userverify->Init();
-			continue;
-		}
-		printf("Verifying %s ... ",buf);
-		sprintf(buf1,"<%s:1970>",buf);
-		string_to_sin(buf1,&sin);
-		if ( userverify->Verify(WRITE,&sin) == TRUE )
-			printf("ALLOW\n");
-		else
-			printf("DENY\n");
-	}
-	
-	delete userverify;
-
-#ifdef WIN32
-	_CrtMemCheckpoint( &s2 );
-	// _CrtMemDumpAllObjectsSince( &s1 );
-    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDOUT);
-    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDOUT);
-    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDOUT);
-	if ( _CrtMemDifference( &s3, &s1, &s2 ) )
-      _CrtMemDumpStatistics( &s3 );
-	// _CrtDumpMemoryLeaks();	// report any memory leaks on Win32
-#endif
-
-	return TRUE;
-}
-#endif	// of WANT_STANDALONE_TESTING

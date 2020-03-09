@@ -26,7 +26,6 @@
 #include "selector.h"
 #include "CondorError.h"
 #include "ccb_client.h"
-#include "daemon_core_sock_adapter.h"
 #include "condor_sinful.h"
 #include "shared_port_endpoint.h"
 
@@ -34,7 +33,7 @@ static bool registered_reverse_connect_command = false;
 
 // hash of CCBClients waiting for a reverse connect command
 // indexed by connection id
-static HashTable< MyString,classy_counted_ptr<CCBClient> > waiting_for_reverse_connect(MyStringHash);
+static HashTable< std::string,classy_counted_ptr<CCBClient> > waiting_for_reverse_connect(hashFunction);
 
 
 
@@ -64,7 +63,7 @@ CCBClient::CCBClient( char const *ccb_contact, ReliSock *target_sock ):
 	unsigned char *keybuf = Condor_Crypt_Base::randomKey(keylen);
 	size_t i;
 	for(i=0;i<keylen;i++) {
-		m_connect_id.formatstr_cat("%02x",keybuf[i]);
+		formatstr(m_connect_id,"%02x",keybuf[i]);
 	}
 	free( keybuf );
 }
@@ -75,7 +74,7 @@ CCBClient::~CCBClient()
 		delete m_ccb_sock;
 	}
 	if( m_deadline_timer != -1 ) {
-		daemonCoreSockAdapter.Cancel_Timer(m_deadline_timer);
+		daemonCore->Cancel_Timer(m_deadline_timer);
 		m_deadline_timer = -1;
 	}
 }
@@ -85,6 +84,11 @@ bool
 CCBClient::ReverseConnect( CondorError *error, bool non_blocking )
 {
 	if( non_blocking ) {
+		// Non-blocking mode requires DaemonCore
+		if ( !daemonCore ) {
+			dprintf( D_ALWAYS, "Can't do non-blocking CCB reverse connection without DaemonCore!\n" );
+			return false;
+		}
 		m_target_sock->enter_reverse_connecting_state();
 		// NOTE: now we _must_ call exit_reverse_connecting_state()
 		// before we are done with m_target_sock.  This state
@@ -101,16 +105,16 @@ CCBClient::ReverseConnect( CondorError *error, bool non_blocking )
 	return ReverseConnect_blocking( error );
 }
 
-MyString
+std::string
 CCBClient::myName()
 {
 	// This is purely for debugging purposes.
 	// It is who we say we are when talking to the CCB server.
-	MyString name;
+	std::string name;
 	name = get_mySubSystem()->getName();
-	if( daemonCoreSockAdapter.isEnabled() ) {
+	if( daemonCore && daemonCore->publicNetworkIpAddr() ) {
 		name += " ";
-		name += daemonCoreSockAdapter.publicNetworkIpAddr();
+		name += daemonCore->publicNetworkIpAddr();
 	}
 	return name;
 }
@@ -118,55 +122,74 @@ CCBClient::myName()
 bool
 CCBClient::ReverseConnect_blocking( CondorError *error )
 {
-	counted_ptr<ReliSock> listen_sock;
-	counted_ptr<SharedPortEndpoint> shared_listener;
+	std::shared_ptr<ReliSock> listen_sock;
+	std::shared_ptr<SharedPortEndpoint> shared_listener;
 	char const *listener_addr = NULL;
-
-	if( SharedPortEndpoint::UseSharedPort() ) {
-		shared_listener = counted_ptr<SharedPortEndpoint>(new SharedPortEndpoint());
-		shared_listener->InitAndReconfig();
-		MyString errmsg;
-		if( !shared_listener->CreateListener() ) {
-			errmsg.formatstr("Failed to create shared port endpoint for reversed connection from %s.",
-						   m_target_peer_description.Value());
-		}
-		else if( !(listener_addr = shared_listener->GetMyRemoteAddress()) ) {
-			errmsg.formatstr("Failed to get remote address for shared port endpoint for reversed connection from %s.",
-						   m_target_peer_description.Value());
-		}
-		if( !listener_addr ) {
-			if( error ) {
-				error->push("CCBClient", CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
-			}
-			dprintf(D_ALWAYS,"CCBClient: %s\n",errmsg.Value());
-			return false;
-		}
-	}
-	else {
-		listen_sock = counted_ptr<ReliSock>(new ReliSock());
-		listen_sock->bind(false,0);
-		if( !listen_sock->listen() ) {
-			MyString errmsg;
-			errmsg.formatstr("Failed to listen for reversed connection from %s.",
-						   m_target_peer_description.Value());
-			if( error ) {
-				error->push("CCBClient", CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
-			}
-			dprintf(D_ALWAYS,"CCBClient: %s\n",errmsg.Value());
-
-			return false;
-		}
-		listener_addr = listen_sock->get_sinful_public();
-	}
-	ASSERT( listener_addr );
 
 	m_ccb_contacts.rewind();
 	char const *ccb_contact;
 	while( (ccb_contact = m_ccb_contacts.next()) ) {
 		bool success = false;
-		MyString ccb_address, ccbid;
-		if( !SplitCCBContact( ccb_contact, ccb_address, ccbid, error ) ) {
+		std::string ccb_address, ccbid;
+		if( !SplitCCBContact( ccb_contact, ccb_address, ccbid, m_target_peer_description, error ) ) {
 			continue;
+		}
+
+		//
+		// Generate a listen port for the appropriate protocol.  It will be
+		// distressing that we're passed CCB contact strings rather than
+		// sinfuls, when it's time to handle multiple addresses...
+		//
+		// FIXME: Assumes that shared port knows what it's doing.
+		//
+		if( SharedPortEndpoint::UseSharedPort() ) {
+			shared_listener = std::shared_ptr<SharedPortEndpoint>(new SharedPortEndpoint());
+			shared_listener->InitAndReconfig();
+			MyString errmsg;
+			if( !shared_listener->CreateListener() ) {
+				errmsg.formatstr( "Failed to create shared port endpoint for reversed connection from %s.",
+					m_target_peer_description.c_str() );
+			}
+			else if( !(listener_addr = shared_listener->GetMyRemoteAddress()) ) {
+				errmsg.formatstr( "Failed to get remote address for shared port endpoint for reversed connection from %s.",
+					m_target_peer_description.c_str() );
+			}
+			if( !listener_addr ) {
+				if( error ) {
+					error->push( "CCBClient", CEDAR_ERR_CONNECT_FAILED, errmsg.Value() );
+				}
+				dprintf(D_ALWAYS,"CCBClient: %s\n",errmsg.Value());
+				return false;
+			}
+		} else {
+			condor_sockaddr ccbSA;
+			MyString faked_sinful = "<" + ccb_address + ">";
+			if( ! ccbSA.from_sinful( faked_sinful ) ) {
+				dprintf( D_FULLDEBUG, "Failed to generate condor_sockaddr from faked sinful '%s', ignoring this broker.\n", faked_sinful.Value() );
+				continue;
+			}
+
+			listen_sock = std::shared_ptr<ReliSock>( new ReliSock() );
+
+			// Should bind() should accept a condor_sockaddr directly?
+			if (!listen_sock->bind( ccbSA.get_protocol(), false, 0, false )) {
+				dprintf(D_ALWAYS,"CCBClient: can't bind listen socket\n");
+				return false;
+			}
+
+			if( ! listen_sock->listen() ) {
+				MyString errmsg;
+				errmsg.formatstr( "Failed to listen for reversed connection from %s.",
+					m_target_peer_description.c_str() );
+				if( error ) {
+					error->push("CCBClient", CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
+				}
+				dprintf(D_ALWAYS,"CCBClient: %s\n",errmsg.Value());
+
+				return false;
+			}
+
+			listener_addr = listen_sock->get_sinful_public();
 		}
 
 		ClassAd msg;
@@ -174,17 +197,20 @@ CCBClient::ReverseConnect_blocking( CondorError *error )
 		msg.Assign(ATTR_CLAIM_ID,m_connect_id);
 		// purely for debugging purposes: identify ourselves
 		msg.Assign(ATTR_NAME, myName());
+		// ATTR_MY_ADDRESS is functional and subject to address rewriting,
+		// but it's not OK to be protocol-blind, because we won't recognize
+		// the port number (it's not a command socket).
 		msg.Assign(ATTR_MY_ADDRESS, listener_addr);
 
 		dprintf(D_NETWORK|D_FULLDEBUG,
 				"CCBClient: requesting reverse connection to %s "
 				"via CCB server %s#%s; I am listening at %s.\n",
-				m_target_peer_description.Value(),
-				ccb_address.Value(),
-				ccbid.Value(),
+				m_target_peer_description.c_str(),
+				ccb_address.c_str(),
+				ccbid.c_str(),
 				listener_addr);
 
-		Daemon ccb(DT_COLLECTOR,ccb_address.Value(),NULL);
+		Daemon ccb(DT_COLLECTOR,ccb_address.c_str(),NULL);
 		if( m_ccb_sock ) {
 			delete m_ccb_sock;
 		}
@@ -205,7 +231,7 @@ CCBClient::ReverseConnect_blocking( CondorError *error )
 					"CCBClient",
 					CEDAR_ERR_CONNECT_FAILED,
 					"Failed to write request to CCB server %s.",
-					ccb_address.Value());
+					ccb_address.c_str());
 			}
 		}
 
@@ -255,9 +281,9 @@ CCBClient::ReverseConnect_blocking( CondorError *error )
 				errmsg.formatstr(
 					"Timed out waiting for response after requesting reversed "
 					"connection from %s ccbid %s via CCB server %s.",
-					m_target_peer_description.Value(),
-					ccbid.Value(),
-					ccb_address.Value());
+					m_target_peer_description.c_str(),
+					ccbid.c_str(),
+					ccb_address.c_str());
 
 				if( error ) {
 					error->push("CCBClient",CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
@@ -283,7 +309,7 @@ CCBClient::ReverseConnect_blocking( CondorError *error )
 					if( shared_listener.get() ) {
 						shared_listener->RemoveListenerFromSelector(selector);
 							// destruct the shared port endpoint
-						shared_listener = counted_ptr<SharedPortEndpoint>(NULL);
+						shared_listener = std::shared_ptr<SharedPortEndpoint>(NULL);
 					}
 
 					success = true;
@@ -314,14 +340,14 @@ CCBClient::ReverseConnect_blocking( CondorError *error )
 	return false;
 }
 
-bool CCBClient::SplitCCBContact( char const *ccb_contact, MyString &ccb_address, MyString &ccbid, CondorError *error )
+bool CCBClient::SplitCCBContact( char const *ccb_contact, std::string &ccb_address, std::string &ccbid, const std::string & peer, CondorError *error )
 {
 	// expected format: "<address>#ccbid"
 	char const *ptr = strchr(ccb_contact,'#');
 	if( !ptr ) {
 		MyString errmsg;
 		errmsg.formatstr("Bad CCB contact '%s' when connecting to %s.",
-					   ccb_contact, m_target_peer_description.Value());
+					   ccb_contact, peer.c_str());
 
 		if( error ) {
 			error->push("CCBClient",CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
@@ -331,14 +357,13 @@ bool CCBClient::SplitCCBContact( char const *ccb_contact, MyString &ccb_address,
 		}
 		return false;
 	}
-	ccb_address = ccb_contact;
-	ccb_address.setChar(ptr-ccb_contact,'\0');
+	ccb_address.assign(ccb_contact, ptr-ccb_contact);
 	ccbid = ptr+1;
 	return true;
 }
 
 bool
-CCBClient::AcceptReversedConnection(counted_ptr<ReliSock> listen_sock,counted_ptr<SharedPortEndpoint> shared_listener)
+CCBClient::AcceptReversedConnection(std::shared_ptr<ReliSock> listen_sock,std::shared_ptr<SharedPortEndpoint> shared_listener)
 {
 	// This happens when we are in ReverseConnect_blocking().
 	// and our listen socket becomes readable, indicating that
@@ -351,7 +376,7 @@ CCBClient::AcceptReversedConnection(counted_ptr<ReliSock> listen_sock,counted_pt
 			dprintf(D_ALWAYS,
 					"CCBClient: failed to accept() reversed connection "
 					"via shared port (intended target is %s)\n",
-					m_target_peer_description.Value());
+					m_target_peer_description.c_str());
 			return false;
 		}
 	}
@@ -359,7 +384,7 @@ CCBClient::AcceptReversedConnection(counted_ptr<ReliSock> listen_sock,counted_pt
 		dprintf(D_ALWAYS,
 				"CCBClient: failed to accept() reversed connection "
 				"(intended target is %s)\n",
-				m_target_peer_description.Value());
+				m_target_peer_description.c_str());
 		return false;
 	}
 
@@ -375,12 +400,12 @@ CCBClient::AcceptReversedConnection(counted_ptr<ReliSock> listen_sock,counted_pt
 				"CCBClient: failed to read hello message from reversed "
 				"connection %s (intended target is %s)\n",
 				m_target_sock->default_peer_description(),
-				m_target_peer_description.Value());
+				m_target_peer_description.c_str());
 		m_target_sock->close();
 		return false;
 	}
 
-	MyString connect_id;
+	std::string connect_id;
 	msg.LookupString(ATTR_CLAIM_ID,connect_id);
 
 	if( cmd != CCB_REVERSE_CONNECT || connect_id != m_connect_id ) {
@@ -388,7 +413,7 @@ CCBClient::AcceptReversedConnection(counted_ptr<ReliSock> listen_sock,counted_pt
 				"CCBClient: invalid hello message from reversed "
 				"connection %s (intended target is %s)\n",
 				m_target_sock->default_peer_description(),
-				m_target_peer_description.Value());
+				m_target_peer_description.c_str());
 		m_target_sock->close();
 		return false;
 	}
@@ -397,7 +422,7 @@ CCBClient::AcceptReversedConnection(counted_ptr<ReliSock> listen_sock,counted_pt
 			"CCBClient: received reversed connection %s "
 			"(intended target is %s)\n",
 			m_target_sock->default_peer_description(),
-			m_target_peer_description.Value());
+			m_target_peer_description.c_str());
 
 	m_target_sock->isClient(true);
 	return true;
@@ -421,7 +446,7 @@ CCBClient::HandleReversedConnectionRequestReply(CondorError *error)
 		errmsg.formatstr("Failed to read response from CCB server "
 					   "%s when requesting reversed connection to %s",
 					   m_ccb_sock->peer_description(),
-					   m_target_peer_description.Value());
+					   m_target_peer_description.c_str());
 		if( error ) {
 			error->push("CCBClient",CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
 		}
@@ -433,15 +458,15 @@ CCBClient::HandleReversedConnectionRequestReply(CondorError *error)
 
 	msg.LookupBool(ATTR_RESULT,result);
 	if( !result ) {
-		MyString remote_errmsg;
+		std::string remote_errmsg;
 		msg.LookupString(ATTR_ERROR_STRING,remote_errmsg);
 
 		errmsg.formatstr(
 			"received failure message from CCB server %s in response to "
 			"request for reversed connection to %s: %s",
 			m_ccb_sock->peer_description(),
-			m_target_peer_description.Value(),
-			remote_errmsg.Value());
+			m_target_peer_description.c_str(),
+			remote_errmsg.c_str());
 
 		if( error ) {
 			error->push("CCBClient",CEDAR_ERR_CONNECT_FAILED,errmsg.Value());
@@ -455,7 +480,7 @@ CCBClient::HandleReversedConnectionRequestReply(CondorError *error)
 				"CCBClient: received 'success' in reply from CCB server %s "
 				"in response to request for reversed connection to %s\n",
 				m_ccb_sock->peer_description(),
-				m_target_peer_description.Value());
+				m_target_peer_description.c_str());
 	}
 
 	return result;
@@ -493,17 +518,17 @@ CCBClient::try_next_ccb()
 		dprintf(D_ALWAYS,
 				"CCBClient: no more CCB servers to try for requesting "
 				"reversed connection to %s; giving up.\n",
-				m_target_peer_description.Value());
+				m_target_peer_description.c_str());
 		ReverseConnectCallback(NULL);
 		return false;
 	}
 
-	MyString ccbid;
-	if( !SplitCCBContact( ccb_contact, m_cur_ccb_address, ccbid, NULL ) ) {
+	std::string ccbid;
+	if( !SplitCCBContact( ccb_contact, m_cur_ccb_address, ccbid, m_target_peer_description, NULL ) ) {
 		return try_next_ccb();
 	}
 
-	char const *return_address = daemonCoreSockAdapter.publicNetworkIpAddr();
+	char const *return_address = daemonCore->publicNetworkIpAddr();
 
 	// For now, we require that this daemon has a command port.
 	// If needed, we could add support for opening a listen socket here.
@@ -519,7 +544,7 @@ CCBClient::try_next_ccb()
 				"or you have not configured the private network name "
 				"to be the same in these two networks when it really should "
 				"be.  Assuming the latter.\n",
-				m_target_peer_description.Value());
+				m_target_peer_description.c_str());
 
 		// strip off CCB contact info in the return address
 		sinful_return.setCCBContact(NULL);
@@ -530,18 +555,20 @@ CCBClient::try_next_ccb()
 			"CCBClient: requesting reverse connection to %s "
 			"via CCB server %s#%s; "
 			"I am listening on my command socket %s.\n",
-			m_target_peer_description.Value(),
-			m_cur_ccb_address.Value(),
-			ccbid.Value(),
+			m_target_peer_description.c_str(),
+			m_cur_ccb_address.c_str(),
+			ccbid.c_str(),
 			return_address);
 
-	classy_counted_ptr<Daemon> ccb_server = new Daemon(DT_COLLECTOR,m_cur_ccb_address.Value(),NULL);
+	classy_counted_ptr<Daemon> ccb_server = new Daemon(DT_COLLECTOR,m_cur_ccb_address.c_str(),NULL);
 
 	ClassAd ad;
 	ad.Assign(ATTR_CCBID,ccbid);
 	ad.Assign(ATTR_CLAIM_ID,m_connect_id);
 	// purely for debugging purposes: identify ourselves
 	ad.Assign(ATTR_NAME, myName());
+	// ATTR_MY_ADDRESS is functional and subject to address rewriting, so
+	// it's OK to use the protocol-blind publicNetworkIpAddr() above.
 	ad.Assign(ATTR_MY_ADDRESS, return_address);
 
 	classy_counted_ptr<CCBRequestMsg> msg = new CCBRequestMsg(ad);
@@ -580,7 +607,7 @@ CCBClient::try_next_ccb()
 
 			// bypass startCommand() and call the command handler directly
 			// this call will take care of deleting server_sock when done
-		daemonCoreSockAdapter.CallCommandHandler(CCB_REQUEST,server_sock);
+		daemonCore->CallCommandHandler(CCB_REQUEST,server_sock);
 	}
 	else {
 		ccb_server->sendMsg(msg.get());
@@ -593,7 +620,7 @@ CCBClient::try_next_ccb()
 void
 CCBClient::CancelReverseConnect()
 {
-	if( m_target_sock ) {
+	if( daemonCore && m_target_sock ) {
 		ReverseConnectCallback( NULL );
 	}
 }
@@ -618,7 +645,7 @@ CCBClient::CCBResultsCallback(DCMsgCallback *cb)
 	else {
 		ClassAd msg = ((ClassAdMsg *)cb->getMessage())->getMsgClassAd();
 		bool result = false;
-		MyString remote_errmsg;
+		std::string remote_errmsg;
 		msg.LookupBool(ATTR_RESULT,result);
 		msg.LookupString(ATTR_ERROR_STRING,remote_errmsg);
 
@@ -626,9 +653,9 @@ CCBClient::CCBResultsCallback(DCMsgCallback *cb)
 			dprintf(D_ALWAYS,"CCBClient:"
 				"received failure message from CCB server %s in response to "
 				"(non-blocking) request for reversed connection to %s: %s\n",
-				m_cur_ccb_address.Value(),
-				m_target_peer_description.Value(),
-				remote_errmsg.Value());
+				m_cur_ccb_address.c_str(),
+				m_target_peer_description.c_str(),
+				remote_errmsg.c_str());
 			UnregisterReverseConnectCallback();
 			try_next_ccb();
 		}
@@ -637,8 +664,8 @@ CCBClient::CCBResultsCallback(DCMsgCallback *cb)
 				"CCBClient: received 'success' in reply from CCB server %s "
 				"in response to (non-blocking) request for reversed connection"
 				" to %s\n",
-				m_cur_ccb_address.Value(),
-				m_target_peer_description.Value());
+				m_cur_ccb_address.c_str(),
+				m_target_peer_description.c_str());
 
 			// Nothing special to do, because all we care about in
 			// 'success' case is ReverseConnectCallback(), which has
@@ -681,12 +708,11 @@ CCBClient::RegisterReverseConnectCallback()
 		// security session management.  Again, that stuff all happens
 		// later in the reverse direction.
 
-		daemonCoreSockAdapter.Register_Command(
+		daemonCore->Register_Command(
 			CCB_REVERSE_CONNECT,
 			"CCB_REVERSE_CONNECT",
 			CCBClient::ReverseConnectCommandHandler,
 			"CCBClient::ReverseConnectCommandHandler",
-			NULL,
 			ALLOW);
 	}
 
@@ -706,7 +732,7 @@ CCBClient::RegisterReverseConnectCallback()
 		if( timeout < 0 ) {
 			timeout = 0;
 		}
-		m_deadline_timer = daemonCoreSockAdapter.Register_Timer (
+		m_deadline_timer = daemonCore->Register_Timer (
 			timeout,
 			(TimerHandlercpp)&CCBClient::DeadlineExpired,
 			"CCBClient::DeadlineExpired",
@@ -722,7 +748,7 @@ CCBClient::DeadlineExpired()
 {
 	dprintf(D_ALWAYS,
 			"CCBClient: deadline expired for reverse connection to %s.\n",
-			m_target_peer_description.Value());
+			m_target_peer_description.c_str());
 
 	m_deadline_timer = -1;
 	CancelReverseConnect();
@@ -732,7 +758,7 @@ void
 CCBClient::UnregisterReverseConnectCallback()
 {
 	if( m_deadline_timer != -1 ) {
-		daemonCoreSockAdapter.Cancel_Timer(m_deadline_timer);
+		daemonCore->Cancel_Timer(m_deadline_timer);
 		m_deadline_timer = -1;
 	}
 
@@ -744,7 +770,7 @@ CCBClient::UnregisterReverseConnectCallback()
 }
 
 int
-CCBClient::ReverseConnectCommandHandler(Service *,int cmd,Stream *stream)
+CCBClient::ReverseConnectCommandHandler(int cmd,Stream *stream)
 {
 	// This is a static function called when the command socket
 	// receives a reverse connect command.  Our job is to direct
@@ -762,7 +788,7 @@ CCBClient::ReverseConnectCommandHandler(Service *,int cmd,Stream *stream)
 
 	// Now figure out which CCBClient is waiting for this connection.
 
-	MyString connect_id;
+	std::string connect_id;
 	msg.LookupString(ATTR_CLAIM_ID,connect_id);
 
 	classy_counted_ptr<CCBClient> client;
@@ -770,7 +796,7 @@ CCBClient::ReverseConnectCommandHandler(Service *,int cmd,Stream *stream)
 	if( rc < 0 ) {
 		dprintf(D_ALWAYS,
 				"CCBClient: failed to find requested connection id %s.\n",
-				connect_id.Value());
+				connect_id.c_str());
 		return FALSE;
 	}
 	client->ReverseConnectCallback((Sock *)stream);
@@ -794,7 +820,7 @@ CCBClient::ReverseConnectCallback(Sock *sock)
 			"CCBClient: received reversed (non-blocking) connection %s "
 			"(intended target is %s)\n",
 			sock->peer_description(),
-			m_target_peer_description.Value());
+			m_target_peer_description.c_str());
 	}
 
 	m_target_sock->exit_reverse_connecting_state((ReliSock*)sock);
@@ -806,7 +832,7 @@ CCBClient::ReverseConnectCallback(Sock *sock)
 	// We are all done creating the connection (or failing to do so).
 	// Call any function that may have been registered with
 	// DaemonCore::Register_Socket().
-	daemonCoreSockAdapter.CallSocketHandler(m_target_sock,false);
+	daemonCore->CallSocketHandler(m_target_sock,false);
 
 	// No more use of m_target_sock, because it may have been deleted
 	// by now.

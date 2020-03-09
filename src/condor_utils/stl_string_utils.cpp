@@ -20,15 +20,10 @@
 #include "condor_common.h" 
 #include "condor_snutils.h"
 #include "condor_debug.h"
+#include "condor_random_num.h"
+#include <limits>
 
 #include "stl_string_utils.h"
-
-void assign(std::string& dst, const MyString& src) {
-    dst = src.Value();
-}
-void assign(MyString& dst, const std::string& src) {
-    dst = src.c_str();
-}
 
 bool operator==(const MyString& L, const std::string& R) { return R == L.Value(); }
 bool operator==(const std::string& L, const MyString& R) { return L == R.Value(); }
@@ -44,7 +39,8 @@ bool operator>=(const MyString& L, const std::string& R) { return R <= L.Value()
 bool operator>=(const std::string& L, const MyString& R) { return L >= R.Value(); }
 
 
-int vformatstr(std::string& s, const char* format, va_list pargs) {
+static
+int vformatstr_impl(std::string& s, bool concat, const char* format, va_list pargs) {
     char fixbuf[STL_STRING_UTILS_FIXBUF];
     const int fixlen = sizeof(fixbuf)/sizeof(fixbuf[0]);
 	int n;
@@ -64,7 +60,11 @@ int vformatstr(std::string& s, const char* format, va_list pargs) {
     // In this case, fixed buffer was sufficient so we're done.
     // Return number of chars written.
     if (n < fixlen) {
-        s = fixbuf;
+		if (concat) {
+			s.append(fixbuf, n);
+		} else {
+			s.assign(fixbuf, n);
+		}
         return n;
     }
 
@@ -78,7 +78,7 @@ int vformatstr(std::string& s, const char* format, va_list pargs) {
     } catch (...) {
         varbuf = NULL;
     }
-    if (NULL == varbuf) EXCEPT("Failed to allocate char buffer of %d chars", n);
+	if (NULL == varbuf) { EXCEPT("Failed to allocate char buffer of %d chars", n); }
 
     // re-print, using buffer of sufficient size
 #if !defined(va_copy)
@@ -93,7 +93,11 @@ int vformatstr(std::string& s, const char* format, va_list pargs) {
     if (nn >= n) EXCEPT("Insufficient buffer size (%d) for printing %d chars", n, nn);
 
     // safe to do string assignment
-    s = varbuf;
+	if (concat) {
+		s.append(varbuf, nn);
+	} else {
+		s.assign(varbuf, nn);
+	}
 
     // clean up our allocated buffer
     delete[] varbuf;
@@ -102,10 +106,18 @@ int vformatstr(std::string& s, const char* format, va_list pargs) {
     return nn;
 }
 
+int vformatstr(std::string& s, const char* format, va_list pargs) {
+	return vformatstr_impl(s, false, format, pargs);
+}
+
+int vformatstr_cat(std::string& s, const char* format, va_list pargs) {
+	return vformatstr_impl(s, true, format, pargs);
+}
+
 int formatstr(std::string& s, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    int r = vformatstr(s, format, args);
+    int r = vformatstr_impl(s, false, format, args);
     va_end(args);
     return r;
 }
@@ -115,19 +127,17 @@ int formatstr(MyString& s, const char* format, ...) {
     std::string t;
     va_start(args, format);
     // this gets me the sprintf-standard return value (# chars printed)
-    int r = vformatstr(t, format, args);
+    int r = vformatstr_impl(t, false, format, args);
     va_end(args);
-    assign(s, t);
+    s = t;
     return r;
 }
 
 int formatstr_cat(std::string& s, const char* format, ...) {
     va_list args;
-    std::string t;
     va_start(args, format);
-    int r = vformatstr(t, format, args);
+    int r = vformatstr_impl(s, true, format, args);
     va_end(args);
-    s += t;
     return r;
 }
 
@@ -135,11 +145,30 @@ int formatstr_cat(MyString& s, const char* format, ...) {
     va_list args;
     std::string t;
     va_start(args, format);
-    int r = vformatstr(t, format, args);
+    int r = vformatstr_impl(t, false, format, args);
     va_end(args);
     s += t.c_str();
     return r;
 }
+
+template <typename T> std::string IntToStr( T val )
+{
+	char buf[64];
+	if (std::numeric_limits<T>::is_signed) {
+		snprintf( buf, sizeof(buf), "%lld", (long long)val );
+	} else {
+		snprintf( buf, sizeof(buf), "%llu", (unsigned long long)val );
+	}
+	return std::string( buf );
+}
+
+// force instantiation of the StrToInt functions that users of condor_utils will need
+template std::string IntToStr<int>(int val);
+template std::string IntToStr<long>(long val);
+template std::string IntToStr<long long>(long long val);
+template std::string IntToStr<unsigned int>(unsigned int val);
+template std::string IntToStr<unsigned long>(unsigned long val);
+template std::string IntToStr<unsigned long long>(unsigned long long val);
 
 // to replace MyString with std::string we need a compatible read-line function
 bool readLine(std::string& str, FILE *fp, bool append)
@@ -196,7 +225,7 @@ void trim( std::string &str )
 		++begin;
 	}
 
-	int			end = str.length() - 1;
+	int			end = (int)str.length() - 1;
 	while ( end >= 0 && isspace(str[end]) ) {
 		--end;
 	}
@@ -247,6 +276,45 @@ void title_case( std::string &str )
 		}
 		upper = isspace(str[i]);
 	}
+}
+
+std::string EscapeChars(const std::string& src, const std::string& Q, char escape)
+{
+	// create a result string.  may as well reserve the length to
+	// begin with to minimize reallocations.
+	std::string S;
+	S.reserve(src.length());
+
+	// go through each char in the string src
+	for (size_t i = 0; i < src.length(); i++) {
+
+		// if it is in the set of chars to escape,
+		// drop an escape onto the end of the result
+		if (strchr(Q.c_str(), src[i])) {
+			// this character needs escaping
+			S += escape;
+		}
+
+		// put this char into the result
+		S += src[i];
+	}
+
+	// thats it!
+	return S;
+}
+
+bool ends_with(const std::string& str, const std::string& post) {
+	size_t postSize = post.size();
+	if( postSize == 0 ) { return false; }
+
+	size_t strSize = str.size();
+	if( strSize < postSize ) { return false; }
+
+	size_t offset = strSize - postSize;
+	for( size_t i = 0; i < postSize; ++i ) {
+		if( str[offset + i] != post[i] ) { return false; }
+	}
+	return true;
 }
 
 // returns true if pre is non-empty and str is the same as pre up to pre.size()
@@ -305,6 +373,75 @@ bool sort_decending_ignore_case(std::string const & a, std::string const & b)
 	return ! sort_ascending_ignore_case(a, b);
 }
 
+/*
+** Return true iff the given string is a blank line.
+*/
+int blankline( const char *str )
+{
+	while(isspace(*str))
+		str++;
+	return( (*str=='\0') ? 1 : 0);
+}
+
+/*
+ * return true if the input attibute is in the list of attributes
+ * search is case insensitive.  Items in the list should be space or comma or newline separated
+ * return value is NULL if attribute not found, or a pointer to the first character in the list
+ * after the matching attribute if a match is found
+ *
+ * This code relys on the fact that attribute names can only contain Alpha-numeric characters, _ or .
+ * The list is must be separated by comma, space or non-printing characters and must contain only
+ * valid attribute names otherwise. these assumptions allow for some shortcuts in the code
+ * that make it much faster than an iterative strcasecmp would be.  They also mean that an attempt
+ * to use this to compare arbitrary strings could result in false matches. 
+ * For instance, { is uppercase [ according to this code. and * would match \n
+ *
+ */
+const char * is_attr_in_attr_list(const char * attr, const char * list)
+{
+	// a fairly optimized comparison of characters to see if they match case-insenstively
+	// this ONLY works for A-Za-Z0-9, and can generate false matches if either of the strings
+	// contains non-printing characters, but it will work for our use case here
+	#define ALPHANUM_EQUAL_NOCASE(c1,c2) ((((c1) ^ (c2)) & ~0x20) == 0)
+	// this is true for space, comma and newline, NOT true for :;<=>?@
+	#define IS_SEP_CHAR(ch) ((ch) <= ',')
+
+	const char * a = attr;
+	const char * p = list;
+	while (*p) {
+		a = attr;
+		while (*a && ALPHANUM_EQUAL_NOCASE(*p,*a)) { ++p, ++a; }
+		// we get to here at the end of attr, or when char matching fails against the list
+
+		if ( ! *a) {
+			// at the end of attr, we have a match if we are also at the end of
+			// an entry in the list
+			if ( ! *p || IS_SEP_CHAR(*p)) {
+				// the attribute has ended, so this is a match
+				// return a pointer to where we stopped searching.
+				return p;
+			}
+		}
+
+		// skip to the end of this entry in the list (skip all non-separator characters)
+		while (*p && !IS_SEP_CHAR(*p)) { ++p; }
+		// skip to the start of the next entry (skip separator characters)
+		while (*p && IS_SEP_CHAR(*p)) { ++p; }
+	}
+
+	#undef ALPHANUM_EQUAL_NOCASE
+	#undef IS_SEP_CHAR
+
+	return NULL;
+}
+
+#if 1
+static MyStringTokener tokenbuf;
+void Tokenize(const char *str) { tokenbuf.Tokenize(str); }
+void Tokenize(const MyString &str) { Tokenize(str.Value()); }
+void Tokenize(const std::string &str) { Tokenize(str.c_str()); }
+const char *GetNextToken(const char *delim, bool skipBlankTokens) { return tokenbuf.GetNextToken(delim, skipBlankTokens); }
+#else
 static char *tokenBuf = NULL;
 static char *nextToken = NULL;
 
@@ -358,6 +495,7 @@ const char *GetNextToken(const char *delim, bool skipBlankTokens)
 
 	return result;
 }
+#endif
 
 void join(const std::vector< std::string > &v, char const *delim, std::string &result)
 {
@@ -372,3 +510,159 @@ void join(const std::vector< std::string > &v, char const *delim, std::string &r
 		result += (*it);
 	}
 }
+
+// scan an input string for path separators, returning a pointer into the input string that is
+// the first charactter after the last input separator. (i.e. the filename part). if the input
+// string contains no path separater, the return is the same as the input, if the input string
+// ends with a path separater, the return is a pointer to the null terminator.
+const char * filename_from_path(const char * pathname)
+{
+	const char * psz = pathname;
+	for (const char * p = psz; *p; ++p) {
+		if (*p == '/') psz = p+1;
+#ifdef WIN32
+		else if (*p == '\\') psz = p+1;
+#endif
+	}
+	return psz;
+}
+size_t filename_offset_from_path(std::string & pathname)
+{
+	size_t cch = pathname.size();
+	size_t ix = 0;
+	for (size_t ii = 0; ii < cch; ++ii) {
+		if (pathname[ix] == '/') ix = ii+1;
+#ifdef WIN32
+		else if (pathname[ix] == '\\') ix = ii+1;
+#endif
+	}
+	return ix;
+}
+
+// if len is 10, this means 10 random ascii characters from the set.
+void
+randomlyGenerateInsecure(std::string &str, const char *set, int len)
+{
+	int i;
+	int idx;
+	int set_len;
+
+    if (!set || len <= 0) {
+		str.clear();
+		return;
+	}
+
+	str.assign(len, '0');
+
+	set_len = (int)strlen(set);
+
+	// now pick randomly from the set and fill stuff in
+	for (i = 0; i < len ; i++) {
+		idx = get_random_int_insecure() % set_len;
+		str[i] = set[idx];
+	}
+}
+
+#if 0
+void
+randomlyGeneratePRNG(std::string &str, const char *set, int len)
+{
+	if (!set || len <= 0) {
+		str.clear();
+		return;
+	}
+
+	str.assign(len, '0');
+
+	auto set_len = strlen(set);
+	for (int idx = 0; idx < len; idx++) {
+		auto rand_val = get_random_int_insecure() % set_len;
+		str[idx] = set[rand_val];
+	}
+}
+#endif
+
+void
+randomlyGenerateInsecureHex(std::string &str, int len)
+{
+	randomlyGenerateInsecure(str, "0123456789abcdef", len);
+}
+
+void
+randomlyGenerateShortLivedPassword(std::string &str, int len)
+{
+	// Create a randome password of alphanumerics
+	// and safe-to-print punctuation.
+	//
+	//randomlyGeneratePRNG(
+	randomlyGenerateInsecure(
+				str,
+				"abcdefghijklmnopqrstuvwxyz"
+				"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				"0123456789"
+				"!@#$%^&*()-_=+,<.>/?",
+				len
+				);
+}
+
+// return the bounds of the next token or -1 if no tokens remain
+//
+int StringTokenIterator::next_token(int & length)
+{
+	length = 0;
+	if ( ! str) return -1;
+
+	int ix = ixNext;
+
+	// skip leading separators and whitespace
+	while (str[ix] && strchr(delims, str[ix])) ++ix;
+	ixNext = ix;
+
+	// scan for next delimiter or \0
+	while (str[ix] && !strchr(delims, str[ix])) ++ix;
+	if (ix <= ixNext)
+		return -1;
+
+	length = ix-ixNext;
+	int ixStart = ixNext;
+	ixNext = ix;
+	return ixStart;
+}
+
+// return the next string from the StringTokenIterator as a const std::string *
+// returns NULL when there is no next string.
+//
+const std::string * StringTokenIterator::next_string()
+{
+#if 1
+	int len;
+	int start = next_token(len);
+	if (start < 0) return NULL;
+	current.assign(str, start, len);
+#else
+	if ( ! str) return NULL;
+
+	int ix = ixNext;
+
+	// skip leading separators and whitespace
+	while (str[ix] && strchr(delims, str[ix])) ++ix;
+	ixNext = ix;
+
+	// scan for next delimiter or \0
+	while (str[ix] && !strchr(delims, str[ix])) ++ix;
+	if (ix <= ixNext)
+		return NULL;
+
+	current.assign(str, ixNext, ix-ixNext);
+	ixNext = ix;
+#endif
+	return &current;
+}
+
+bool StringTokenIterator::next(MyString & tok)
+{
+	const char * p = next(); 
+	tok = p;
+	return p != NULL; 
+}
+

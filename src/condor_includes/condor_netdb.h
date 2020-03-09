@@ -22,21 +22,11 @@
 #define CONDOR_NETDB_H
 
 #include "condor_common.h"
-#include "condor_socket_types.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
-
-// do not use gethostbyname and gethostbyaddr
-// use resolve_hsotname, get_hostname instead
-
-//struct hostent *
-//condor_gethostbyname(const char *name);
-//
-//struct hostent *
-//condor_gethostbyaddr(const char *addr, SOCKET_LENGTH_TYPE len, int type);
 
 int
 condor_gethostname(char *name, size_t namelen);

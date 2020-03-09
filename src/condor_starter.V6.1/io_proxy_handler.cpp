@@ -246,12 +246,12 @@ void IOProxyHandler::handle_standard_request( ReliSock *r, char *line )
 				dprintf(D_SYSCALLS | D_VERBOSE,"File %s maps to url %s, peer version is %d.%d.%d\n", path, url, 
 					    vi ? vi->getMajorVer() : 0, vi ? vi->getMinorVer() : 0, vi ? vi->getSubMinorVer() : 0);
 				if (vi && ! vi->built_since_version(7,9,6)) {
-					EXCEPT("File %s maps to url %s, which I don't know how to open.\n",path,url);
+					EXCEPT("File %s maps to url %s, which I don't know how to open.",path,url);
 				}
 				strncpy(path,url,CHIRP_LINE_MAX);
 			}
 		} else {
-			EXCEPT("Unable to map file %s to a url: %s\n",path,strerror(errno));
+			EXCEPT("Unable to map file %s to a url: %s",path,strerror(errno));
 		}
 
 		dprintf(D_SYSCALLS,"Which simplifies to file %s\n",path);
@@ -281,8 +281,10 @@ void IOProxyHandler::handle_standard_request( ReliSock *r, char *line )
 		if(result>=0) {
 			char *buffer = (char*) malloc(1024);
 			ASSERT( buffer != NULL );
-			REMOTE_CONDOR_stat(path, buffer);
-			r->put_bytes_raw(buffer,strlen(buffer));
+			REMOTE_CONDOR_fstat(result, buffer);
+			int len = strlen(buffer);
+			if (len == 0) { buffer[0] = '\n'; len = 1; }
+			r->put_bytes_raw(buffer,len);
 			free( buffer );
 		}
 
@@ -413,7 +415,7 @@ void IOProxyHandler::handle_standard_request( ReliSock *r, char *line )
 	} else if(m_enable_delayed && sscanf_chirp(line,"get_job_attr_delayed %s",name)==1) {
 		std::string value;
 		classad::ClassAdUnParser unparser;
-		std::auto_ptr<classad::ExprTree> expr = m_shadow->getDelayedUpdate(name);
+		std::unique_ptr<classad::ExprTree> expr = m_shadow->getDelayedUpdate(name);
 		if (expr.get()) {
 			unparser.Unparse(value, expr.get());
 			sprintf(line,"%u",(unsigned int)value.size());
@@ -475,7 +477,7 @@ void IOProxyHandler::handle_standard_request( ReliSock *r, char *line )
 		// setInfoText truncates name to 128 bytes
 		event.setInfoText( name );
 
-		ad = event.toClassAd();
+		ad = event.toClassAd(true);
 		ASSERT(ad);
 
 		result = REMOTE_CONDOR_ulog( ad );
@@ -636,6 +638,7 @@ void IOProxyHandler::handle_standard_request( ReliSock *r, char *line )
 				result = REMOTE_CONDOR_putfile_buffer(buffer, length);
 				sprintf(line, "%d", convert(result, errno));
 				r->put_line_raw(line);
+				free(buffer);
 			} else {
 				sprintf(line,"%d",CHIRP_ERROR_NO_MEMORY);
 				r->put_line_raw(line);
@@ -850,38 +853,16 @@ int IOProxyHandler::convert( int result, int unix_errno )
 			return CHIRP_ERROR_IS_DIR;
 		case ENOTDIR:
 			return CHIRP_ERROR_NOT_DIR;
-/* ENOTEMPTY is equal to EEXIST under AIX */
-#if defined(ENOTEMPTY) && !defined(AIX) 
+#if defined(ENOTEMPTY)
 		case ENOTEMPTY:
 			return CHIRP_ERROR_NOT_EMPTY;
 #endif
 		case EXDEV:
 			return CHIRP_ERROR_CROSS_DEVICE_LINK;
+		case ETIMEDOUT:
+			return CHIRP_ERROR_OFFLINE;
 		default:
 			dprintf(D_ALWAYS, "Starter ioproxy server got unknown unix errno:%d\n", unix_errno);
 			return CHIRP_ERROR_UNKNOWN;
 	}
-}
-
-void IOProxyHandler::fix_chirp_path( char *path )
-{
-#ifdef WIN32
-#else
-	char temp_path[CHIRP_LINE_MAX];
-
-	// Get rid of leading '//','/','\','\\'
-	if(path && path[0] == DIR_DELIM_CHAR) {
-		if(path[1] == DIR_DELIM_CHAR) {
-			strncpy(temp_path, path+2, CHIRP_LINE_MAX);
-			temp_path[CHIRP_LINE_MAX-1] = '\0';
-			strcpy(path, temp_path);
-		}
-		else {
-			strncpy(temp_path, path+1, CHIRP_LINE_MAX);
-			temp_path[CHIRP_LINE_MAX-1] = '\0';
-			strcpy(path, temp_path);
-		}
-	}
-
-#endif
 }

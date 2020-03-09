@@ -26,7 +26,9 @@
 namespace classad {
 
 // macro for recognising octal digits
-#define isodigit(x) (( (x) - '0' < 8 ) && ((x) - '0' >= 0))
+//#define isodigit(x) (((x) >= '0') && ((x) < '8'))
+// using & instead of && to avoid a branch...
+#define isodigit(x) (((x) >= '0') & ((x) < '8'))
 
 // A structure which represents the Absolute Time Literal
 struct abstime_t 
@@ -52,6 +54,10 @@ long timezone_offset( time_t clock, bool no_dst = false );
  * correct characters like tab. It also converts octal sequences. 
  */
 void convert_escapes(std::string &text, bool &validStr); 
+void convert_escapes_json(std::string &text, bool &validStr, bool &quotedExpr);
+
+// appends a formatted long int to a std:::string -- much faster than sprintf
+void append_long(std::string &s, long long l);
 
 void getLocalTime(time_t *now, struct tm *localtm);
 void getGMTime(time_t *now, struct tm *localtm);

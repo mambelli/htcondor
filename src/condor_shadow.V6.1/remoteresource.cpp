@@ -24,7 +24,6 @@
 #include "remoteresource.h"
 #include "exit.h"             // for JOB_BLAH_BLAH exit reasons
 #include "condor_debug.h"     // for D_debuglevel #defines
-#include "condor_string.h"    // for strnewp()
 #include "condor_attributes.h"
 #include "internet.h"
 #include "condor_daemon_core.h"
@@ -55,6 +54,323 @@ static const char *Resource_State_String [] = {
 	"CHECKPOINTED",
 };
 
+#if defined(DLOPEN_GSI_LIBS)
+/* The following functions use a child process to call GSI and VOMS
+ * functions. This allows us to not dlopen() the GSI and VOMS libraries
+ * in the main shadow process, thus reducing memory usage.
+ */
+
+/* This function works like fgets(), with the follow exceptions:
+ *   - It reads from a file descriptor.
+ *   - If the buffer s is filled, it continues to read from the fd until
+ *     a newline or EOF. The additional input is discarded.
+ *   - When a newline is read, it is discarded (not placed in the buffer).
+ */
+static char *
+my_fgets( char *s, int size, int fd )
+{
+	int rc;
+	int i = 0;
+	char c;
+
+	rc = read( fd, &c, 1 );
+	if ( rc <= 0 ) {
+		s[0] = '\0';
+		return NULL;
+	}
+	while ( rc > 0 && c != '\n' ) {
+		if ( i < size - 1 ) {
+			s[i] = c;
+			i++;
+		}
+		rc = read( fd, &c, 1 );
+	}
+	s[i] = '\0';
+	return s;
+}
+
+/* Inspect the job's proxy in a child process and read information about
+ * it via a pipe from the child.
+ */
+static int
+QueryJobProxy( const char *proxy_file, time_t *expiration_time, char **identity,
+			   char **voname, char **firstfqan, char **quoted_DN_and_FQAN )
+{
+	int result = 1;
+	int rc;
+	int fds[2];
+	pid_t child_pid = 0;
+	int child_status = 0;
+
+	if ( pipe( fds ) < 0 ) {
+		dprintf( D_ALWAYS, "QueryJobProxy(): pipe() failed: errno %d (%s)\n",
+				 errno, strerror( errno ) );
+		return 1;
+	}
+
+	child_pid = fork();
+	if ( child_pid < 0 ) {
+			// Error
+		dprintf( D_ALWAYS, "QueryJobProxy(): fork() failed: errno %d (%s)\n",
+				 errno, strerror( errno ) );
+		close( fds[0] );
+		close( fds[1] );
+		return 1;
+
+	} else if ( child_pid == 0 ) {
+			// Child
+		close( fds[0] );
+
+		if ( activate_globus_gsi() != 0 ) {
+			dprintf( D_ALWAYS, "QueryJobProxy(): %s\n", x509_error_string() );
+		}
+
+		std::string reply;
+		if ( expiration_time ) {
+			formatstr_cat( reply, "%ld\n", (long)x509_proxy_expiration_time( proxy_file ) );
+		}
+
+		if ( identity ) {
+			char *id = x509_proxy_identity_name( proxy_file );
+			formatstr_cat( reply, "%s\n", id ? id : "" );
+			free( id );
+		}
+
+		if ( voname || firstfqan || quoted_DN_and_FQAN ) {
+		//   query voms if wanted, write result to pipe
+			int vomserr = 1;
+#if defined(HAVE_EXT_VOMS)
+			vomserr = extract_VOMS_info_from_file( proxy_file,
+												   0, /*do not verify*/
+												   voname,
+												   firstfqan,
+												   quoted_DN_and_FQAN);
+#endif
+			if ( voname ) {
+				formatstr_cat( reply, "%s\n", !vomserr && *voname ? *voname : "" );
+			}
+			if ( firstfqan ) {
+				formatstr_cat( reply, "%s\n", !vomserr && *firstfqan ? *firstfqan : "" );
+			}
+			if ( quoted_DN_and_FQAN ) {
+				formatstr_cat( reply, "%s\n", !vomserr && *quoted_DN_and_FQAN ? *quoted_DN_and_FQAN : "" );
+			}
+
+		}
+
+		if ( write( fds[1], reply.c_str(), reply.length() ) < (ssize_t)reply.length() ) {
+			dprintf( D_ALWAYS, "QueryJobProxy(): Failed to write reply to parent!\n" );
+			_exit( 1 );
+		}
+		close( fds[1] );
+
+			// TODO we always indicate success. Do we want to signal failure
+			//   in any situation?
+		_exit( 0 );
+	}
+
+		// Parent
+	close( fds[1] );
+
+	char buf[1024];
+	if ( expiration_time ) {
+		if ( my_fgets( buf, sizeof(buf), fds[0] ) ) {
+			*expiration_time = atol( buf );
+		} else {
+			*expiration_time = -1;
+		}
+	}
+	if ( identity ) {
+		if ( my_fgets( buf, sizeof(buf), fds[0] ) ) {
+			*identity = strdup( buf );
+		} else {
+			*identity = strdup( "" );
+		}
+	}
+	if ( voname ) {
+		if ( my_fgets( buf, sizeof(buf), fds[0] ) ) {
+			*voname = strdup( buf );
+		} else {
+			*voname = strdup( "" );
+		}
+	}
+	if ( firstfqan ) {
+		if ( my_fgets( buf, sizeof(buf), fds[0] ) ) {
+			*firstfqan = strdup( buf );
+		} else {
+			*firstfqan = strdup( "" );
+		}
+	}
+	if ( quoted_DN_and_FQAN ) {
+		if ( my_fgets( buf, sizeof(buf), fds[0] ) ) {
+			*quoted_DN_and_FQAN = strdup( buf );
+		} else {
+			*quoted_DN_and_FQAN = strdup( "" );
+		}
+	}
+
+	close( fds[0] );
+
+	do {
+		rc = waitpid( child_pid, &child_status, 0 );
+	} while ( rc < 0 && errno == EINTR );
+
+	if ( child_status != 0 ) {
+		result = 1;
+	}
+
+	return result;
+}
+
+/* Call DCStartd::delegateX509Proxy() in a child process.
+ */
+static int
+StartdDelegateX509Proxy( DCStartd *dc_startd, const char* proxy, time_t expiration_time )
+{
+	int result = -1;
+	int rc;
+	int fds[2];
+	pid_t child_pid = 0;
+	int child_status = 0;
+
+	if ( pipe( fds ) < 0 ) {
+		dprintf( D_ALWAYS, "StartdDelegateX509Proxy(): pipe() failed: errno %d (%s)\n",
+				 errno, strerror( errno ) );
+		return -1;
+	}
+
+	child_pid = fork();
+	if ( child_pid < 0 ) {
+			// Error
+		dprintf( D_ALWAYS, "StartdDelegateX509Proxy(): fork() failed: errno %d (%s)\n",
+				 errno, strerror( errno ) );
+		close( fds[0] );
+		close( fds[1] );
+		return -1;
+
+	} else if ( child_pid == 0 ) {
+			// Child
+		close( fds[0] );
+
+		if ( activate_globus_gsi() != 0 ) {
+			dprintf( D_ALWAYS, "StartdDelegateX509Proxy(): %s\n", x509_error_string() );
+		}
+
+		// Call delegation
+		int dReply = dc_startd->delegateX509Proxy (proxy, expiration_time, NULL );
+
+		if ( write( fds[1], &dReply, sizeof(int) ) < (ssize_t)sizeof(int) ) {
+			dprintf( D_ALWAYS, "StartdDelegateX509Proxy(): Failed to write reply to parent!\n" );
+			_exit( 1 );
+		}
+		close( fds[1] );
+
+			// TODO we always indicate success. Do we want to signal failure
+			//   in any situation?
+		_exit( 0 );
+	}
+
+		// Parent
+	close( fds[1] );
+
+	rc = read( fds[0], &result, sizeof(int) );
+	if ( rc < (int)sizeof(int) ) {
+		dprintf( D_ALWAYS, "StartdDelegateX509Proxy(): read() returned %d\n", rc );
+		result = -1;
+	}
+
+	close( fds[0] );
+
+	do {
+		rc = waitpid( child_pid, &child_status, 0 );
+	} while ( rc < 0 && errno == EINTR );
+
+	if ( child_status != 0 ) {
+		dprintf( D_ALWAYS, "StartdDelegateX509Proxy(): child exited with status %d\n", child_status );
+		result = -1;
+	}
+
+	return result;
+}
+
+/* Call DCStarter::delegateX509Proxy() in a child process
+ */
+static DCStarter::X509UpdateStatus
+StarterDelegateX509Proxy(DCStarter *dc_starter, const char * filename, time_t expiration_time,char const *sec_session_id, time_t *result_expiration_time)
+{
+	DCStarter::X509UpdateStatus result = DCStarter::XUS_Error;
+	int rc;
+	int fds[2];
+	pid_t child_pid = 0;
+	int child_status = 0;
+
+	if ( pipe( fds ) < 0 ) {
+		dprintf( D_ALWAYS, "StarterDelegateX509Proxy(): pipe() failed: errno %d (%s)\n",
+				 errno, strerror( errno ) );
+		return result;
+	}
+
+	child_pid = fork();
+	if ( child_pid < 0 ) {
+			// Error
+		dprintf( D_ALWAYS, "StarterDelegateX509Proxy(): fork() failed: errno %d (%s)\n",
+				 errno, strerror( errno ) );
+		close( fds[0] );
+		close( fds[1] );
+		return result;
+
+	} else if ( child_pid == 0 ) {
+			// Child
+		close( fds[0] );
+
+		if ( activate_globus_gsi() != 0 ) {
+			dprintf( D_ALWAYS, "StarterDelegateX509Proxy(): %s\n", x509_error_string() );
+		}
+
+		// Call delegation
+		DCStarter::X509UpdateStatus dReply = dc_starter->delegateX509Proxy (filename, expiration_time, sec_session_id, result_expiration_time );
+
+		if ( write( fds[1], &dReply, sizeof(DCStarter::X509UpdateStatus) ) < (ssize_t)sizeof(DCStarter::X509UpdateStatus) ||
+			 write( fds[1], result_expiration_time, sizeof(time_t) ) < (ssize_t)sizeof(time_t) ) {
+			dprintf( D_ALWAYS, "StarerDelegateX509Proxy(): Failed to write reply to parent!\n" );
+			_exit( 1 );
+		}
+		close( fds[1] );
+
+			// TODO we always indicate success. Do we want to signal failure
+			//   in any situation?
+		_exit( 0 );
+	}
+
+		// Parent
+	close( fds[1] );
+
+	rc = read( fds[0], &result, sizeof(DCStarter::X509UpdateStatus) );
+	if ( rc < (int)sizeof(int) ) {
+		dprintf( D_ALWAYS, "StarterDelegateX509Proxy(): read() returned %d\n", rc );
+		result = DCStarter::XUS_Error;
+	}
+	rc = read( fds[0], result_expiration_time, sizeof(time_t) );
+	if ( rc < (int)sizeof(time_t) ) {
+		dprintf( D_ALWAYS, "StarterDelegateX509Proxy(): read() returned %d\n", rc );
+		result = DCStarter::XUS_Error;
+	}
+
+	close( fds[0] );
+
+	do {
+		rc = waitpid( child_pid, &child_status, 0 );
+	} while ( rc < 0 && errno == EINTR );
+
+	if ( child_status != 0 ) {
+		dprintf( D_ALWAYS, "StarterDelegateX509Proxy(): child exited with status %d\n", child_status );
+		result = DCStarter::XUS_Error;
+	}
+
+	return result;
+}
+#endif /* defined(DLOPEN_GSI_LIBS) */
+
 
 RemoteResource::RemoteResource( BaseShadow *shad ) 
 	: m_want_remote_updates(false),
@@ -75,6 +391,7 @@ RemoteResource::RemoteResource( BaseShadow *shad )
 	exit_value = -1;
 	memset( &remote_rusage, 0, sizeof(struct rusage) );
 	disk_usage = 0;
+	scratch_dir_file_count = -1; // -1 for 'unspecified'
 	image_size_kb = 0;
 	memory_usage_mb = -1;
 	proportional_set_size_kb = -1;
@@ -91,6 +408,7 @@ RemoteResource::RemoteResource( BaseShadow *shad )
 	lease_duration = -1;
 	already_killed_graceful = false;
 	already_killed_fast = false;
+	m_got_job_exit = false;
 	m_want_chirp = false;
 	m_want_streaming_io = false;
 	m_attempt_shutdown_tid = -1;
@@ -99,8 +417,13 @@ RemoteResource::RemoteResource( BaseShadow *shad )
 	m_download_xfer_status = XFER_STATUS_UNKNOWN;
 
 	std::string prefix;
-	param(prefix, "CHIRP_DELAYED_UPDATE_PREFIX", "CHIRP*");
+	param(prefix, "CHIRP_DELAYED_UPDATE_PREFIX");
 	m_delayed_update_prefix.initializeFromString(prefix.c_str());
+
+	param_and_insert_attrs("PROTECTED_JOB_ATTRS", m_unsettable_attrs);
+	param_and_insert_attrs("SYSTEM_PROTECTED_JOB_ATTRS", m_unsettable_attrs);
+	param_and_insert_attrs("IMMUTABLE_JOB_ATTRS", m_unsettable_attrs);
+	param_and_insert_attrs("SYSTEM_IMMUTABLE_JOB_ATTRS", m_unsettable_attrs);
 }
 
 
@@ -113,10 +436,10 @@ RemoteResource::~RemoteResource()
 		thisRemoteResource = NULL;
 	}
 	if ( dc_startd     ) delete dc_startd;
-	if ( machineName   ) delete [] machineName;
-	if ( starterAddress) delete [] starterAddress;
-	if ( starterArch   ) delete [] starterArch;
-	if ( starterOpsys  ) delete [] starterOpsys;
+	if ( machineName   ) free( machineName );
+	if ( starterAddress) free( starterAddress );
+	if ( starterArch   ) free( starterArch );
+	if ( starterOpsys  ) free( starterOpsys );
 	closeClaimSock();
 	if ( jobAd && jobAd != shadow->getJobAd() ) {
 		delete jobAd;
@@ -176,7 +499,11 @@ RemoteResource::activateClaim( int starterVersion )
 		dprintf( D_FULLDEBUG,
 	                 "trying early delegation (for glexec) of proxy: %s\n", proxy );
 		time_t expiration_time = GetDesiredDelegatedJobCredentialExpiration(jobAd);
+#if defined(DLOPEN_GSI_LIBS)
+		int dReply = StartdDelegateX509Proxy( dc_startd, proxy, expiration_time );
+#else
 		int dReply = dc_startd->delegateX509Proxy( proxy, expiration_time, NULL );
+#endif
 		if( dReply == OK ) {
 			// early delegation was successful. this means the startd
 			// is going to launch the starter using glexec, so we need
@@ -318,13 +645,13 @@ RemoteResource::killStarter( bool graceful )
 		already_killed_fast = true;
 	}
 
-	char* addr = dc_startd->addr();
+	const char* addr = dc_startd->addr();
 	if( addr ) {
 		dprintf( D_FULLDEBUG, "Killed starter (%s) at %s\n", 
 				 graceful ? "graceful" : "fast", addr );
 	}
 
-	int wantReleaseClaim = 0;
+	bool wantReleaseClaim = false;
 	jobAd->LookupBool(ATTR_RELEASE_CLAIM, wantReleaseClaim);
 	if (wantReleaseClaim) {
 		ClassAd replyAd;
@@ -382,8 +709,8 @@ RemoteResource::dprintfSelf( int debugLevel )
 	shadow->dprintf ( debugLevel, "RemoteResource::dprintSelf printing "
 					  "host info:\n");
 	if( dc_startd ) {
-		char* addr = dc_startd->addr();
-		char* id = dc_startd->getClaimId();
+		const char* addr = dc_startd->addr();
+		const char* id = dc_startd->getClaimId();
 		shadow->dprintf( debugLevel, "\tstartdAddr: %s\n", 
 						 addr ? addr : "Unknown" );
 		shadow->dprintf( debugLevel, "\tClaimId: %s\n", 
@@ -401,20 +728,19 @@ RemoteResource::dprintfSelf( int debugLevel )
 	shadow->dprintf( debugLevel, "\texited_by_signal: %s\n", 
 					 exited_by_signal ? "True" : "False" );
 	if( exited_by_signal ) {
-		shadow->dprintf( debugLevel, "\texit_signal: %d\n", 
-						 exit_value );
+		shadow->dprintf( debugLevel, "\texit_signal: %lld\n", 
+						 (long long)exit_value );
 	} else {
-		shadow->dprintf( debugLevel, "\texit_code: %d\n", 
-						 exit_value );
+		shadow->dprintf( debugLevel, "\texit_code: %lld\n", 
+						 (long long)exit_value );
 	}
 }
 
-int
+void
 RemoteResource::attemptShutdownTimeout()
 {
 	m_attempt_shutdown_tid = -1;
 	attemptShutdown();
-	return TRUE;
 }
 
 void
@@ -489,11 +815,11 @@ RemoteResource::getMachineName( char *& mName )
 {
 
 	if ( !mName ) {
-		mName = strnewp( machineName );
+		mName = strdup( machineName );
 	} else {
 		if ( machineName ) {
-			delete [] mName;
-			mName = strnewp( machineName );
+			free( mName );
+			mName = strdup( machineName );
 		} else {
 			mName[0] = '\0';
 		}
@@ -510,14 +836,13 @@ RemoteResource::getStartdAddress( char *& sinful )
 	if( ! dc_startd ) {
 		return;
 	}
-	char* addr = dc_startd->addr();
+	const char* addr = dc_startd->addr();
 	if( ! addr ) {
 		return;
 	}
 	if( sinful ) {
-		delete [] sinful;
-	}
-	sinful = strnewp( addr );
+		free( sinful );	}
+	sinful = strdup( addr );
 }
 
 void
@@ -529,14 +854,14 @@ RemoteResource::getStartdName( char *& remoteName )
 	if( ! dc_startd ) {
 		return;
 	}
-	char* localName = dc_startd->name();
+	const char* localName = dc_startd->name();
 	if( ! localName ) {
 		return;
 	}
 	if( remoteName ) {
-		delete [] remoteName;
+		free( remoteName );
 	}
-	remoteName = strnewp( localName );
+	remoteName = strdup( localName );
 }
 
 
@@ -550,14 +875,14 @@ RemoteResource::getClaimId( char *& id )
 	if( ! dc_startd ) {
 		return;
 	}
-	char* my_id = dc_startd->getClaimId();
+	const char* my_id = dc_startd->getClaimId();
 	if( ! my_id ) {
 		return;
 	}
 	if( id ) {
-		delete[] id;
+		free( id );
 	}
-	id = strnewp( my_id );
+	id = strdup( my_id );
 }
 
 void
@@ -565,11 +890,11 @@ RemoteResource::getStarterAddress( char *& starterAddr )
 {
 
 	if (!starterAddr) {
-		starterAddr = strnewp( starterAddress );
+		starterAddr = starterAddress ? strdup( starterAddress ) : NULL;
 	} else {
 		if ( starterAddress ) {
-			delete[] starterAddr;
-			starterAddr = strnewp( starterAddress );
+			free( starterAddr );
+			starterAddr = strdup( starterAddress );
 		} else {
 			starterAddr[0] = '\0';
 		}
@@ -607,7 +932,7 @@ RemoteResource::claimIsClosing()
 }
 
 
-int
+int64_t
 RemoteResource::exitSignal( void )
 {
 	if( exited_by_signal ) {
@@ -617,7 +942,7 @@ RemoteResource::exitSignal( void )
 }
 
 
-int
+int64_t
 RemoteResource::exitCode( void )
 {
 	if( ! exited_by_signal ) {
@@ -705,7 +1030,8 @@ RemoteResource::initStartdInfo( const char *name, const char *pool,
 				m_claim_session.secSessionInfo(),
 				EXECUTE_SIDE_MATCHSESSION_FQU,
 				dc_startd->addr(),
-				0 /*don't expire*/ );
+				0 /*don't expire*/,
+				nullptr );
 
 			if( !rc ) {
 				dprintf(D_ALWAYS,"SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION: failed to create security session for %s, so will fall back on security negotiation\n",m_claim_session.publicClaimId());
@@ -744,7 +1070,8 @@ RemoteResource::initStartdInfo( const char *name, const char *pool,
 				NULL,
 				EXECUTE_SIDE_MATCHSESSION_FQU,
 				NULL,
-				0 /*don't expire*/ );
+				0 /*don't expire*/,
+				nullptr );
 
 			if( !rc ) {
 				dprintf(D_ALWAYS,"SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION: failed to create security session for %s, so will fall back on security negotiation\n",m_filetrans_session.publicClaimId());
@@ -799,8 +1126,8 @@ RemoteResource::setStarterInfo( ClassAd* ad )
 	if( ad->LookupString(ATTR_NAME, &tmp) ) {
 		if( machineName ) {
 			if( is_valid_sinful(machineName) ) {
-				delete [] machineName;
-				machineName = strnewp( tmp );
+				free(machineName);
+				machineName = strdup( tmp );
 			}
 		}	
 		dprintf( D_SYSCALLS, "  %s = %s\n", ATTR_MACHINE, tmp );
@@ -809,8 +1136,8 @@ RemoteResource::setStarterInfo( ClassAd* ad )
 	} else if( ad->LookupString(ATTR_MACHINE, &tmp) ) {
 		if( machineName ) {
 			if( is_valid_sinful(machineName) ) {
-				delete [] machineName;
-				machineName = strnewp( tmp );
+				free(machineName);
+				machineName = strdup( tmp );
 			}
 		}	
 		dprintf( D_SYSCALLS, "  %s = %s\n", ATTR_MACHINE, tmp );
@@ -820,25 +1147,23 @@ RemoteResource::setStarterInfo( ClassAd* ad )
 
 	if( ad->LookupString(ATTR_ARCH, &tmp) ) {
 		if( starterArch ) {
-			delete [] starterArch;
+			free( starterArch );
 		}	
-		starterArch = strnewp( tmp );
+		starterArch = tmp;
 		dprintf( D_SYSCALLS, "  %s = %s\n", ATTR_ARCH, tmp ); 
-		free( tmp );
 		tmp = NULL;
 	}
 
 	if( ad->LookupString(ATTR_OPSYS, &tmp) ) {
 		if( starterOpsys ) {
-			delete [] starterOpsys;
+			free( starterOpsys );
 		}	
-		starterOpsys = strnewp( tmp );
+		starterOpsys = tmp;
 		dprintf( D_SYSCALLS, "  %s = %s\n", ATTR_OPSYS, tmp ); 
-		free( tmp );
 		tmp = NULL;
 	}
 
-	char* starter_version;
+	char* starter_version=NULL;
 	if( ad->LookupString(ATTR_VERSION, &starter_version) ) {
 		dprintf( D_SYSCALLS, "  %s = %s\n", ATTR_VERSION, starter_version ); 
 	}
@@ -852,11 +1177,9 @@ RemoteResource::setStarterInfo( ClassAd* ad )
 
 	filetrans.setTransferQueueContactInfo( shadow->getTransferQueueContactInfo() );
 
-	int tmp_int;
-	if( ad->LookupBool(ATTR_HAS_RECONNECT, tmp_int) ) {
+	if( ad->LookupBool(ATTR_HAS_RECONNECT, supports_reconnect) ) {
 			// Whatever the starter defines in its own classad
 			// overrides whatever we might think...
-		supports_reconnect = tmp_int;
 		dprintf( D_SYSCALLS, "  %s = %s\n", ATTR_HAS_RECONNECT, 
 				 supports_reconnect ? "TRUE" : "FALSE" );
 	} else {
@@ -871,18 +1194,18 @@ RemoteResource::setMachineName( const char * mName )
 {
 
 	if ( machineName )
-		delete [] machineName;
+		free(machineName);
 	
-	machineName = strnewp ( mName );
+	machineName = strdup ( mName );
 }
 
 void
 RemoteResource::setStarterAddress( const char * starterAddr )
 {
 	if( starterAddress ) {
-		delete [] starterAddress;
+		free( starterAddress );
 	}	
-	starterAddress = strnewp( starterAddr );
+	starterAddress = strdup( starterAddr );
 }
 
 
@@ -961,41 +1284,51 @@ RemoteResource::setJobAd( ClassAd *jA )
 		// ImageSizeEvent everytime we start running, even if the
 		// image size hasn't changed at all...
 
-	int int_value;
-	int64_t int64_value;
+	int64_t long_value;
 	double real_value;
 
-	if( jA->LookupFloat(ATTR_JOB_REMOTE_SYS_CPU, real_value) ) {
-		remote_rusage.ru_stime.tv_sec = (time_t) real_value;
-	}
+	// REMOTE_SYS_CPU and REMOTE_USER_CPU reflect usage for this execution only.
+	// reset to 0 on start or restart.
+	real_value = 0.0;
+	remote_rusage.ru_stime.tv_sec = (time_t) real_value;
+	remote_rusage.ru_utime.tv_sec = (time_t) real_value;
+	jA->Assign(ATTR_JOB_REMOTE_USER_CPU, real_value);
+	jA->Assign(ATTR_JOB_REMOTE_SYS_CPU, real_value);
 			
-	if( jA->LookupFloat(ATTR_JOB_REMOTE_USER_CPU, real_value) ) {
-		remote_rusage.ru_utime.tv_sec = (time_t) real_value;
+	if( jA->LookupInteger(ATTR_IMAGE_SIZE, long_value) ) {
+		image_size_kb = long_value;
 	}
 
-	if( jA->LookupInteger(ATTR_IMAGE_SIZE, int64_value) ) {
-		image_size_kb = int64_value;
+	if( jA->LookupInteger(ATTR_MEMORY_USAGE, long_value) ) {
+		memory_usage_mb = long_value;
 	}
 
-	if( jA->LookupInteger(ATTR_MEMORY_USAGE, int64_value) ) {
-		memory_usage_mb = int64_value;
+	if( jA->LookupInteger(ATTR_RESIDENT_SET_SIZE, long_value) ) {
+		remote_rusage.ru_maxrss = long_value;
 	}
 
-	if( jA->LookupInteger(ATTR_RESIDENT_SET_SIZE, int_value) ) {
-		remote_rusage.ru_maxrss = int_value;
+	if( jA->LookupInteger(ATTR_PROPORTIONAL_SET_SIZE, long_value) ) {
+		proportional_set_size_kb = long_value;
 	}
 
-	if( jA->LookupInteger(ATTR_PROPORTIONAL_SET_SIZE, int64_value) ) {
-		proportional_set_size_kb = int64_value;
+	// DiskUsage and ScratchDirFileCount should reflect the usage for this single execution
+	// so we *don't* propagate the values from the initial job ad
+#if 1
+	disk_usage = 0;
+	scratch_dir_file_count = -1; // -1 because the starter may never send us a value
+#else
+
+	if( jA->LookupInteger(ATTR_DISK_USAGE, long_value) ) {
+		disk_usage = long_value;
 	}
 
-			
-	if( jA->LookupInteger(ATTR_DISK_USAGE, int_value) ) {
-		disk_usage = int_value;
+	if( jA->LookupInteger(ATTR_SCRATCH_DIR_FILE_COUNT, long_value) ) {
+		scratch_dir_file_count = long_value;
 	}
+#endif
 
-	if( jA->LookupInteger(ATTR_LAST_JOB_LEASE_RENEWAL, int_value) ) {
-		last_job_lease_renewal = (time_t)int_value;
+	if( jA->LookupInteger(ATTR_LAST_JOB_LEASE_RENEWAL, long_value) ) {
+		last_job_lease_renewal = (time_t)long_value;
 	}
 
 	jA->LookupBool( ATTR_WANT_IO_PROXY, m_want_chirp );
@@ -1026,9 +1359,9 @@ RemoteResource::setJobAd( ClassAd *jA )
 void
 RemoteResource::updateFromStarter( ClassAd* update_ad )
 {
-	int int_value;
-	int64_t int64_value;
-	MyString string_value;
+	int64_t long_value;
+	std::string string_value;
+	bool bool_value;
 
 	dprintf( D_FULLDEBUG, "Inside RemoteResource::updateFromStarter()\n" );
 	hadContact();
@@ -1041,111 +1374,182 @@ RemoteResource::updateFromStarter( ClassAd* update_ad )
 
 	double real_value;
 	if( update_ad->LookupFloat(ATTR_JOB_REMOTE_SYS_CPU, real_value) ) {
+		double prevUsage;
+		if (!jobAd->LookupFloat(ATTR_JOB_REMOTE_SYS_CPU, prevUsage)) {
+			prevUsage = 0.0;
+		}
+
+		// Remote cpu usage should be strictly increasing
+		if (real_value > prevUsage) {
+			double prevTotalUsage = 0.0;
+			jobAd->LookupFloat(ATTR_JOB_CUMULATIVE_REMOTE_SYS_CPU, prevTotalUsage);
+			jobAd->Assign(ATTR_JOB_CUMULATIVE_REMOTE_SYS_CPU, prevTotalUsage + (real_value - prevUsage));
+		}
+		
 		remote_rusage.ru_stime.tv_sec = (time_t) real_value;
 		jobAd->Assign(ATTR_JOB_REMOTE_SYS_CPU, real_value);
 	}
-			
+
 	if( update_ad->LookupFloat(ATTR_JOB_REMOTE_USER_CPU, real_value) ) {
+		double prevUsage;
+		if (!jobAd->LookupFloat(ATTR_JOB_REMOTE_USER_CPU, prevUsage)) {
+			prevUsage = 0.0;
+		}
+
+		// Remote cpu usage should be strictly increasing
+		if (real_value > prevUsage) {
+			double prevTotalUsage = 0.0;
+			jobAd->LookupFloat(ATTR_JOB_CUMULATIVE_REMOTE_USER_CPU, prevTotalUsage);
+			jobAd->Assign(ATTR_JOB_CUMULATIVE_REMOTE_USER_CPU, prevTotalUsage + (real_value - prevUsage));
+		}
+		
 		remote_rusage.ru_utime.tv_sec = (time_t) real_value;
 		jobAd->Assign(ATTR_JOB_REMOTE_USER_CPU, real_value);
 	}
 
-	if( update_ad->LookupInteger(ATTR_IMAGE_SIZE, int64_value) ) {
-		if( int64_value > image_size_kb ) {
-			image_size_kb = int64_value;
+	if( update_ad->LookupInteger(ATTR_IMAGE_SIZE, long_value) ) {
+		if( long_value > image_size_kb ) {
+			image_size_kb = long_value;
 			jobAd->Assign(ATTR_IMAGE_SIZE, image_size_kb);
 		}
 	}
 
+	// Update memory_usage_mb, which should be the maximum value seen
+	// in the update ad for ATTR_MEMORY_USAGE
+	if( EvalInteger(ATTR_MEMORY_USAGE, update_ad, NULL, long_value) ) {
+		if( long_value > memory_usage_mb ) {
+			memory_usage_mb = long_value;
+		}
+	}
+	// Now update MemoryUsage in the job ad.  If the update ad sent us 
+	// a literal value for MemoryUsage, then insert in the job ad the MAX 
+	// value we have seen.  But if the update ad sent us MemoryUsage as an
+	// expression, then just copy the expression into the job ad.
 	classad::ExprTree * tree = update_ad->Lookup(ATTR_MEMORY_USAGE);
-	if( tree ) {
-		tree = tree->Copy();
-		jobAd->Insert(ATTR_MEMORY_USAGE, tree, false);
+	if (tree) {
+		if (tree->GetKind() != ExprTree::LITERAL_NODE) {
+				// Copy the exression over
+			tree = tree->Copy();
+			jobAd->Insert(ATTR_MEMORY_USAGE, tree);
+		} else {
+				// It is a literal, so insert the MAX of the literals seen
+			jobAd->Assign(ATTR_MEMORY_USAGE, memory_usage_mb);
+		}
 	}
 
 	if( update_ad->LookupFloat(ATTR_JOB_VM_CPU_UTILIZATION, real_value) ) {
 		  jobAd->Assign(ATTR_JOB_VM_CPU_UTILIZATION, real_value);
 	}
-	
-	if( update_ad->LookupInteger(ATTR_RESIDENT_SET_SIZE, int_value) ) {
-		int rss = remote_rusage.ru_maxrss;
-		if( !jobAd->LookupInteger(ATTR_RESIDENT_SET_SIZE,rss) || rss < int_value ) {
-			remote_rusage.ru_maxrss = int_value;
-			jobAd->Assign(ATTR_RESIDENT_SET_SIZE, int_value);
+
+	if( update_ad->LookupInteger(ATTR_RESIDENT_SET_SIZE, long_value) ) {
+		int64_t rss = remote_rusage.ru_maxrss;
+		if( !jobAd->LookupInteger(ATTR_RESIDENT_SET_SIZE,rss) || rss < long_value ) {
+			remote_rusage.ru_maxrss = long_value;
+			jobAd->Assign(ATTR_RESIDENT_SET_SIZE, long_value);
 		}
 	}
 
-	if( update_ad->LookupInteger(ATTR_PROPORTIONAL_SET_SIZE, int64_value) ) {
+	if( update_ad->LookupInteger(ATTR_PROPORTIONAL_SET_SIZE, long_value) ) {
 		int64_t pss = proportional_set_size_kb;
-		if( !jobAd->LookupInteger(ATTR_PROPORTIONAL_SET_SIZE,pss) || pss < int64_value ) {
-			proportional_set_size_kb = int64_value;
-			jobAd->Assign(ATTR_PROPORTIONAL_SET_SIZE, int64_value);
+		if( !jobAd->LookupInteger(ATTR_PROPORTIONAL_SET_SIZE,pss) || pss < long_value ) {
+			proportional_set_size_kb = long_value;
+			jobAd->Assign(ATTR_PROPORTIONAL_SET_SIZE, long_value);
 		}
 	}
 
-    jobAd->CopyAttribute(ATTR_BLOCK_READ_KBYTES, update_ad);
-    jobAd->CopyAttribute(ATTR_BLOCK_WRITE_KBYTES, update_ad);
-    jobAd->CopyAttribute("Recent" ATTR_BLOCK_READ_KBYTES, update_ad);
-    jobAd->CopyAttribute("Recent" ATTR_BLOCK_WRITE_KBYTES, update_ad);
+    CopyAttribute(ATTR_NETWORK_IN, *jobAd, *update_ad);
+    CopyAttribute(ATTR_NETWORK_OUT, *jobAd, *update_ad);
 
-    jobAd->CopyAttribute(ATTR_BLOCK_READ_BYTES, update_ad);
-    jobAd->CopyAttribute(ATTR_BLOCK_WRITE_BYTES, update_ad);
-    jobAd->CopyAttribute("Recent" ATTR_BLOCK_READ_BYTES, update_ad);
-    jobAd->CopyAttribute("Recent" ATTR_BLOCK_WRITE_BYTES, update_ad);
+    CopyAttribute(ATTR_BLOCK_READ_KBYTES, *jobAd, *update_ad);
+    CopyAttribute(ATTR_BLOCK_WRITE_KBYTES, *jobAd, *update_ad);
+    CopyAttribute("Recent" ATTR_BLOCK_READ_KBYTES, *jobAd, *update_ad);
+    CopyAttribute("Recent" ATTR_BLOCK_WRITE_KBYTES, *jobAd, *update_ad);
 
-    jobAd->CopyAttribute(ATTR_BLOCK_READS, update_ad);
-    jobAd->CopyAttribute(ATTR_BLOCK_WRITES, update_ad);
-    jobAd->CopyAttribute("Recent" ATTR_BLOCK_READS, update_ad);
-    jobAd->CopyAttribute("Recent" ATTR_BLOCK_WRITES, update_ad);
+    CopyAttribute(ATTR_BLOCK_READ_BYTES, *jobAd, *update_ad);
+    CopyAttribute(ATTR_BLOCK_WRITE_BYTES, *jobAd, *update_ad);
+    CopyAttribute("Recent" ATTR_BLOCK_READ_BYTES, *jobAd, *update_ad);
+    CopyAttribute("Recent" ATTR_BLOCK_WRITE_BYTES, *jobAd, *update_ad);
+
+    CopyAttribute(ATTR_BLOCK_READS, *jobAd, *update_ad);
+    CopyAttribute(ATTR_BLOCK_WRITES, *jobAd, *update_ad);
+    CopyAttribute("Recent" ATTR_BLOCK_READS, *jobAd, *update_ad);
+    CopyAttribute("Recent" ATTR_BLOCK_WRITES, *jobAd, *update_ad);
+
+    CopyAttribute(ATTR_IO_WAIT, *jobAd, *update_ad);
+
+	// FIXME: If we're convinced that we want a whitelist here (chirp
+	// would seem to make a mockery of that), we should at least rewrite
+	// all of the copies to be based on a table.
+	CopyAttribute( "PreExitCode", *jobAd, *update_ad );
+	CopyAttribute( "PreExitSignal", *jobAd, *update_ad );
+	CopyAttribute( "PreExitBySignal", *jobAd, *update_ad );
+
+	CopyAttribute( "PostExitCode", *jobAd, *update_ad );
+	CopyAttribute( "PostExitSignal", *jobAd, *update_ad );
+	CopyAttribute( "PostExitBySignal", *jobAd, *update_ad );
+
+	classad::ClassAd * toeTag = dynamic_cast<classad::ClassAd *>(update_ad->Lookup(ATTR_JOB_TOE));
+	if( toeTag ) {
+		CopyAttribute(ATTR_JOB_TOE, *jobAd, *update_ad );
+
+		// Required to actually update the schedd's copy.  (sigh)
+		shadow->watchJobAttr(ATTR_JOB_TOE);
+	}
 
     // these are headed for job ads in the scheduler, so rename them
     // to prevent these from colliding with similar attributes from schedd statistics
-    jobAd->CopyAttribute("StatsLastUpdateTimeStarter", "StatsLastUpdateTime", update_ad);
-    jobAd->CopyAttribute("StatsLifetimeStarter", "StatsLifetime", update_ad);
-    jobAd->CopyAttribute("RecentStatsLifetimeStarter", "RecentStatsLifetime", update_ad);
-    jobAd->CopyAttribute("RecentWindowMaxStarter", "RecentWindowMax", update_ad);
-    jobAd->CopyAttribute("RecentStatsTickTimeStarter", "RecentStatsTickTime", update_ad);
+    CopyAttribute("StatsLastUpdateTimeStarter", *jobAd, "StatsLastUpdateTime", *update_ad);
+    CopyAttribute("StatsLifetimeStarter", *jobAd, "StatsLifetime", *update_ad);
+    CopyAttribute("RecentStatsLifetimeStarter", *jobAd, "RecentStatsLifetime", *update_ad);
+    CopyAttribute("RecentWindowMaxStarter", *jobAd, "RecentWindowMax", *update_ad);
+    CopyAttribute("RecentStatsTickTimeStarter", *jobAd, "RecentStatsTickTime", *update_ad);
 
-	if( update_ad->LookupInteger(ATTR_DISK_USAGE, int_value) ) {
-		if( int_value > disk_usage ) {
-			disk_usage = int_value;
-			jobAd->Assign(ATTR_DISK_USAGE, int_value);
+	if( update_ad->LookupInteger(ATTR_DISK_USAGE, long_value) ) {
+		if( long_value > disk_usage ) {
+			disk_usage = long_value;
+			jobAd->Assign(ATTR_DISK_USAGE, disk_usage);
+		}
+	}
+
+	if( update_ad->LookupInteger(ATTR_SCRATCH_DIR_FILE_COUNT, long_value) ) {
+		if( long_value > scratch_dir_file_count ) {
+			scratch_dir_file_count = long_value;
+			jobAd->Assign(ATTR_SCRATCH_DIR_FILE_COUNT, scratch_dir_file_count);
 		}
 	}
 
 	if( update_ad->LookupString(ATTR_EXCEPTION_HIERARCHY,string_value) ) {
-		jobAd->Assign(ATTR_EXCEPTION_HIERARCHY, string_value.Value());
+		jobAd->Assign(ATTR_EXCEPTION_HIERARCHY, string_value);
 	}
 
 	if( update_ad->LookupString(ATTR_EXCEPTION_NAME,string_value) ) {
-		jobAd->Assign(ATTR_EXCEPTION_NAME, string_value.Value());
+		jobAd->Assign(ATTR_EXCEPTION_NAME, string_value);
 	}
 
 	if( update_ad->LookupString(ATTR_EXCEPTION_TYPE,string_value) ) {
-		jobAd->Assign(ATTR_EXCEPTION_TYPE, string_value.Value());
+		jobAd->Assign(ATTR_EXCEPTION_TYPE, string_value);
 	}
 
-	if( update_ad->LookupBool(ATTR_ON_EXIT_BY_SIGNAL, int_value) ) {
-		exited_by_signal = (bool)int_value;
-		jobAd->Assign(ATTR_ON_EXIT_BY_SIGNAL, (bool)exited_by_signal);
+	if( update_ad->LookupBool(ATTR_ON_EXIT_BY_SIGNAL, exited_by_signal) ) {
+		jobAd->Assign(ATTR_ON_EXIT_BY_SIGNAL, exited_by_signal);
 	}
 
-	if( update_ad->LookupInteger(ATTR_ON_EXIT_SIGNAL, int_value) ) {
-		jobAd->Assign(ATTR_ON_EXIT_SIGNAL, int_value);
-		exit_value = int_value;
+	if( update_ad->LookupInteger(ATTR_ON_EXIT_SIGNAL, long_value) ) {
+		jobAd->Assign(ATTR_ON_EXIT_SIGNAL, long_value);
+		exit_value = long_value;
 	}
 
-	if( update_ad->LookupInteger(ATTR_ON_EXIT_CODE, int_value) ) {
-		jobAd->Assign(ATTR_ON_EXIT_CODE, int_value);
-		exit_value = int_value;
+	if( update_ad->LookupInteger(ATTR_ON_EXIT_CODE, long_value) ) {
+		jobAd->Assign(ATTR_ON_EXIT_CODE, long_value);
+		exit_value = long_value;
 	}
 
 	if( update_ad->LookupString(ATTR_EXIT_REASON,string_value) ) {
-		jobAd->Assign(ATTR_EXIT_REASON, string_value.Value());
+		jobAd->Assign(ATTR_EXIT_REASON, string_value);
 	}
 
-	if( update_ad->LookupBool(ATTR_JOB_CORE_DUMPED, int_value) ) {
-		jobAd->Assign(ATTR_JOB_CORE_DUMPED, (bool)int_value);
+	if( update_ad->LookupBool(ATTR_JOB_CORE_DUMPED, bool_value) ) {
+		jobAd->Assign(ATTR_JOB_CORE_DUMPED, bool_value);
 	}
 
 		// The starter sends this attribute whether or not we are spooling
@@ -1154,7 +1558,7 @@ RemoteResource::updateFromStarter( ClassAd* update_ad )
 		// are spooling output.  However, it doesn't hurt to have it there
 		// otherwise.
 	if( update_ad->LookupString(ATTR_SPOOLED_OUTPUT_FILES,string_value) ) {
-		jobAd->Assign(ATTR_SPOOLED_OUTPUT_FILES,string_value.Value());
+		jobAd->Assign(ATTR_SPOOLED_OUTPUT_FILES,string_value);
 	}
 	else if( jobAd->LookupString(ATTR_SPOOLED_OUTPUT_FILES,string_value) ) {
 		jobAd->AssignExpr(ATTR_SPOOLED_OUTPUT_FILES,"UNDEFINED");
@@ -1162,8 +1566,34 @@ RemoteResource::updateFromStarter( ClassAd* update_ad )
 
 		// Process all chirp-based updates from the starter.
 	for (classad::ClassAd::const_iterator it = update_ad->begin(); it != update_ad->end(); it++) {
-		if (allowRemoteWriteAttributeAccess(it->first))
-		{
+		size_t offset = -1;
+		if (allowRemoteWriteAttributeAccess(it->first)) {
+			classad::ExprTree *expr_copy = it->second->Copy();
+			jobAd->Insert(it->first, expr_copy);
+			shadow->watchJobAttr(it->first);
+		} else if( (offset = it->first.rfind( "AverageUsage" )) != std::string::npos
+			&& offset == it->first.length() - 12 ) {
+			classad::ExprTree *expr_copy = it->second->Copy();
+			jobAd->Insert(it->first, expr_copy);
+			shadow->watchJobAttr(it->first);
+		} else if( (offset = it->first.rfind( "Usage" )) != std::string::npos
+			&& offset == it->first.length() - 5 ) {
+			classad::ExprTree *expr_copy = it->second->Copy();
+			jobAd->Insert(it->first, expr_copy);
+			shadow->watchJobAttr(it->first);
+		} else if( (offset = it->first.rfind( "Provisioned" )) != std::string::npos
+			&& offset == it->first.length() - 11 ) {
+			classad::ExprTree *expr_copy = it->second->Copy();
+			jobAd->Insert(it->first, expr_copy);
+			shadow->watchJobAttr(it->first);
+		} else if( it->first.find( "Assigned" ) == 0 ) {
+			classad::ExprTree *expr_copy = it->second->Copy();
+			jobAd->Insert(it->first, expr_copy);
+			shadow->watchJobAttr(it->first);
+		// Arguably, this should actually check the list of container services
+		// and only forward the matching attributes through, but I'm not
+		// actually worried.
+		} else if( ends_with( it->first, "_HostPort" ) ) {
 			classad::ExprTree *expr_copy = it->second->Copy();
 			jobAd->Insert(it->first, expr_copy);
 			shadow->watchJobAttr(it->first);
@@ -1220,17 +1650,19 @@ RemoteResource::updateFromStarter( ClassAd* update_ad )
 		}
 	}
 
-	if (jobAd->EvalInteger(ATTR_MEMORY_USAGE, NULL, int64_value)) {
-		memory_usage_mb = int64_value;
-	}
-
-	MyString starter_addr;
+	std::string starter_addr;
 	update_ad->LookupString( ATTR_STARTER_IP_ADDR, starter_addr );
-	if( !starter_addr.IsEmpty() ) {
+	if( !starter_addr.empty() ) {
 		// The starter sends updated contact info along with the job
 		// update (useful if CCB info changes).  It's a bit of a hack
 		// to do it through this channel, but better than nothing.
-		setStarterAddress( starter_addr.Value() );
+		setStarterAddress( starter_addr.c_str() );
+	}
+
+	if( IsDebugLevel(D_MACHINE) ) {
+		dprintf( D_MACHINE, "shadow's job ad after update:\n" );
+		dPrintAd( D_MACHINE, * jobAd );
+		dprintf( D_MACHINE, "--- End of ClassAd ---\n" );
 	}
 
 		// now that we've gotten an update, we should evaluate our
@@ -1267,23 +1699,19 @@ RemoteResource::recordSuspendEvent( ClassAd* update_ad )
 		// copy of the job ClassAd
 	int now = (int)time(NULL);
 	int total_suspensions = 0;
-	char tmp[256];
 
 	jobAd->LookupInteger( ATTR_TOTAL_SUSPENSIONS, total_suspensions );
 	total_suspensions++;
-	sprintf( tmp, "%s = %d", ATTR_TOTAL_SUSPENSIONS, total_suspensions );
-	jobAd->Insert( tmp );
+	jobAd->Assign( ATTR_TOTAL_SUSPENSIONS, total_suspensions );
 
-	sprintf( tmp, "%s = %d", ATTR_LAST_SUSPENSION_TIME, now );
-	jobAd->Insert( tmp );
+	jobAd->Assign( ATTR_LAST_SUSPENSION_TIME, now );
 
 	// Log stuff so we can check our sanity
 	printSuspendStats( D_FULLDEBUG );
 	
 	// TSTCLAIR: In promotion to 1st class status we *must* 
 	// update the job in the queue
-	sprintf( tmp, "%s = %d", ATTR_JOB_STATUS , SUSPENDED );
-	jobAd->Insert( tmp );
+	jobAd->Assign( ATTR_JOB_STATUS, SUSPENDED );
 	shadow->updateJobInQueue(U_STATUS);
 	
 	return rval;
@@ -1306,7 +1734,6 @@ RemoteResource::recordResumeEvent( ClassAd* /* update_ad */ )
 	int now = (int)time(NULL);
 	int cumulative_suspension_time = 0;
 	int last_suspension_time = 0;
-	char tmp[256];
 
 		// add in the time I spent suspended to a running total
 	jobAd->LookupInteger( ATTR_CUMULATIVE_SUSPENSION_TIME,
@@ -1324,21 +1751,17 @@ RemoteResource::recordResumeEvent( ClassAd* /* update_ad */ )
 		jobAd->Assign(ATTR_UNCOMMITTED_SUSPENSION_TIME, uncommitted_suspension_time);
 	}
 
-	sprintf( tmp, "%s = %d", ATTR_CUMULATIVE_SUSPENSION_TIME,
-			 cumulative_suspension_time );
-	jobAd->Insert( tmp );
+	jobAd->Assign( ATTR_CUMULATIVE_SUSPENSION_TIME, cumulative_suspension_time );
 
 		// set the current suspension time to zero, meaning not suspended
-	sprintf(tmp, "%s = 0", ATTR_LAST_SUSPENSION_TIME );
-	jobAd->Insert( tmp );
+	jobAd->Assign( ATTR_LAST_SUSPENSION_TIME, 0 );
 
 		// Log stuff so we can check our sanity
 	printSuspendStats( D_FULLDEBUG );
 
 	// TSTCLAIR: In promotion to 1st class status we *must* 
 	// update the job in the queue
-	sprintf( tmp, "%s = %d", ATTR_JOB_STATUS , RUNNING );
-	jobAd->Insert( tmp );
+	jobAd->Assign( ATTR_JOB_STATUS, RUNNING );
 	shadow->updateJobInQueue(U_STATUS);
 
 	return rval;
@@ -1349,7 +1772,7 @@ bool
 RemoteResource::recordCheckpointEvent( ClassAd* update_ad )
 {
 	bool rval = true;
-	MyString string_value;
+	std::string string_value;
 	int int_value = 0;
 	static float last_recv_bytes = 0.0;
 
@@ -1419,10 +1842,10 @@ RemoteResource::recordCheckpointEvent( ClassAd* update_ad )
 
 	// Update Ckpt MAC and IP address of VM
 	if( update_ad->LookupString(ATTR_VM_CKPT_MAC,string_value) ) {
-		jobAd->Assign(ATTR_VM_CKPT_MAC, string_value.Value());
+		jobAd->Assign(ATTR_VM_CKPT_MAC, string_value);
 	}
 	if( update_ad->LookupString(ATTR_VM_CKPT_IP,string_value) ) {
-		jobAd->Assign(ATTR_VM_CKPT_IP, string_value.Value());
+		jobAd->Assign(ATTR_VM_CKPT_IP, string_value);
 	}
 
 	shadow->CommitSuspensionTime(jobAd);
@@ -1476,7 +1899,7 @@ void
 RemoteResource::printCheckpointStats( int debug_level )
 {
 	int int_value = 0;
-	MyString string_attr;
+	std::string string_attr;
 
 	dprintf( debug_level, "Statistics about job checkpointing:\n" );
 
@@ -1505,20 +1928,20 @@ RemoteResource::printCheckpointStats( int debug_level )
 	// CkptArch and CkptOpSys
 	string_attr = "";
 	jobAd->LookupString(ATTR_CKPT_ARCH, string_attr);
-	dprintf( debug_level, "%s = %s\n", ATTR_CKPT_ARCH, string_attr.Value());
+	dprintf( debug_level, "%s = %s\n", ATTR_CKPT_ARCH, string_attr.c_str());
 
 	string_attr = "";
 	jobAd->LookupString(ATTR_CKPT_OPSYS, string_attr);
-	dprintf( debug_level, "%s = %s\n", ATTR_CKPT_OPSYS, string_attr.Value());
+	dprintf( debug_level, "%s = %s\n", ATTR_CKPT_OPSYS, string_attr.c_str());
 
 	// MAC and IP address of VM
 	string_attr = "";
 	jobAd->LookupString(ATTR_VM_CKPT_MAC, string_attr);
-	dprintf( debug_level, "%s = %s\n", ATTR_VM_CKPT_MAC, string_attr.Value());
+	dprintf( debug_level, "%s = %s\n", ATTR_VM_CKPT_MAC, string_attr.c_str());
 
 	string_attr = "";
 	jobAd->LookupString(ATTR_VM_CKPT_IP, string_attr);
-	dprintf( debug_level, "%s = %s\n", ATTR_VM_CKPT_IP, string_attr.Value());
+	dprintf( debug_level, "%s = %s\n", ATTR_VM_CKPT_IP, string_attr.c_str());
 }
 
 
@@ -1528,10 +1951,17 @@ RemoteResource::resourceExit( int reason_for_exit, int exit_status )
 	dprintf( D_FULLDEBUG, "Inside RemoteResource::resourceExit()\n" );
 	setExitReason( reason_for_exit );
 
+	m_got_job_exit = true;
+
 	// record the start time of transfer output into the job ad.
-	time_t tStart = -1;
-	if (filetrans.GetDownloadTimestamps(&tStart)) {
+	time_t tStart = -1, tEnd = -1;
+	if (filetrans.GetDownloadTimestamps(&tStart, &tEnd)) {
 		jobAd->Assign(ATTR_JOB_CURRENT_START_TRANSFER_OUTPUT_DATE, (int)tStart);
+		jobAd->Assign(ATTR_JOB_CURRENT_FINISH_TRANSFER_OUTPUT_DATE, (int)tEnd);
+	}
+	if (filetrans.GetUploadTimestamps(&tStart, &tEnd)) {
+		jobAd->Assign(ATTR_JOB_CURRENT_START_TRANSFER_INPUT_DATE, (int)tStart);
+		jobAd->Assign(ATTR_JOB_CURRENT_FINISH_TRANSFER_INPUT_DATE, (int)tEnd);
 	}
 
 #if 0 // tj: this seems to record only transfer output time, turn it off for now.
@@ -1560,28 +1990,30 @@ RemoteResource::resourceExit( int reason_for_exit, int exit_status )
 			   always done in the past, so it's no less accurate than
 			   an old shadow talking to the same starter...
 			*/
-		char tmp[64];
 		if( WIFSIGNALED(exit_status) ) {
 			exited_by_signal = true;
-			sprintf( tmp, "%s=TRUE", ATTR_ON_EXIT_BY_SIGNAL );
-			jobAd->Insert( tmp );
+			jobAd->Assign( ATTR_ON_EXIT_BY_SIGNAL, true );
 
 			exit_value = WTERMSIG( exit_status );
-			sprintf( tmp, "%s=%d", ATTR_ON_EXIT_SIGNAL, exit_value );
-			jobAd->Insert( tmp );
+			jobAd->Assign( ATTR_ON_EXIT_SIGNAL, exit_value );
 
 		} else {
 			exited_by_signal = false;
-			sprintf( tmp, "%s=FALSE", ATTR_ON_EXIT_BY_SIGNAL );
-			jobAd->Insert( tmp );
+			jobAd->Assign( ATTR_ON_EXIT_BY_SIGNAL, false );
 
 			exit_value = WEXITSTATUS( exit_status );
-			sprintf( tmp, "%s=%d", ATTR_ON_EXIT_CODE, exit_value );
-			jobAd->Insert( tmp );
+			jobAd->Assign( ATTR_ON_EXIT_CODE, exit_value );
 		}
 	}
 }
 
+void
+RemoteResource::incrementJobCompletionCount() {
+	int numJobCompletions = 0;
+	jobAd->LookupInteger( ATTR_NUM_JOB_COMPLETIONS, numJobCompletions );
+	++numJobCompletions;
+	jobAd->Assign( ATTR_NUM_JOB_COMPLETIONS, numJobCompletions );
+}
 
 void 
 RemoteResource::setResourceState( ResourceState s )
@@ -1613,7 +2045,7 @@ RemoteResource::startCheckingProxy()
 	if( proxy_check_tid != -1 ) {
 		return; // already running
 	}
-	if( !proxy_path.IsEmpty() ) {
+	if( !proxy_path.empty() ) {
 		// This job has a proxy.  We need to check it regularlly to
 		// potentially upload a renewed one.
 		int PROXY_CHECK_INTERVAL = param_integer("SHADOW_CHECKPROXY_INTERVAL",60*10,1);
@@ -1648,13 +2080,8 @@ RemoteResource::beginExecution( void )
 void
 RemoteResource::hadContact( void )
 {
-		// Length: ATTR_LAST_JOB_LEASE_RENEWAL is 19, '=' is 1,
-		// MAX_INT is 10, and another 10 to spare should plenty... 
-	char contact_buf[40];
 	last_job_lease_renewal = time(0);
-	snprintf( contact_buf, 32, "%s=%d", ATTR_LAST_JOB_LEASE_RENEWAL,
-			  (int)last_job_lease_renewal );
-	jobAd->Insert( contact_buf );
+	jobAd->Assign( ATTR_LAST_JOB_LEASE_RENEWAL, (int)last_job_lease_renewal );
 }
 
 
@@ -1722,13 +2149,11 @@ RemoteResource::reconnect( void )
 		// each time we get here, see how much time remains...
 	int remaining = remainingLeaseDuration();
 	if( !remaining ) {
-	dprintf( D_ALWAYS, "%s remaining: EXPIRED!\n",
+		dprintf( D_ALWAYS, "%s remaining: EXPIRED!\n",
 			 ATTR_JOB_LEASE_DURATION );
-		MyString reason = "Job disconnected too long: ";
-		reason += ATTR_JOB_LEASE_DURATION;
-		reason += " (";
-		reason += lease_duration;
-		reason += " seconds) expired";
+		MyString reason;
+		formatstr( reason, "Job disconnected too long: %s (%d seconds) expired",
+		           ATTR_JOB_LEASE_DURATION, lease_duration );
 		shadow->reconnectFailed( reason.Value() );
 	}
 	dprintf( D_ALWAYS, "%s remaining: %d\n", ATTR_JOB_LEASE_DURATION,
@@ -1814,7 +2239,7 @@ RemoteResource::locateReconnectStarter( void )
 			setStarterAddress( tmp );
 			dprintf( D_ALWAYS, "Found starter: %s\n", tmp );
 			free( tmp );
-			delete[] claimid;
+			free( claimid );
 			return true;
 		} else {
 			EXCEPT( "impossible: locateStarter() returned success "
@@ -1880,7 +2305,7 @@ RemoteResource::locateReconnectStarter( void )
 		EXCEPT( "impossible: success already handled" );
 		break;
 	}
-	delete[] claimid;
+	free( claimid );
 	return false;
 }
 
@@ -1940,10 +2365,10 @@ RemoteResource::initFileTransfer()
 		// The job may override the system defaults for max transfer I/O
 	int ad_max_upload_mb = -1;
 	int ad_max_download_mb = -1;
-	if( jobAd->EvalInteger(ATTR_MAX_TRANSFER_INPUT_MB,NULL,ad_max_upload_mb) ) {
+	if( jobAd->LookupInteger(ATTR_MAX_TRANSFER_INPUT_MB,ad_max_upload_mb) ) {
 		max_upload_mb = ad_max_upload_mb;
 	}
-	if( jobAd->EvalInteger(ATTR_MAX_TRANSFER_OUTPUT_MB,NULL,ad_max_download_mb) ) {
+	if( jobAd->LookupInteger(ATTR_MAX_TRANSFER_OUTPUT_MB,ad_max_download_mb) ) {
 		max_download_mb = ad_max_download_mb;
 	}
 
@@ -2002,8 +2427,7 @@ RemoteResource::requestReconnect( void )
 	char* value = NULL;
 	jobAd->LookupString(ATTR_TRANSFER_KEY,&value);
 	if (value) {
-		msg.formatstr("%s=\"%s\"",ATTR_TRANSFER_KEY,value);
-		req.Insert(msg.Value());
+		req.Assign(ATTR_TRANSFER_KEY, value);
 		free(value);
 		value = NULL;
 	} else {
@@ -2012,8 +2436,7 @@ RemoteResource::requestReconnect( void )
 	}
 	jobAd->LookupString(ATTR_TRANSFER_SOCKET,&value);
 	if (value) {
-		msg.formatstr("%s=\"%s\"",ATTR_TRANSFER_SOCKET,value);
-		req.Insert(msg.Value());
+		req.Assign(ATTR_TRANSFER_SOCKET, value);
 		free(value);
 		value = NULL;
 	} else {
@@ -2060,6 +2483,7 @@ RemoteResource::requestReconnect( void )
 
 				// All the errors that can only be programmer
 				// mistakes: the starter should never return them...  
+		default:
 		case CA_FAILURE:
 		case CA_INVALID_STATE:
 		case CA_INVALID_REQUEST:
@@ -2136,18 +2560,24 @@ RemoteResource::setRemoteProxyRenewTime()
 		// actually is, we would need to have a better interface for
 		// obtaining that information from the file transfer object.
 
-	if( proxy_path.IsEmpty() ) {
+	if( proxy_path.empty() ) {
 		return;
 	}
 
 	time_t desired_expiration_time = GetDesiredDelegatedJobCredentialExpiration(jobAd);
-	time_t proxy_expiration_time = x509_proxy_expiration_time(proxy_path.Value());
+#if defined(DLOPEN_GSI_LIBS)
+	time_t proxy_expiration_time = -1;
+	QueryJobProxy( proxy_path.c_str(), &proxy_expiration_time, NULL, NULL,
+				   NULL, NULL );
+#else
+	time_t proxy_expiration_time = x509_proxy_expiration_time(proxy_path.c_str());
+#endif
 	time_t expiration_time = desired_expiration_time;
 
 	if( proxy_expiration_time == (time_t)-1 ) {
 		char const *errmsg = x509_error_string();
 		dprintf(D_ALWAYS,"setRemoteProxyRenewTime: failed to get proxy expiration time for %s: %s\n",
-				proxy_path.Value(),
+				proxy_path.c_str(),
 				errmsg ? errmsg : "");
 	}
 	else {
@@ -2174,7 +2604,11 @@ RemoteResource::updateX509Proxy(const char * filename)
 	if ( param_boolean( "DELEGATE_JOB_GSI_CREDENTIALS", true ) == true ) {
 		time_t expiration_time = GetDesiredDelegatedJobCredentialExpiration(jobAd);
 		time_t result_expiration_time = 0;
+#if defined(DLOPEN_GSI_LIBS)
+		ret = StarterDelegateX509Proxy(&starter, filename, expiration_time, m_claim_session.secSessionId(),&result_expiration_time);
+#else
 		ret = starter.delegateX509Proxy(filename, expiration_time, m_claim_session.secSessionId(),&result_expiration_time);
+#endif
 		if( ret == DCStarter::XUS_Okay ) {
 			setRemoteProxyRenewTime(result_expiration_time);
 		}
@@ -2206,12 +2640,12 @@ RemoteResource::checkX509Proxy( void )
 		dprintf(D_FULLDEBUG,"checkX509Proxy() doing nothing, because resource is not in EXECUTING state.\n");
 		return;
 	}
-	if(proxy_path.IsEmpty()) {
+	if(proxy_path.empty()) {
 		/* Harmless, but suspicious. */
 		return;
 	}
 	
-	StatInfo si(proxy_path.Value());
+	StatInfo si(proxy_path.c_str());
 	time_t lastmod = si.GetModifyTime();
 	dprintf(D_FULLDEBUG, "Proxy timestamps: remote estimated %ld, local %ld (%ld difference)\n",
 		(long)last_proxy_timestamp, (long)lastmod,lastmod - last_proxy_timestamp);
@@ -2236,10 +2670,43 @@ RemoteResource::checkX509Proxy( void )
 	// of whether or not the remote side succesfully receives the proxy, since
 	// this allows us to use the attributes in job policy (periodic_hold, etc.)
 
+#if defined(DLOPEN_GSI_LIBS)
+	char *proxy_subject = NULL;
+	time_t proxy_expiration_time = -1;
+	char *voname = NULL;
+	char *firstfqan = NULL;
+	char *quoted_DN_and_FQAN = NULL;
+	QueryJobProxy( proxy_path.c_str(), &proxy_expiration_time, &proxy_subject,
+				   &voname, &firstfqan, &quoted_DN_and_FQAN );
+
+	jobAd->Assign(ATTR_X509_USER_PROXY_EXPIRATION, proxy_expiration_time);
+	/* These are secure attributes, only settable by the schedd.
+	 * Assume they won't change during job execution.
+	if ( proxy_subject && *proxy_subject ) {
+		jobAd->Assign(ATTR_X509_USER_PROXY_SUBJECT, proxy_subject);
+	}
+	if ( voname && *voname ) {
+		jobAd->Assign(ATTR_X509_USER_PROXY_VONAME, voname);
+	}
+	if ( firstfqan && *firstfqan ) {
+		jobAd->Assign(ATTR_X509_USER_PROXY_FIRST_FQAN, firstfqan);
+	}
+	if ( quoted_DN_and_FQAN && *quoted_DN_and_FQAN ) {
+		jobAd->Assign(ATTR_X509_USER_PROXY_FQAN, quoted_DN_and_FQAN);
+	}
+	*/
+	free( proxy_subject );
+	free( voname );
+	free( firstfqan );
+	free( quoted_DN_and_FQAN );
+#else
 	// first, do the DN and expiration time, which all proxies have
-	char* proxy_subject = x509_proxy_identity_name(proxy_path.Value());
-	time_t proxy_expiration_time = x509_proxy_expiration_time(proxy_path.Value());
+	char* proxy_subject = x509_proxy_identity_name(proxy_path.c_str());
+	time_t proxy_expiration_time = x509_proxy_expiration_time(proxy_path.c_str());
+	/* This is a secure attribute, only settable by the schedd.
+	 * Assume it won't change during job execution.
 	jobAd->Assign(ATTR_X509_USER_PROXY_SUBJECT, proxy_subject);
+	*/
 	jobAd->Assign(ATTR_X509_USER_PROXY_EXPIRATION, proxy_expiration_time);
 	if (proxy_subject) {
 		free(proxy_subject);
@@ -2251,7 +2718,7 @@ RemoteResource::checkX509Proxy( void )
 	char * firstfqan = NULL;
 	char * quoted_DN_and_FQAN = NULL;
 	int vomserr = extract_VOMS_info_from_file(
-			proxy_path.Value(),
+			proxy_path.c_str(),
 			0 /*do not verify*/,
 			&voname,
 			&firstfqan,
@@ -2261,9 +2728,12 @@ RemoteResource::checkX509Proxy( void )
 		if (IsDebugVerbose(D_SECURITY)) {
 			dprintf(D_SECURITY, "VOMS attributes were found\n");
 		}
+		/* These are secure attributes, only settable by the schedd.
+		 * Assume they won't change during job execution.
 		jobAd->Assign(ATTR_X509_USER_PROXY_VONAME, voname);
 		jobAd->Assign(ATTR_X509_USER_PROXY_FIRST_FQAN, firstfqan);
 		jobAd->Assign(ATTR_X509_USER_PROXY_FQAN, quoted_DN_and_FQAN);
+		*/
 		free(voname);
 		free(firstfqan);
 		free(quoted_DN_and_FQAN);
@@ -2273,11 +2743,12 @@ RemoteResource::checkX509Proxy( void )
 		}
 	}
 #endif
+#endif
 	shadow->updateJobInQueue(U_X509);
 
 	// Proxy file updated.  Time to upload
 	last_proxy_timestamp = lastmod;
-	updateX509Proxy(proxy_path.Value());
+	updateX509Proxy(proxy_path.c_str());
 }
 
 bool
@@ -2345,6 +2816,16 @@ RemoteResource::allowRemoteWriteAttributeAccess( const std::string &name )
 	{
 		response = m_delayed_update_prefix.contains_anycase_withwildcard(name.c_str());
 	}
+
+	// Since this function is called to see if a user job is allowed to update
+	// the given attribute (via mechanisms like chirp), make certain we disallow 
+	// protected attributes. We do this here because the schedd may allow it to happen 
+	// since the shadow will likely be connected as a queue super user with access
+	// to modify protected attributes.
+	if (response && m_unsettable_attrs.find(name) != m_unsettable_attrs.end()) {
+		response = false;
+	}
+
 	// Do NOT log failures -- unfortunately, this routine doesn't know about the other
 	// whitelisted attributes (for example, ExitCode)
 	if (response) logRemoteAccessCheck(response,"write access to attribute",name.c_str());

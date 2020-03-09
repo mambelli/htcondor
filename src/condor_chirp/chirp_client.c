@@ -178,6 +178,10 @@ chirp_client_connect_url( const char *url, const char **path_part)
 			//which is not followed by a valid port/path.
 
 			host = (char *)malloc(str-url+1);
+			if ( ! host) {
+				errno = ENOMEM;
+				return NULL;
+			}
 			strncpy(host,url,str-url);
 			host[str-url] = '\0';
 
@@ -980,6 +984,9 @@ convert_result( int result )
 			case CHIRP_ERROR_CROSS_DEVICE_LINK:
 				errno = EXDEV;
 				break;
+			case CHIRP_ERROR_OFFLINE:
+				errno = ETIMEDOUT;
+				break;
 			case CHIRP_ERROR_UNKNOWN:
 				chirp_fatal_response();
 				break;
@@ -1029,6 +1036,10 @@ tcp_connect( const char *host, int port )
 	struct addrinfo* result = 0;
 	int success;
 	SOCKET fd;
+	struct addrinfo hint;
+	int one = 1;
+	int r = 0;
+
 	union {
 		struct sockaddr_in6 v6;
 		struct sockaddr_in v4;
@@ -1037,20 +1048,28 @@ tcp_connect( const char *host, int port )
 
 	if(!initialize_sockets())
 		return INVALID_SOCKET;
-		success = getaddrinfo(host, NULL, NULL, &result);
 
-	memcpy(&sa.storage, result->ai_addr, result->ai_addrlen );
-	switch(result->ai_family) {
-		case AF_INET: sa.v4.sin_port = htons(port); break;
-		case AF_INET6: sa.v6.sin6_port = htons(port); break;
-		default: return INVALID_SOCKET;
-	}
+	// Ubuntu 10 and 12 don't implement AI_ADDRCONFIG the same way
+	// everyone else does, so we have to turn it off explicitly.
+	memset( & hint, 0, sizeof(hint) );
+	hint.ai_family = AF_UNSPEC;
+	hint.ai_flags = AI_CANONNAME;
+	success = getaddrinfo(host, NULL, &hint, &result);
 
 	if (success != 0)
 		return INVALID_SOCKET;
 
 	if (result == NULL)
 		return INVALID_SOCKET;
+
+	memcpy(&sa.storage, result->ai_addr, result->ai_addrlen );
+	switch(result->ai_family) {
+		case AF_INET: sa.v4.sin_port = htons(port); break;
+		case AF_INET6: sa.v6.sin6_port = htons(port); break;
+		default:
+			freeaddrinfo( result );
+			return INVALID_SOCKET;
+	}
 
 #if defined(WIN32)
 	// Create the socket with no overlapped I/0 so we can later associate the socket
@@ -1059,7 +1078,15 @@ tcp_connect( const char *host, int port )
 #else
 	fd = socket( result->ai_family, SOCK_STREAM, 0 );
 #endif
-	if(fd == INVALID_SOCKET) return INVALID_SOCKET;
+	if(fd == INVALID_SOCKET) {
+		freeaddrinfo(result);
+		return INVALID_SOCKET;
+	}
+
+	r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof(one));
+	if (r < 0) {
+		fprintf(stderr, "Warning: error %d settting SO_REUSEADDR\n", errno);
+	}
 
 	success = connect( fd, (struct sockaddr*)&sa.storage, result->ai_addrlen );
 	freeaddrinfo(result);

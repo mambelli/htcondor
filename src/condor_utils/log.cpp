@@ -210,7 +210,8 @@ LogRecord::ReadHeader(FILE *fp)
     if (rval < 0) {
         return rval;
     }
-    if (!lex_cast(op, op_type) || !valid_record_optype(op_type)) {
+    YourStringDeserializer lex(op);
+    if (!lex.deserialize_int(&op_type) || !valid_record_optype(op_type)) {
         op_type = CondorLogOp_Error;
     }
     free(op);
@@ -227,16 +228,17 @@ LogRecord::ReadTail(FILE *  /*fp*/)
 }
 
 LogRecord *
-ReadLogEntry(FILE *fp, unsigned long recnum, LogRecord* (*InstantiateLogEntry)(FILE *fp, unsigned long recnum, int type))
+ReadLogEntry(FILE *fp, unsigned long recnum, LogRecord* (*InstantiateLogEntry)(FILE *fp, unsigned long recnum, int type, const ConstructLogEntry & ctor), const ConstructLogEntry & ctor)
 {
     char* opword = NULL;
     int opcode = CondorLogOp_Error;
 	int rval = LogRecord::readword(fp, opword);
 	if (rval < 0) return NULL;
-    if (!lex_cast(opword, opcode) || !valid_record_optype(opcode)) {
+    YourStringDeserializer lex(opword);
+    if (!lex.deserialize_int(&opcode) || !valid_record_optype(opcode)) {
         opcode = CondorLogOp_Error;
     }
     free(opword);
 
-	return InstantiateLogEntry(fp, recnum, opcode);
+	return InstantiateLogEntry(fp, recnum, opcode, ctor);
 }

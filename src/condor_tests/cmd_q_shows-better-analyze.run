@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -61,9 +62,7 @@ my $submit = sub {
 			@statarray = ();
 			CondorTest::runCondorTool("condor_status -negotiator -autoformat MyAddress Name",\@statarray,0,{emit_output=>0});
 			foreach my $line (@statarray) {
-			#<128.105.109.64:49860 Look for beginning of sinful string
-				if( $line =~ /^<\d+\.\d+\.\d+\.\d+:\d+.*$/) {
-			#print "Got a sinful string for negotiator:$line\n";
+				if( $line =~ /^<\[[:0-9A-Za-z]+]:\d+.*$/ || $line =~ /^<\d+\.\d+\.\d+\.\d+:\d+.*$/ ) {
 					$foundnegotiator = 1;
 				}
 			}
@@ -73,8 +72,7 @@ my $submit = sub {
 			@statarray = ();
 			CondorTest::runCondorTool("condor_status -startd -autoformat MyAddress Name",\@statarray,0,{emit_output=>0});
 			foreach my $line (@statarray) {
-			#<128.105.109.64:49860 Look for beginning of sinful string
-				if( $line =~ /^<\d+\.\d+\.\d+\.\d+:\d+.*$/) {
+				if( $line =~ /^<\[[:0-9A-Za-z]+]:\d+.*$/ || $line =~ /^<\d+\.\d+\.\d+\.\d+:\d+.*$/ ) {
 					#print "Got a sinful string for startd:$line\n";
 					$foundstartd = 1;
 				}

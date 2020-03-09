@@ -56,7 +56,7 @@ FileLexerSource::ReadCharacter(void)
 	if (_file != NULL) {
 		character = fgetc(_file);
 	} else {
-		character = -1;
+		character = EOF;
 	}
  	_previous_character = character;
 	return character;
@@ -65,9 +65,7 @@ FileLexerSource::ReadCharacter(void)
 void 
 FileLexerSource::UnreadCharacter(void)
 {
-	//fseek(_file, -1, SEEK_CUR);
 	ungetc(_previous_character, _file);
-	return;
 }
 
 bool 
@@ -77,67 +75,6 @@ FileLexerSource::AtEnd(void) const
 	
 	if (_file != NULL) {
 		at_end = (feof(_file) != 0);
-	} else {
-		at_end = true;
-	}
-	return at_end;
-}
-
-/*--------------------------------------------------------------------
- *
- * InputStreamLexerSource
- *
- *-------------------------------------------------------------------*/
-
-InputStreamLexerSource::InputStreamLexerSource(istream &stream) 
-{
-	SetNewSource(stream);
-	return;
-}
-
-InputStreamLexerSource::~InputStreamLexerSource()
-{
-	return;
-}
-
-void InputStreamLexerSource::SetNewSource(istream &stream)
-{
-	_stream = &stream;
-	return;
-}
-
-int 
-InputStreamLexerSource::ReadCharacter(void)
-{
-	char real_character;
-	int  character;
-
-	if (_stream != NULL && _stream->good()) {
-		_stream->get(real_character);
-		character = (unsigned char)real_character;
-	} else {
-		character = -1;
-	}
-   _previous_character = character;
-	return character;
-}
-
-void 
-InputStreamLexerSource::UnreadCharacter(void)
-{
-	//doesn't work on cin
-	//_stream->seekg(-1, ios::cur);
-	_stream->putback(_previous_character);
-	return;
-}
-
-bool 
-InputStreamLexerSource::AtEnd(void) const
-{
-	bool at_end;
-	
-	if (_stream != NULL) {
-		at_end = (_stream->eof());
 	} else {
 		at_end = true;
 	}
@@ -175,7 +112,7 @@ CharLexerSource::ReadCharacter(void)
 
 	character = (unsigned char)_string[_offset];
 	if (character == 0) {
-		character = -1; 
+		character = EOF;
 	} else {
         _offset++;
 	}
@@ -243,7 +180,7 @@ StringLexerSource::ReadCharacter(void)
 
 	character = (unsigned char)(*_string)[_offset];
 	if (character == 0) {
-		character = -1;
+		character = EOF;
 	} else {
 		_offset++;
 	}

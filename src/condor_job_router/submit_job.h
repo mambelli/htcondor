@@ -96,21 +96,7 @@ bool yield_job(classad::ClassAd const &ad, const char * pool_name,
   condor_config file claims".
 
 */
-bool submit_job( ClassAd & src, const char * schedd_name, const char * pool_name, bool is_sandboxed, int * cluster_out = 0, int * proc_out = 0 );
-
-
-/* 
-- src - The classad to submit.  Will _not_ be modified.
-
-- schedd_name - Name of the schedd to send the job to, as specified in the Name
-  attribute of the schedd's classad.  Can be NULL to indicate "local schedd"
-
-- pool_name - hostname (and possible port) of collector where schedd_name can
-  be found.  Can be NULL to indicate "whatever COLLECTOR_HOST in my
-  condor_config file claims".
-
-*/
-bool submit_job( classad::ClassAd & src, const char * schedd_name, const char * pool_name, bool is_sandboxed, int * cluster_out = 0, int * proc_out = 0 );
+bool submit_job( const std::string &owner, const std::string &domain, ClassAd & src, const char * schedd_name, const char * pool_name, bool is_sandboxed, int * cluster_out = 0, int * proc_out = 0 );
 
 
 /*
@@ -155,7 +141,7 @@ cluster.proc - ID of the grid (transformed) job.
 schedd_name and pool_name can be NULL to indicate "local".
 
 */
-bool finalize_job(classad::ClassAd const &ad, int cluster, int proc, const char * schedd_name, const char * pool_name, bool is_sandboxed);
+bool finalize_job(const std::string &owner, const std::string &domain, classad::ClassAd const &ad, int cluster, int proc, const char * schedd_name, const char * pool_name, bool is_sandboxed);
 
 /*
 
@@ -174,6 +160,8 @@ bool WriteTerminateEventToUserLog( classad::ClassAd const &ad );
 bool WriteAbortEventToUserLog( classad::ClassAd const &ad );
 bool EmailTerminateEvent( classad::ClassAd const &ad );
 bool WriteHoldEventToUserLog( classad::ClassAd const &ad );
+bool WriteExecuteEventToUserLog( classad::ClassAd const &ad );
+bool WriteEvictEventToUserLog( classad::ClassAd const &ad );
 
 
 #endif /* INCLUDE_SUBMIT_JOB_H*/

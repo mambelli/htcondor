@@ -30,6 +30,7 @@
 
 #if !defined(WIN32)
 #include "glexec_kill.unix.h"
+#include <syslog.h>
 #endif
 
 extern int log_size;
@@ -212,6 +213,8 @@ parse_command_line(int argc, char* argv[])
 				}
 				index++;
 				log_size = atoi(argv[index]);
+				// set a 64k floor on the log size, to avoid excessive rotation
+				if (log_size > 0) { log_size = MAX(log_size, 65536); }
 				break;
 				
 			// maximum snapshot interval
@@ -334,21 +337,6 @@ get_parent_info(pid_t& parent_pid, birthday_t& parent_birthday)
 		exit(1);
 	}
 
-#if !defined(WIN32)
-	/* The operation of the procd is that it will allow any authorized client
-		to send signals to any process which is the child of the parent
-		of the procd. One could conspire to exec the procd in a process
-		whose parent is already the init process, and in doing so, allow
-		an authorized client to send a signal to ANY process on the system
-		since by definition they are all children of init. So, to prevent
-		an escalation of privileges granted to the authorized process, we 
-		exit if we determine that our parent is init. */
-	if (own_pi->ppid == 1) {
-		fprintf(stderr, "error: Procd's ppid can't be 1!\n");
-		exit(1);
-	}
-#endif
-
 	if (parent_pi->birthday > own_pi->birthday) {
 		fprintf(stderr,
 		        "error: parent process's birthday ("
@@ -413,8 +401,13 @@ main(int argc, char* argv[])
 	//
 	extern FILE* debug_fp;
 	extern char* debug_fn;
-	
-	if (log_file_name != NULL) {
+
+	if (log_file_name && !strcmp(log_file_name, "SYSLOG")) {
+#if !defined(WIN32)
+		openlog(NULL, LOG_NOWAIT|LOG_PID, LOG_DAEMON);
+		debug_fn = log_file_name;
+#endif
+	} else if (log_file_name != NULL) {
 		debug_fn = log_file_name;
 		debug_fp = safe_fopen_wrapper_follow(log_file_name, "a");
 		if (debug_fp == NULL) {
@@ -430,6 +423,9 @@ main(int argc, char* argv[])
 #if defined(WIN32)
 		dprintf(D_ALWAYS, "* PID = %lu\n", 
 			(unsigned long)::GetCurrentProcessId());
+#if defined _M_X64
+		dprintf(D_ALWAYS, "* ARCH = x64\n");
+#endif
 #else
 		dprintf(D_ALWAYS, "* PID = %lu\n", (unsigned long)getpid());
 		dprintf(D_ALWAYS, "* UID = %lu\n", (unsigned long)getuid());

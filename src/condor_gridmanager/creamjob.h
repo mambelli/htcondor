@@ -24,7 +24,6 @@
 #include "condor_common.h"
 #include "condor_classad.h"
 #include "MyString.h"
-#include "classad_hashtable.h"
 
 #include "proxymanager.h"
 #include "basejob.h"
@@ -65,7 +64,7 @@ class CreamJob : public BaseJob
 	static void setConnectFailureRetry( int count )
 		{ maxConnectFailures = count; }
 
-	int ProxyCallback();
+	void ProxyCallback();
 
 	bool IsConnectionError( const char *msg );
 

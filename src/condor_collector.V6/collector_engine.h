@@ -21,9 +21,7 @@
 #define __COLLECTOR_ENGINE_H__
 
 #include "condor_classad.h"
-#include "condor_daemon_core.h"
 
-#include "condor_collector.h"
 #include "collector_stats.h"
 #include "hashkey.h"
 
@@ -72,19 +70,51 @@ class CollectorEngine : public Service
 	// walk specified hash table with the given visit procedure
 	int walkHashTable (AdTypes, int (*)(ClassAd *));
 
+	// Walk through a specific (non-generic, non-ANY) table using a lambda
+	template<typename T>
+	int walkConcreteTable(AdTypes adType, T scanFunction) {
+		if (ANY_AD == adType || GENERIC_AD == adType) {
+			dprintf(D_ALWAYS, "Generic ad requested from walkConcreteTable.\n");
+			return 0;
+		}
+
+		CollectorHashTable *table;
+		CollectorEngine::HashFunc func;
+		if (!LookupByAdType(adType, table, func)) {
+			dprintf (D_ALWAYS, "Unknown type %d\n", adType);
+			return 0;
+		}
+
+			// walk the hash table
+		ClassAd *ad;
+		table->startIterations();
+		while (table->iterate(ad)) {
+				// call scan function for each ad
+			if (!scanFunction(ad)) {break;}
+		}
+
+		return 1;
+	}
+
+
+	// register the collector's own ad pointer, and check to see if a given ad is that ad.
+	// this is used to allow us to recognise the collector ad during iteration and automatically
+	// insert fresh stats into it when it is fetched.
+	void identifySelfAd(ClassAd * ad);
+	bool isSelfAd(void * ad) { return __self_ad__ != NULL && __self_ad__ == ad; }
+
 	// Publish stats into the collector's ClassAd
-	int publishStats( ClassAd *ad );
+	//int publishStats( ClassAd *ad );
 
 		// returns true on success; false on failure (and sets error_desc)
 	bool setCollectorRequirements( char const *str, MyString &error_desc );
 
   private:
-	typedef bool (*HashFunc) (AdNameHashKey &, ClassAd *);
+	typedef bool (*HashFunc) (AdNameHashKey &, const ClassAd *);
 
 	bool LookupByAdType(AdTypes, CollectorHashTable *&, HashFunc &);
  
 	// the greater tables
-	enum {GREATER_TABLE_SIZE = 1024};
 
 	/**
 	* TODO<tstclair>: Eval notes and refactor when time permits.
@@ -95,24 +125,19 @@ class CollectorEngine : public Service
 
 	CollectorHashTable StartdAds;
 	CollectorHashTable StartdPrivateAds;
-#ifdef HAVE_EXT_POSTGRESQL
-	CollectorHashTable QuillAds;
-#endif /* HAVE_EXT_POSTGRESQL */
 	CollectorHashTable ScheddAds;
 	CollectorHashTable SubmittorAds;
 	CollectorHashTable LicenseAds;
 	CollectorHashTable MasterAds;
 	CollectorHashTable StorageAds;
-	CollectorHashTable XferServiceAds;
+	CollectorHashTable AccountingAds;
 
 	// the lesser tables
-	enum {LESSER_TABLE_SIZE = 32};
 	CollectorHashTable CkptServerAds;
 	CollectorHashTable GatewayAds;
 	CollectorHashTable CollectorAds;
 	CollectorHashTable NegotiatorAds;
 	CollectorHashTable HadAds;
-	CollectorHashTable LeaseManagerAds;
 	CollectorHashTable GridAds;
 	
 	// table for "generic" ad types
@@ -148,10 +173,21 @@ class CollectorEngine : public Service
 
 	bool ValidateClassAd(int command,ClassAd *clientAd,Sock *sock);
 
+	void* __self_ad__; // contains address of last Ad for this collector added to the hashtable, do NOT free from here
+					   // this pointer is only used to recognise this collector's ad during a condor_status query
+					   // so it's harmless if this pointer is out of date.
+
 	// Statistics
 	CollectorStats	*collectorStats;
 
 	ClassAd *m_collector_requirements;
+
+	bool m_forwardFilteringEnabled;
+	StringList m_forwardWatchList;
+	int m_forwardInterval;
+public: // so that the config code can set it.
+	bool m_allowOnlyOneNegotiator; // prior to 8.5.8, this was hard-coded to be true.
+	int  m_get_ad_options; // new for 8.7.0, may be temporary
 };
 
 

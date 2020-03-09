@@ -54,9 +54,8 @@ VMRegister::~VMRegister()
 }
 
 static bool 
-_requestVMRegister(char *addr)
+_requestVMRegister(const char *addr)
 {
-	char *buffer = NULL;
 	Daemon hstartd(DT_STARTD, addr);
 
 	//Using TCP
@@ -76,25 +75,18 @@ _requestVMRegister(char *addr)
 	}
 
 	// Send <IP address:port> of virtual machine
-	buffer = strdup(daemonCore->InfoCommandSinfulString());
-	ASSERT(buffer);
-
-	if ( !ssock.code(buffer) ) {
+	if ( !ssock.put(daemonCore->InfoCommandSinfulString()) ) {
 		dprintf( D_FULLDEBUG,
 				 "Failed to send VM_REGISTER command's arguments to "
-				 "host startd %s: %s\n",
-				 addr, buffer );
-		free(buffer);
+				 "host startd %s\n",
+				 addr);
 		return FALSE;
 	}
 
 	if( !ssock.end_of_message() ) {
 		dprintf( D_FULLDEBUG, "Failed to send EOM to host startd %s\n", addr );
-		free(buffer);
 		return FALSE;
 	}
-
-	free(buffer);
 
 	//Now, read permission information
 	ssock.timeout( VM_SOCKET_TIMEOUT );
@@ -183,7 +175,7 @@ VMRegister::requestHostClassAds(void)
 	SetTargetTypeName(query_ad, STARTD_ADTYPE);
 	query_ad.Assign(ATTR_REQUIREMENTS, true);
 
-	char *addr = m_vm_host_daemon->addr();
+	const char *addr = m_vm_host_daemon->addr();
 	Daemon hstartd(DT_STARTD, addr);
 	ReliSock ssock;
 
@@ -243,28 +235,21 @@ VMRegister::requestHostClassAds(void)
 	adList.Rewind();
 	ad = adList.Next();
 
-#if defined(ADD_TARGET_SCOPING)
-	ad->AddTargetRefs( TargetJobAttrs );
-#endif
-
 	// Get each Attribute from the classAd
 	// added "HOST_" in front of each Attribute name
-	const char *name;
-	ExprTree *expr;
 
-	ad->ResetExpr();
-	while( ad->NextExpr(name, expr) ) {
-		MyString attr;
+	for ( auto itr = ad->begin(); itr != ad->end(); itr++ ) {
+		std::string attr;
 		attr += "HOST_";
-		attr += name;
+		attr += itr->first;
 
 		// Insert or Update an attribute to host_classAd in a VMRegister object
-		ExprTree * pTree = expr->Copy();
-		host_classad->Insert(attr.Value(), pTree, true);
+		ExprTree * pTree = itr->second->Copy();
+		host_classad->Insert(attr, pTree);
 	}
 }
 
-char *
+const char *
 VMRegister::getHostSinful(void)
 {
 	if( !m_vm_host_daemon )

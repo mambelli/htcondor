@@ -27,12 +27,22 @@
 #include "MyString.h"
 #include "HashTable.h"
 
+#ifdef WIN32
+// kerb5.h in win-mac.h sets MAXHOSTNAMELEN differently than we do (incorrectly?)
+// so we want to push/pop our definition and undef it to prevent a pointless warning.
+#pragma push_macro("MAXHOSTNAMELEN")
+#undef MAXHOSTNAMELEN
+#endif
+
 extern "C" {
 #include "krb5.h"
 #if defined(Darwin)
 #include "com_err.h"
 #endif
 }
+#ifdef WIN32
+#pragma pop_macro("MAXHOSTNAMELEN")
+#endif
 
 class Condor_Auth_Kerberos : public Condor_Auth_Base {
  public:
@@ -46,7 +56,12 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     // Destructor
     //------------------------------------------
 
-    int authenticate(const char * remoteHost, CondorError* errstack);
+    static bool Initialize();
+    // Perform one-time initialization, primarily dlopen()ing the
+    // kerberos libs on linux. Returns true on success, false on failure.
+
+    int authenticate(const char * remoteHost, CondorError* errstack, bool non_blocking);
+    int authenticate_continue(CondorError*, bool);
     //------------------------------------------
     // PURPOSE: authenticate with the other side 
     // REQUIRE: hostAddr -- host to authenticate
@@ -70,7 +85,7 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     //          >0 -- expiration time
     //------------------------------------------
 
-    int wrap(char* input, int input_len, char*& output, int& output_len);
+    int wrap(const char* input, int input_len, char*& output, int& output_len);
     //------------------------------------------
     // PURPOSE: Wrap the buffer
     // REQUIRE: 
@@ -78,7 +93,7 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     //          May need more code later on
     //------------------------------------------
     
-    int unwrap(char* input, int input_len, char*& output, int& output_len);
+    int unwrap(const char* input, int input_len, char*& output, int& output_len);
     //------------------------------------------
     // PURPOSE: Unwrap the buffer
     // REQUIRE: 
@@ -92,6 +107,31 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     // RETURNS: TRUE -- success, FALSE -- failure
     //------------------------------------------
  private:
+
+	static bool m_initTried;
+	static bool m_initSuccess;
+
+    // states, return vals, and drivers for non-blocking authentication
+    enum CondorAuthKerberosState {
+        ServerReceiveClientReadiness = 100,
+        ServerAuthenticate,
+        ServerReceiveClientSuccessCode
+    };
+
+    enum CondorAuthKerberosRetval {
+        Fail = 0,
+        Success,
+        WouldBlock,
+        Continue
+    };
+
+    CondorAuthKerberosState m_state;
+    krb5_ticket *     ticket_;
+
+    CondorAuthKerberosRetval doServerReceiveClientReadiness(CondorError* errstack, bool non_blocking);
+    CondorAuthKerberosRetval doServerAuthenticate(CondorError* errstack, bool non_blocking);
+    CondorAuthKerberosRetval doServerReceiveClientSuccessCode(CondorError* errstack, bool non_blocking);
+
 
     int init_user();
     //------------------------------------------
@@ -117,7 +157,9 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     // RETURNS : TRUE -- success; FALSE failure
     //------------------------------------------
     
-    int authenticate_server_kerberos();
+    int authenticate_server_kerberos_0();
+    int authenticate_server_kerberos_1();
+    int authenticate_server_kerberos_2();
     //------------------------------------------
     // PURPOSE : Server's authentication method
     // REQUIRE : None
@@ -140,6 +182,7 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     //------------------------------------------
     
     int send_request(krb5_data * request);
+    int send_request_and_receive_reply(krb5_data * request);
     //------------------------------------------
     // PURPOSE: Send an authentication request 
     // REQUIRE: None
@@ -152,22 +195,6 @@ class Condor_Auth_Kerberos : public Condor_Auth_Base {
     // PURPOSE: intialize default cache name and 
     // REQUIRE: NONE
     // RETURNS: 1 -- success; -1:  failure
-    //------------------------------------------
-    
-    int forward_tgt_creds(krb5_creds      * creds,
-                          krb5_ccache       ccache);
-    //------------------------------------------
-    // PURPOSE: Forwarding tgt to another process
-    // REQUIRE: krb5_creds
-    // RETURNS: 1 -- unable to forward
-    //          0 -- success
-    //------------------------------------------
-    int receive_tgt_creds(krb5_ticket * ticket);
-    //------------------------------------------
-    // PURPOSE: Receive tgt from another process
-    // REQUIRE: ticket, context
-    // RETURNS: 1 -- unable to receive tgt
-    //          0 -- success
     //------------------------------------------
     
     int read_request(krb5_data * request);

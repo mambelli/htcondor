@@ -23,8 +23,7 @@
 
 #include "classad/common.h"
 #include "classad/util.h"
-#include "classad/classad_stl.h"
-
+#include "classad/classad_containers.h"
 
 namespace classad {
 
@@ -47,9 +46,11 @@ class Value
 		/** A relative time value */ 			RELATIVE_TIME_VALUE = 1<<5,
 		/** An absolute time value */ 			ABSOLUTE_TIME_VALUE = 1<<6,
 		/** A string value */ 					STRING_VALUE        = 1<<7,
-		/** A classad value */ 					CLASSAD_VALUE       = 1<<8,
-		/** A list value (not owned here)*/	            LIST_VALUE 			= 1<<9,
-		/** A list value (owned via shared_ptr)*/     	SLIST_VALUE 		= 1<<10
+		/** A classad value (not owned here) */ CLASSAD_VALUE       = 1<<8,
+		/** A list value (not owned here)*/				LIST_VALUE 	= 1<<9,
+		/** A list value (owned via shared_ptr)*/		SLIST_VALUE	= 1<<10,
+		/** A classad value (owner via shared_ptr) */	SCLASSAD_VALUE =  1<<11,
+		/** Mask of types that need _Clear*/ VALUE_OWNS_POINTER = ABSOLUTE_TIME_VALUE | STRING_VALUE | SLIST_VALUE | SCLASSAD_VALUE,
 		};
 
 			/// Number factors
@@ -67,19 +68,40 @@ class Value
 		static const double ScaleFactor[];
 
 		/// Constructor
-		Value();
+		Value()
+			: classadValue(NULL)
+			, valueType(UNDEFINED_VALUE)
+			, factor(NO_FACTOR)
+		{}
 
-        /// Copy Constructor
-        Value(const Value &value);
+		/// Copy Constructor
+		Value(const Value &value)
+			: classadValue(NULL)
+			, valueType(UNDEFINED_VALUE)
+			, factor(NO_FACTOR)
+		{
+			CopyFrom(value);
+			return;
+		}
 
 		/// Destructor
-		~Value();
+		~Value() { _Clear(); }
 
-        /// Assignment operator
-        Value& operator=(const Value &value);
+		/// Assignment operator
+		Value& operator=(const Value &value) {
+			if (this != &value) {
+				CopyFrom(value);
+			}
+			return *this;
+		}
 
 		/** Discards the previous value and sets the value to UNDEFINED */
-		void Clear (void);
+		void Clear (void) {
+			if (valueType & VALUE_OWNS_POINTER) { _Clear(); }
+			classadValue = NULL; // This clears the entire union.
+			valueType 	= UNDEFINED_VALUE;
+			factor = NO_FACTOR;
+		}
 
 		/** Copies the value of another value object.
 			@param v The value copied from.
@@ -124,11 +146,19 @@ class Value
 		*/
 		void SetListValue(ExprList* l);
 
+		/** Sets a ClassAd list value; previous value discarded. Unlike the
+			version of this function that takes a raw ClassAd pointer, this one
+			takes (shared) ownership over the list.  This list will be deleted
+			when the last copy of this shared_ptr goes away.
+			@param c The ClassAd value.
+		*/
+        void SetClassAdValue(classad_shared_ptr<ClassAd> c);
+
 		/** Sets a ClassAd value; previous value discarded. You still own the ClassA:, it 
             is not owned by the Value class, so it is your responsibility to delete it. 
 			@param c The ClassAd value.
 		*/
-		void SetClassAdValue(ClassAd* c);	
+		void SetClassAdValue(ClassAd* c);
 
 		/** Sets a string value; previous value discarded.
 			@param str The string value.
@@ -140,6 +170,7 @@ class Value
 			@param str The string value.
 		*/
 		void SetStringValue( const char *str );
+		void SetStringValue( const char *str, size_t cch );
 
 		/** Sets an absolute time value in seconds since the UNIX epoch, & the 
             time zone it's measured in.
@@ -266,6 +297,14 @@ class Value
 			@return true iff the value is a ClassAd.
 		*/
 		inline bool IsClassAdValue(ClassAd *&c) const; 
+		/** Checks if the value is an expression list.
+			@param c A shared_ptr to the ClassAd if the value is a ClassAd.
+			         Note that if the list was not set via a shared_ptr, a copy of the
+			         list will be made and this Value will convert from type CLASSAD_VALUE
+			         to SCLASSAD_VALUE as a side-effect.
+			@return true iff the value is an expression list
+		*/
+		bool IsSClassAdValue(classad_shared_ptr<ClassAd>& c);
 		/** Checks if the value is a ClassAd. 
 			@return true iff the value is a ClassAd value.
 		*/
@@ -334,14 +373,39 @@ class Value
 		friend std::ostream& operator<<(std::ostream &stream, Value &value);
 
 	private:
-		void _Clear();
+		void _Clear() {
+			switch( valueType ) {
+			case SCLASSAD_VALUE:
+				delete sclassadValue;
+				break;
+
+			case SLIST_VALUE:
+				delete slistValue;
+				break;
+
+			case STRING_VALUE:
+				delete strValue;
+				break;
+
+			case ABSOLUTE_TIME_VALUE:
+				delete absTimeValueSecs;
+				break;
+
+			default:
+			case LIST_VALUE:
+			case CLASSAD_VALUE:
+					// list and classad values live in the evaluation environment, so they must
+					// never be explicitly destroyed
+				break;
+			}
+
+			classadValue = NULL; // this clears the entire union
+			factor = NO_FACTOR;
+		}
 
 		friend class Literal;
 		friend class ClassAd;
 		friend class ExprTree;
-
-		ValueType 		valueType;		// the type of the value
-
 
 		union {
 			bool			booleanValue;
@@ -350,10 +414,15 @@ class Value
 			ExprList        *listValue;
 			classad_shared_ptr<ExprList> *slistValue;
 			ClassAd			*classadValue;
+			classad_shared_ptr<ClassAd> *sclassadValue;
 			double			relTimeValueSecs;
 			abstime_t		*absTimeValueSecs;
 			std::string		*strValue;
 		};
+
+		ValueType 		valueType;	// the type of the value
+		NumberFactor	factor;		// the type of the value
+		void ApplyFactor();
 };
 
 bool convertValueToRealValue(const Value value, Value &realValue);
@@ -476,6 +545,7 @@ IsStringValue( char *s, int len ) const
 {
 	if( valueType == STRING_VALUE ) {
 		strncpy( s, strValue->c_str( ), len );
+		if( s && len && s[len-1] ) s[len-1] = '\0';
 		return( true );
 	}
 	return( false );
@@ -496,7 +566,7 @@ inline bool Value::
 IsStringValue( int &size ) const
 {
     if (valueType == STRING_VALUE) {
-        size = strValue->size();
+        size = (int)strValue->size();
         return true;
     } else {
         size = -1;
@@ -510,6 +580,9 @@ IsClassAdValue(const ClassAd *&ad) const
 	if ( valueType == CLASSAD_VALUE ) {
 		ad = classadValue;
 		return true;
+	} else if( valueType == SCLASSAD_VALUE ) {
+	    ad = sclassadValue->get();
+	    return true;
 	} else {
 		return false;
 	}
@@ -521,6 +594,9 @@ IsClassAdValue(ClassAd *&ad) const
 	if ( valueType == CLASSAD_VALUE ) {
 		ad = classadValue;
 		return true;
+	} else if( valueType == SCLASSAD_VALUE ) {
+	    ad = sclassadValue->get();
+	    return true;
 	} else {
 		return false;
 	}
@@ -529,7 +605,7 @@ IsClassAdValue(ClassAd *&ad) const
 inline bool Value:: 
 IsClassAdValue() const
 {
-	return( valueType == CLASSAD_VALUE );	
+	return( valueType == CLASSAD_VALUE || valueType == SCLASSAD_VALUE );
 }
 
 inline bool Value::

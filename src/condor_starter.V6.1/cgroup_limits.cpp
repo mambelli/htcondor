@@ -17,17 +17,56 @@ CgroupLimits::CgroupLimits(std::string &cgroup) : m_cgroup_string(cgroup)
 		false, false);
 }
 
-int CgroupLimits::set_memory_limit_bytes(uint64_t mem_bytes, bool soft)
+int 
+CgroupLimits::set_memsw_limit_bytes(long long mem_bytes)
+{
+	if (!m_cgroup.isValid() || !CgroupManager::getInstance().isMounted(CgroupManager::MEMORY_CONTROLLER)) {
+		dprintf(D_ALWAYS, "Unable to set memsw limit because cgroup is invalid.\n");
+		return 1;
+	}
+
+	int err;
+	struct cgroup_controller * mem_controller;
+	const char * limit = "memory.memsw.limit_in_bytes";
+
+	dprintf(D_ALWAYS, "Limiting memsw usage to %llu bytes\n", mem_bytes);
+	struct cgroup *memcg = &m_cgroup.getCgroup();
+	if ((mem_controller = cgroup_get_controller(memcg, MEMORY_CONTROLLER_STR)) == NULL) {
+		dprintf(D_ALWAYS,
+			"Unable to get cgroup memsw controller for %s.\n",
+			m_cgroup_string.c_str());
+		return 1;
+	} else if ((err = cgroup_set_value_uint64(mem_controller, limit, mem_bytes))) {
+		dprintf(D_ALWAYS,
+			"Unable to set memsw limit for %s: %u %s\n",
+			m_cgroup_string.c_str(), err, cgroup_strerror(err));
+		return 1;
+	} else {
+		TemporaryPrivSentry sentry(PRIV_ROOT);
+		if ((err = cgroup_modify_cgroup(memcg))) {
+			dprintf(D_ALWAYS,
+				"Unable to commit memsw limit for %s "
+				": %u %s\n",
+				m_cgroup_string.c_str(), err, cgroup_strerror(err));
+			return 1;
+		}
+	}
+	return 0;
+}
+
+int CgroupLimits::set_memory_limit_bytes(long long mem_bytes, bool soft)
 {
 	if (!m_cgroup.isValid() || !CgroupManager::getInstance().isMounted(CgroupManager::MEMORY_CONTROLLER)) {
 		dprintf(D_ALWAYS, "Unable to set memory limit because cgroup is invalid.\n");
 		return 1;
 	}
 
+
 	int err;
 	struct cgroup_controller * mem_controller;
 	const char * limit = soft ? mem_soft_limit : mem_hard_limit;
 
+	dprintf(D_ALWAYS, "Limiting (%s) memory usage to %lld bytes\n", soft ? "soft" : "hard", mem_bytes);
 	struct cgroup *memcg = &m_cgroup.getCgroup();
 	if ((mem_controller = cgroup_get_controller(memcg, MEMORY_CONTROLLER_STR)) == NULL) {
 		dprintf(D_ALWAYS,
@@ -36,15 +75,15 @@ int CgroupLimits::set_memory_limit_bytes(uint64_t mem_bytes, bool soft)
 		return 1;
 	} else if ((err = cgroup_set_value_uint64(mem_controller, limit, mem_bytes))) {
 		dprintf(D_ALWAYS,
-			"Unable to set memory soft limit for %s: %u %s\n",
+			"Unable to set memory limit for %s: %u %s\n",
 			m_cgroup_string.c_str(), err, cgroup_strerror(err));
 		return 1;
 	} else {
 		TemporaryPrivSentry sentry(PRIV_ROOT);
 		if ((err = cgroup_modify_cgroup(memcg))) {
 			dprintf(D_ALWAYS,
-				"Unable to commit memory soft limit for %s "
-				": %u %s\n",
+				"Unable to commit %s to %lld for %s "
+				": %u %s\n", limit, mem_bytes,
 				m_cgroup_string.c_str(), err, cgroup_strerror(err));
 			return 1;
 		}

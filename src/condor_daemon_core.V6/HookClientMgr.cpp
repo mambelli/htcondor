@@ -19,7 +19,7 @@
 
 #include "condor_common.h"
 #include "condor_config.h"
-#include "../condor_daemon_core.V6/condor_daemon_core.h"
+#include "condor_daemon_core.h"
 #include "HookClientMgr.h"
 #include "HookClient.h"
 #include "status_string.h"
@@ -95,7 +95,7 @@ HookClientMgr::spawn(HookClient* client, ArgList* args, MyString *hook_stdin, pr
 
 	int pid = daemonCore->
 		Create_Process(hook_path, final_args, priv,
-					  reaper_id, FALSE, env, NULL, &fi,
+					  reaper_id, FALSE, FALSE, env, NULL, &fi,
 					  NULL, std_fds);
 	client->setPid(pid);
 	if (pid == FALSE) {

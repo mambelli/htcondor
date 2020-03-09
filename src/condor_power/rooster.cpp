@@ -92,7 +92,7 @@ void Rooster::config()
 	m_wakeup_args.Clear();
 	MyString error_msg;
 	if( !m_wakeup_args.AppendArgsV2Quoted(m_wakeup_cmd.Value(),&error_msg) ) {
-		EXCEPT("Invalid wakeup command %s: %s\n",
+		EXCEPT("Invalid wakeup command %s: %s",
 			   m_wakeup_cmd.Value(), error_msg.Value());
 	}
 
@@ -103,7 +103,7 @@ void Rooster::config()
 	}
 	else {
 		if( !m_rank_ad.AssignExpr(ATTR_RANK,rank.Value()) ) {
-			EXCEPT("Invalid expression for ROOSTER_UNHIBERNATE_RANK: %s\n",
+			EXCEPT("Invalid expression for ROOSTER_UNHIBERNATE_RANK: %s",
 				   rank.Value());
 		}
 	}
@@ -125,8 +125,8 @@ static int StartdSortFunc(ClassAd *ad1,ClassAd *ad2,void *data)
 
 	float rank1 = 0;
 	float rank2 = 0;
-	rank_ad->EvalFloat(ATTR_RANK,ad1,rank1);
-	rank_ad->EvalFloat(ATTR_RANK,ad2,rank2);
+	EvalFloat(ATTR_RANK,rank_ad,ad1,rank1);
+	EvalFloat(ATTR_RANK,rank_ad,ad2,rank2);
 
 	return rank1 > rank2;
 }
@@ -142,7 +142,7 @@ void Rooster::poll()
 
 	if( ParseClassAdRvalExpr( m_unhibernate_constraint.Value(), requirements )!=0 || requirements==NULL )
 	{
-		EXCEPT("Invalid expression for ROOSTER_UNHIBERNATE: %s\n",
+		EXCEPT("Invalid expression for ROOSTER_UNHIBERNATE: %s",
 			   m_unhibernate_constraint.Value());
 	}
 
@@ -169,26 +169,26 @@ void Rooster::poll()
 	startdAds.Open();
 	int num_woken = 0;
 	ClassAd *startd_ad;
-	HashTable<MyString,bool> machines_done(MyStringHash);
+	HashTable<MyString,bool> machines_done(hashFunction);
 	while( (startd_ad=startdAds.Next()) ) {
-		MyString machine;
-		MyString name;
+		std::string machine;
+		std::string name;
 		startd_ad->LookupString(ATTR_MACHINE,machine);
 		startd_ad->LookupString(ATTR_NAME,name);
 
 		if( machines_done.exists(machine)==0 ) {
 			dprintf(D_FULLDEBUG,
 					"Skipping %s: already attempted to wake up %s in this cycle.\n",
-					name.Value(),machine.Value());
+					name.c_str(),machine.c_str());
 			continue;
 		}
 
 			// in case the unhibernate expression is time-sensitive,
 			// re-evaluate it now to make sure it still passes
-		if( !EvalBool(startd_ad,requirements) ) {
+		if( !EvalExprBool(startd_ad,requirements) ) {
 			dprintf(D_ALWAYS,
 					"Skipping %s: ROOSTER_UNHIBERNATE is no longer true.\n",
-					name.Value());
+					name.c_str());
 			continue;
 		}
 
@@ -218,16 +218,16 @@ Rooster::wakeUp(ClassAd *startd_ad)
 {
 	ASSERT( startd_ad );
 
-	MyString name;
+	std::string name;
 	startd_ad->LookupString(ATTR_NAME,name);
 
-	dprintf(D_ALWAYS,"Sending wakeup call to %s.\n",name.Value());
+	dprintf(D_ALWAYS,"Sending wakeup call to %s.\n",name.c_str());
 
 	int stdin_pipe_fds[2];
 	stdin_pipe_fds[0] = -1; // child's side
 	stdin_pipe_fds[1] = -1; // my side
 	if( !daemonCore->Create_Pipe(stdin_pipe_fds) ) {
-		dprintf(D_ALWAYS,"Rooster::wakeUp: failed to create stdin pipe.");
+		dprintf(D_ALWAYS,"Rooster::wakeUp: failed to create stdin pipe.\n");
 		return false;
 	}
 
@@ -235,7 +235,7 @@ Rooster::wakeUp(ClassAd *startd_ad)
 	stdout_pipe_fds[0] = -1; // my side
 	stdout_pipe_fds[1] = -1; // child's side
 	if( !daemonCore->Create_Pipe(stdout_pipe_fds) ) {
-		dprintf(D_ALWAYS,"Rooster::wakeUp: failed to create stdout pipe.");
+		dprintf(D_ALWAYS,"Rooster::wakeUp: failed to create stdout pipe.\n");
 		daemonCore->Close_Pipe(stdin_pipe_fds[0]);
 		daemonCore->Close_Pipe(stdin_pipe_fds[1]);
 		return false;
@@ -251,6 +251,7 @@ Rooster::wakeUp(ClassAd *startd_ad)
 		m_wakeup_args,
 		PRIV_CONDOR_FINAL,
 		0,
+		FALSE,
 		FALSE,
 		NULL,
 		NULL,

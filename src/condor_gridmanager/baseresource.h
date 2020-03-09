@@ -59,14 +59,14 @@ class BaseResource : public Service
 	void CancelSubmit( BaseJob *job );
 	void AlreadySubmitted( BaseJob *job );
 
+	void RequestUpdateLeases();
+	time_t GetLeaseExpiration( const BaseJob *job = NULL );
+
     static void setProbeInterval( int new_interval )
 		{ probeInterval = new_interval; }
 
 	static void setProbeDelay( int new_delay )
 		{ probeDelay = new_delay; }
-
-	// TODO Make this private and provide an accessor function?
-	time_t m_sharedLeaseExpiration;
 
 	int m_paramJobPollRate;
 	int m_paramJobPollInterval;
@@ -118,11 +118,11 @@ class BaseResource : public Service
 	bool hasLeases;
 	int updateLeasesTimerId;
 	time_t lastUpdateLeases;
-	List<BaseJob> leaseUpdates;
+	SimpleList<BaseJob*> leaseUpdates;
 	bool updateLeasesActive;
-	bool leaseAttrsSynched;
 	bool updateLeasesCmdActive;
 	bool m_hasSharedLeases;
+	time_t m_sharedLeaseExpiration;
 	time_t m_defaultLeaseDuration;
 
 	int _updateCollectorTimerId;
@@ -194,7 +194,7 @@ protected:
 	// Only called if WatchBatchStatusTimer()
 	// Implements the batch status probe, calling out to
 	// StartBatchStatus and FinishBatchStatus to implement.
-	int DoBatchStatus();
+	void DoBatchStatus();
 };
 
 #endif // define BASERESOURCE_H

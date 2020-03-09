@@ -20,7 +20,6 @@
 #include "condor_common.h"
 #include "condor_debug.h"
 #include "MyString.h"
-#include "extArray.h"
 #include "simplelist.h"
 #include "condor_classad.h"
 #include "condor_attributes.h"
@@ -146,7 +145,7 @@ TransferRequest::append_task(ClassAd *ad)
 }
 
 void
-TransferRequest::set_procids(ExtArray<PROC_ID> *procs)
+TransferRequest::set_procids(std::vector<PROC_ID> *procs)
 {
 	ASSERT(m_ip != NULL);
 
@@ -154,7 +153,7 @@ TransferRequest::set_procids(ExtArray<PROC_ID> *procs)
 }
 
 // do not free this returned pointer
-ExtArray<PROC_ID>*
+std::vector<PROC_ID>*
 TransferRequest::get_procids(void)
 {
 	ASSERT(m_ip != NULL);
@@ -181,15 +180,9 @@ TransferRequest::dprintf(unsigned int lvl)
 void
 TransferRequest::set_num_transfers(int nt)
 {
-	MyString str;
-
 	ASSERT(m_ip != NULL);
 
-	str += ATTR_IP_NUM_TRANSFERS;
-	str += " = ";
-	str += nt;
-
-	m_ip->Insert(str.Value());
+	m_ip->Assign( ATTR_IP_NUM_TRANSFERS, nt );
 }
 
 int
@@ -205,40 +198,24 @@ TransferRequest::get_num_transfers(void)
 }
 
 void
-TransferRequest::set_transfer_service(MyString &mode)
+TransferRequest::set_transfer_service(const std::string &mode)
 {
-	ASSERT(m_ip != NULL);
-
-	set_transfer_service(mode.Value());
+	m_ip->Assign( ATTR_IP_TRANSFER_SERVICE, mode );
 }
 
-void
-TransferRequest::set_transfer_service(const char *mode)
-{
-	MyString str;
-
-	ASSERT(m_ip != NULL);
-
-	str += ATTR_IP_TRANSFER_SERVICE;
-	str += " = \"";
-	str += mode;
-	str += "\"";
-
-	m_ip->Insert(str.Value());
-}
-
+#if 0
 void
 TransferRequest::set_transfer_service(TreqMode  /*mode*/)
 {
 	// XXX TODO
 }
+#endif
 
 
 TreqMode
 TransferRequest::get_transfer_service(void)
 {
-	MyString mode;
-	MyString tmp;
+	std::string mode;
 
 	ASSERT(m_ip != NULL);
 
@@ -252,13 +229,7 @@ TransferRequest::set_protocol_version(int pv)
 {
 	ASSERT(m_ip != NULL);
 
-	MyString str;
-
-	str += ATTR_IP_PROTOCOL_VERSION;
-	str += " = ";
-	str += pv;
-
-	m_ip->Insert(str.Value());
+	m_ip->Assign( ATTR_IP_PROTOCOL_VERSION, pv );
 }
 
 int
@@ -278,13 +249,7 @@ TransferRequest::set_xfer_protocol(int xp)
 {
 	ASSERT(m_ip != NULL);
 
-	MyString str;
-
-	str += ATTR_TREQ_FTP;
-	str += " = ";
-	str += xp;
-
-	m_ip->Insert(str.Value());
+	m_ip->Assign( ATTR_TREQ_FTP, xp );
 }
 
 int
@@ -304,13 +269,7 @@ TransferRequest::set_direction(int dir)
 {
 	ASSERT(m_ip != NULL);
 
-	MyString str;
-
-	str += ATTR_TREQ_DIRECTION;
-	str += " = ";
-	str += dir;
-
-	m_ip->Insert(str.Value());
+	m_ip->Assign( ATTR_TREQ_DIRECTION, dir );
 }
 
 int
@@ -331,13 +290,7 @@ TransferRequest::set_used_constraint(bool con)
 {
 	ASSERT(m_ip != NULL);
 
-	MyString str;
-
-	str += ATTR_TREQ_HAS_CONSTRAINT;
-	str += " = ";
-	str += con==true?"TRUE":"FALSE";
-
-	m_ip->Insert(str.Value());
+	m_ip->Assign( ATTR_TREQ_HAS_CONSTRAINT, con );
 }
 
 bool
@@ -353,36 +306,18 @@ TransferRequest::get_used_constraint(void)
 }
 
 void
-TransferRequest::set_peer_version(MyString &pv)
+TransferRequest::set_peer_version(const std::string &pv)
 {
-	MyString str;
-
 	ASSERT(m_ip != NULL);
 
-	str += ATTR_IP_PEER_VERSION;
-	str += " = \"";
-	str += pv;
-	str += "\"";
-
-	m_ip->Insert(str.Value());
-}
-
-void
-TransferRequest::set_peer_version(char *pv)
-{
-	MyString str;
-	ASSERT(m_ip != NULL);
-
-	str = pv;
-
-	set_peer_version(str);
+	m_ip->Assign( ATTR_IP_PEER_VERSION, pv );
 }
 
 // This will make a copy when you assign the return value to something.
-MyString
+std::string
 TransferRequest::get_peer_version(void)
 {
-	MyString pv;
+	std::string pv;
 
 	ASSERT(m_ip != NULL);
 
@@ -401,24 +336,24 @@ TransferRequest::todo_tasks(void)
 }
 
 void
-TransferRequest::set_capability(MyString &capability)
+TransferRequest::set_capability(const std::string &capability)
 {
 	m_cap = capability;
 }
 
-MyString
+const std::string&
 TransferRequest::get_capability()
 {
 	return m_cap;
 }
 
 void
-TransferRequest::set_rejected_reason(MyString &reason)
+TransferRequest::set_rejected_reason(const std::string &reason)
 {
 	m_rejected_reason = reason;
 }
 
-MyString
+const std::string&
 TransferRequest::get_rejected_reason()
 {
 	return m_rejected_reason;

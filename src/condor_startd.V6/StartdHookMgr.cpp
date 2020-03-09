@@ -31,7 +31,7 @@ StartdHookMgr::StartdHookMgr()
 	: HookClientMgr(),
 	  NUM_HOOKS(3),
 	  UNDEFINED((char*)1),
-	  m_keyword_hook_paths(MyStringHash)
+	  m_keyword_hook_paths(hashFunction)
 {
 	dprintf( D_FULLDEBUG, "Instantiating a StartdHookMgr\n" );
 }
@@ -209,9 +209,7 @@ StartdHookMgr::handleHookFetchWork(FetchClient* fetch_client)
 	if (!job_ad->LookupString(ATTR_HOOK_KEYWORD, NULL, 0)) {
 		char* keyword = rip->getHookKeyword();
 		ASSERT(keyword && keyword != UNDEFINED);
-		MyString keyword_attr;
-		keyword_attr.formatstr("%s = \"%s\"", ATTR_HOOK_KEYWORD, keyword);
-		job_ad->Insert(keyword_attr.Value());
+		job_ad->Assign(ATTR_HOOK_KEYWORD, keyword);
 	}
 
 		// No matter what, if the reply fetch hook is configured, invoke it.
@@ -385,9 +383,10 @@ FetchClient::hookExited(int exit_status) {
 	if (m_std_out.Length()) {
 		ASSERT(m_job_ad == NULL);
 		m_job_ad = new ClassAd();
-		m_std_out.Tokenize();
+		MyStringTokener tok;
+		tok.Tokenize(m_std_out.Value());
 		const char* hook_line = NULL;
-		while ((hook_line = m_std_out.GetNextToken("\n", true))) {
+		while ((hook_line = tok.GetNextToken("\n", true))) {
 			if (!m_job_ad->Insert(hook_line)) {
 				dprintf(D_ALWAYS, "Failed to insert \"%s\" into ClassAd, "
 						"ignoring invalid hook output\n", hook_line);

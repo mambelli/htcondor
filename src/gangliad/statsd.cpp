@@ -19,14 +19,14 @@
 
 #include "condor_common.h"
 #include "condor_config.h"
-#include "../condor_daemon_core.V6/condor_daemon_core.h"
+#include <condor_daemon_core.h>
 #include "directory.h"
 #include "dc_collector.h"
-#include "counted_ptr.h"
 #include "statsd.h"
 
 #include <memory>
 #include <fstream>
+#include <sstream>
 
 #define ATTR_REGEX  "Regex"
 #define ATTR_VERBOSITY "Verbosity"
@@ -99,7 +99,7 @@ Metric::evaluate(char const *attr_name,classad::Value &result,classad::ClassAd &
 		classad::ClassAdUnParser unparser;
 		std::string expr_str;
 		unparser.Unparse(expr_str,expr);
-		dprintf(D_ALWAYS,"Failed to evaluate the following%s%s: %s=%s\n",
+		dprintf(D_FULLDEBUG,"Failed to evaluate the following%s%s: %s=%s\n",
 				name.empty() ? "" : " attribute of metric ",
 				name.c_str(),
 				attr_name,
@@ -184,7 +184,7 @@ Metric::evaluateDaemonAd(classad::ClassAd &metric_ad,classad::ClassAd const &dae
 				return false;
 			}
 			bool dynamic_slot = false;
-			daemon_ad.EvaluateAttrBool(ATTR_SLOT_DYNAMIC,dynamic_slot);
+			(void) daemon_ad.EvaluateAttrBool(ATTR_SLOT_DYNAMIC,dynamic_slot);
 			if( dynamic_slot ) {
 				return false;
 			}
@@ -222,7 +222,7 @@ Metric::evaluateDaemonAd(classad::ClassAd &metric_ad,classad::ClassAd const &dae
 				ExtArray<MyString> the_regex_groups;
 				if( re.match(itr->first.c_str(),&the_regex_groups) ) {
 					// make a new Metric for this attribute that matched the regex
-					counted_ptr<Metric> metric(statsd->newMetric());
+					std::shared_ptr<Metric> metric(statsd->newMetric());
 					metric->evaluateDaemonAd(metric_ad,daemon_ad,max_verbosity,statsd,&the_regex_groups,itr->first.c_str());
 				}
 			}
@@ -373,6 +373,9 @@ Metric::evaluateDaemonAd(classad::ClassAd &metric_ad,classad::ClassAd const &dae
 		else if( !strcasecmp(my_type.c_str(),"submitter") ) {
 			daemon_ad.EvaluateAttrString(ATTR_SCHEDD_NAME,machine);
 		}
+		else if( !strcasecmp(my_type.c_str(),"accounting") ) {
+			daemon_ad.EvaluateAttrString(ATTR_NEGOTIATOR_NAME,machine);
+		}
 		else {
 			// use the daemon name for the metric machine name
 			daemon_ad.EvaluateAttrString(ATTR_NAME,machine);
@@ -469,7 +472,7 @@ Metric::addToAggregateValue(Metric const &datapoint) {
 		}
 		case MIN: {
 			double n=0;
-			if( datapoint.value.IsNumber(sum) ) {
+			if( datapoint.value.IsNumber(n) ) {
 				if( count == 0 || n < sum ) {
 					sum = n;
 				}
@@ -479,7 +482,7 @@ Metric::addToAggregateValue(Metric const &datapoint) {
 		}
 		case MAX: {
 			double n=0;
-			if( datapoint.value.IsNumber(sum) ) {
+			if( datapoint.value.IsNumber(n) ) {
 				if( count == 0 || n > sum ) {
 					sum = n;
 				}
@@ -570,6 +573,7 @@ StatsD::initAndReconfig(char const *service_name)
 		}
 	}
 	else {
+		m_stats_heartbeat_interval = MIN(m_stats_pub_interval,m_stats_heartbeat_interval);
 		m_stats_pub_timer = daemonCore->Register_Timer(
 			m_stats_heartbeat_interval,
 			m_stats_heartbeat_interval,
@@ -750,7 +754,7 @@ StatsD::publishMetrics()
 {
 	dprintf(D_ALWAYS,"Starting update...\n");
 
-    double start_time = UtcTime::getTimeDouble();
+    double start_time = condor_gettimestamp_double();
 
     m_stats_time_till_pub -= m_stats_heartbeat_interval;
 
@@ -825,7 +829,7 @@ StatsD::publishMetrics()
     sendHeartbeats();
 
     // Did we take longer than a heartbeat period?
-    int heartbeats_missed = (int)(UtcTime::getTimeDouble() - start_time) /
+    int heartbeats_missed = (int)(condor_gettimestamp_double() - start_time) /
                             m_stats_heartbeat_interval;
     if (heartbeats_missed) {
         dprintf(D_ALWAYS, "Skipping %d heartbeats\n", heartbeats_missed);
@@ -879,7 +883,7 @@ StatsD::publishDaemonMetrics(ClassAd *daemon_ad)
 		 itr != m_metrics.end();
 		 itr++ )
 	{
-		counted_ptr<Metric> metric(newMetric());
+		std::shared_ptr<Metric> metric(newMetric());
 		// This calls publishMetric() (possibly multiple times) or addToAggregateValue()
 		metric->evaluateDaemonAd(**itr,*daemon_ad,m_verbosity,this);
 	}

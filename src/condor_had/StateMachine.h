@@ -161,7 +161,7 @@ protected:
     void my_debug_print_buffers(void);
 
 	// usage of replication, controlled by configuration parameter 
-	// USE_REPLICATION
+	// HAD_USE_REPLICATION
 	bool m_useReplication;
 
 	bool sendReplicationCommand( int );
@@ -173,9 +173,9 @@ protected:
     // timer handler
     void updateCollectors(void);
     // updates collectors upon changing from/to leader state
-    void updateCollectorsClassAd( const MyString& isHadActive );
+    void updateCollectorsClassAd( const std::string& isHadActive );
 
-	MyString    m_name;
+	std::string    m_name;
 	ClassAd		m_classAd;
 
     // info about our central manager

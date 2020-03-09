@@ -22,7 +22,7 @@
 #define _CONDOR_JIC_LOCAL_SCHEDD_H
 
 #include "jic_local_file.h"
-#include "../condor_schedd.V6/qmgr_job_updater.h"
+#include <qmgr_job_updater.h>
 #include "starter_user_policy.h"
 
 /** 
@@ -167,7 +167,7 @@ protected:
 	void retryJobCleanup( void );
 
 		/// DaemonCore timer handler to actually do the retry.
-	int retryJobCleanupHandler( void );
+	void retryJobCleanupHandler( void );
 
 		/// Timer id for the job cleanup retry handler.
 	int m_cleanup_retry_tid;

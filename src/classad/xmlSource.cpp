@@ -76,17 +76,6 @@ ParseClassAd( FILE *file, ClassAd &ad )
 	return classad_out != NULL;
 }
 
-bool ClassAdXMLParser::
-ParseClassAd( std::istream& stream, ClassAd &ad )
-{
-	ClassAd *classad_out;
-	InputStreamLexerSource lexer_source(stream);
-
-	lexer.SetLexerSource(&lexer_source);
-	classad_out = ParseClassAd(&ad);
-	return classad_out != NULL;
-}
-
 ClassAd *ClassAdXMLParser::
 ParseClassAd( const string &buffer)
 {
@@ -120,18 +109,6 @@ ParseClassAd(FILE *file)
 }
 
 ClassAd *ClassAdXMLParser::
-ParseClassAd( istream& stream)
-{
-	ClassAd *classad;
-	InputStreamLexerSource lexer_source(stream);
-	
-	lexer.SetLexerSource(&lexer_source);
-	classad = ParseClassAd();
-	return classad;
-}
-
-
-ClassAd *ClassAdXMLParser::
 ParseClassAd(ClassAd *classad_in)
 {
 	bool             in_classad;
@@ -158,7 +135,6 @@ ParseClassAd(ClassAd *classad_in)
 						local_ad = new ClassAd();
 						classad = local_ad;
 					}
-					classad->DisableDirtyTracking();
 				} else {
 					// We're done, return the ClassAd we got, if any.
                     in_classad = false;
@@ -208,9 +184,6 @@ ParseClassAd(ClassAd *classad_in)
 				lexer.ConsumeToken(NULL);
 			}
 		}
-	}
-	if (classad != NULL) {
-		classad->EnableDirtyTracking();
 	}
 	return classad;
 }
@@ -336,17 +309,28 @@ ParseNumberOrString(XMLLexer::TagID tag_id)
 		Value value;
 		if (tag_id == XMLLexer::tagID_Integer) {
 			long long number;
-			sscanf(token.text.c_str(), "%lld", &number);
-			value.SetIntegerValue(number);
+			char * pend;
+			const char * pnum = token.text.c_str();
+			number = strtoll(pnum, &pend, 10);
+			if ( ! number && (pend == pnum)) {
+				value.SetErrorValue();
+			} else {
+				value.SetIntegerValue(number);
+			}
 		}
 		else if (tag_id == XMLLexer::tagID_Real) {
 			double real;
-            real = strtod(token.text.c_str(), NULL);
-            value.SetRealValue(real);
-        }
+			char * pend;
+			const char * pnum = token.text.c_str();
+			real = strtod(pnum, &pend);
+			if (pend == pnum) {
+				value.SetErrorValue();
+			} else {
+				value.SetRealValue(real);
+			}
+		}
 		else {        // its a string
 			bool validStr = true;
-			token.text += " ";
 			convert_escapes(token.text, validStr );
 			if(!validStr) {  // invalid string because it had /0 escape sequence
 				return NULL;

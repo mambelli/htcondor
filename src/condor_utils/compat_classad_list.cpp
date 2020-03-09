@@ -24,18 +24,12 @@
 #include <vector>
 #include <algorithm>
 
-namespace compat_classad {
-
-static unsigned int
+static size_t
 ptr_hash_fn(ClassAd* const &index)
 {
 	intptr_t i = (intptr_t)index;
 
-#if (SIZEOF_VOIDPTR > 4)
-	return (unsigned int)( i ^ (i>>32) );
-#else
-	return (unsigned int) i;
-#endif
+	return (size_t) i;
 }
 
 ClassAdListDoesNotDeleteAds::ClassAdListDoesNotDeleteAds():
@@ -230,36 +224,6 @@ ClassAdListDoesNotDeleteAds::Shuffle()
 	}
 }
 
-void ClassAdListDoesNotDeleteAds::fPrintAttrListList(FILE* f, bool use_xml, StringList *attr_white_list)
-{
-	ClassAd            *tmpAttrList;
-	std::string            xml;
-
-	if (use_xml) {
-		AddClassAdXMLFileHeader(xml);
-		printf("%s\n", xml.c_str());
-		xml = "";
-	}
-
-    Open();
-    for(tmpAttrList = Next(); tmpAttrList; tmpAttrList = Next()) {
-		if (use_xml) {
-			sPrintAdAsXML(xml, *tmpAttrList, attr_white_list);
-			printf("%s\n", xml.c_str());
-			xml = "";
-		} else {
-			fPrintAd(f, *tmpAttrList, false, attr_white_list);
-		}
-        fprintf(f, "\n");
-    }
-	if (use_xml) {
-		AddClassAdXMLFileFooter(xml);
-		printf("%s\n", xml.c_str());
-		xml = "";
-	}
-    Close();
-}
-
 int ClassAdListDoesNotDeleteAds::CountMatches(classad::ExprTree* constraint)
 {
 	ClassAd *ad = NULL;
@@ -272,11 +236,9 @@ int ClassAdListDoesNotDeleteAds::CountMatches(classad::ExprTree* constraint)
 
 	Rewind();
 	while( (ad = Next()) ) {
-		if ( EvalBool(ad, constraint) ) {
+		if ( EvalExprBool(ad, constraint) ) {
 			matchCount++;
         }
 	}
 	return matchCount;
 }
-
-} // namespace compat_classad

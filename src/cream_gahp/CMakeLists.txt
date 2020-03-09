@@ -18,13 +18,20 @@
 
 if ( HAVE_EXT_CREAM )
 
-	# cream is such an odd beast and it collides with other versions of
-	# externals
-        if (NOT PROPER)
-            include_directories ( ${CREAM_STAGE}/include )
-            link_directories ( ${CREAM_STAGE}/lib )
-        endif()
-        
+	if ( HAVE_LIBCARES19 )
+		set( CARES_LIB ${HAVE_LIBCARES19} )
+	else()
+		set( CARES_LIB ${HAVE_LIBCARES} )
+	endif()
+
+	# Ensure we use the version of gsoap that was used to build
+	# the glite libraries.
+	# This is different than the version we use for HTCondor's
+	# soap support.
+	if ( NOT PROPER )
+		include_directories( BEFORE ${CREAMSOAP_INSTALL_LOC}/include )
+	endif()
+
 	add_definitions(-D_REENTRANT)
 	# LTO fails with CREAM because they have references to the typeinfo of exceptions,
 	# but the typeinfo for these are not generated as the exceptions are solely defined
@@ -37,8 +44,16 @@ if ( HAVE_EXT_CREAM )
 	condor_exe( cream_gahp
 		"cream_gahp_server.cpp"
 		${C_SBIN}
-		"${CREAM_FOUND};${OPENSSL_FOUND};${GLOBUS_THR_FOUND};${VOMS_FOUND};${CLASSADS_FOUND};${PCRE_FOUND};${ZLIB_FOUND}"
+		"${CREAM_FOUND};${VOMS_FOUND};${GLOBUS_THR_FOUND};${CLASSADS_FOUND};${LIBSSL_FOUND};${LIBCRYPTO_FOUND};${PCRE_FOUND};${CARES_LIB};${ZLIB_FOUND}"
 		OFF )
+	if ( NOT PROPER )
+		if ( CREAMSOAP_REF )
+			add_dependencies(cream_gahp ${CREAMSOAP_REF})
+		endif()
+		if ( GLOBUS_REF )
+			add_dependencies(cream_gahp ${GLOBUS_REF})
+		endif()
+	endif()
 
 	# Check cream_gahp's shared library dependencies and copy a
 	# specific subset of those libraries into <release>/lib/condor

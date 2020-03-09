@@ -36,87 +36,27 @@ const double Value::ScaleFactor[] = {
 	1024.0*1024.0*1024.0*1024.0	// Terra
 };
 
-
-Value::
-Value( )
+void Value::ApplyFactor()
 {
-	valueType = UNDEFINED_VALUE;
-	booleanValue = false;
-	integerValue = 0;
-	realValue = 0.0;
-	listValue = NULL;
-	slistValue = NULL;
-	classadValue = NULL;
-	relTimeValueSecs = 0;
-}
+	if (factor == NO_FACTOR) return;
 
-
-Value::
-Value(const Value &value)
-{
-	valueType = UNDEFINED_VALUE;
-    CopyFrom(value);
-    return;
-}
-
-Value::
-~Value()
-{
-	_Clear();
-}
-
-Value& Value::
-operator=(const Value &value)
-{
-    if (this != &value) {
-        CopyFrom(value);
-    }
-    return *this;
-}
-
-
-void Value::
-Clear()
-{
-	_Clear();
-	valueType 	= UNDEFINED_VALUE;
-}
-
-
-void Value::
-_Clear()
-{
+	double r = 0;
 	switch( valueType ) {
-		case LIST_VALUE:
-			// list values live in the evaluation environment, so they must
-			// never be explicitly destroyed
-			listValue = NULL;
-			break;
-		case SLIST_VALUE:
-			delete slistValue;
-			slistValue = NULL;
-			break;
-		case CLASSAD_VALUE:
-			// classad values live in the evaluation environment, so they must 
-			// never be explicitly destroyed
-			classadValue = NULL;
-			break;
-
-		case STRING_VALUE:
-			delete strValue;
-			strValue = NULL;
-			break;
-
-		case ABSOLUTE_TIME_VALUE:
-			delete absTimeValueSecs;
-			absTimeValueSecs = NULL;
-			break;
-
-		default:
-			; // noop
+	case INTEGER_VALUE:
+		r = integerValue;
+		break;
+	case REAL_VALUE:
+		r = realValue;
+		break;
+	default:
+		factor = NO_FACTOR;
+		return;
 	}
-}
 
+	valueType = REAL_VALUE;
+	realValue = r * ScaleFactor[factor];
+	factor = NO_FACTOR;
+}
 
 bool Value::
 IsNumber (int &i) const
@@ -215,8 +155,16 @@ IsBooleanValueEquiv(bool &b) const
 void Value::
 CopyFrom( const Value &val )
 {
+	// optimization, when copying string to string, we can skip the delete/new of the string buffer
+	if (valueType == STRING_VALUE && val.valueType == valueType) {
+		*strValue = *(val.strValue);
+		return;
+	}
+
 	_Clear();
 	valueType = val.valueType;
+	factor = val.factor;
+
 	switch (val.valueType) {
 		case STRING_VALUE:
 			strValue = new string( *val.strValue);
@@ -237,7 +185,7 @@ CopyFrom( const Value &val )
 		case UNDEFINED_VALUE:
 		case ERROR_VALUE:
 			return;
-	
+
 		case LIST_VALUE:
 			listValue = val.listValue;
 			return;
@@ -248,6 +196,10 @@ CopyFrom( const Value &val )
 
 		case CLASSAD_VALUE:
 			classadValue = val.classadValue;
+			return;
+
+		case SCLASSAD_VALUE:
+			sclassadValue = new classad_shared_ptr<ClassAd>(*val.sclassadValue);
 			return;
 
 		case ABSOLUTE_TIME_VALUE:
@@ -306,6 +258,11 @@ SetErrorValue (void)
 void Value::
 SetStringValue( const string &s )
 {
+	// optimization, when copying string to string, we can skip the delete/new of the string buffer
+	if (valueType == STRING_VALUE) {
+		*strValue = s;
+		return;
+	}
 	_Clear();
 	valueType = STRING_VALUE;
 	strValue = new string( s );
@@ -314,9 +271,27 @@ SetStringValue( const string &s )
 void Value::
 SetStringValue( const char *s )
 {
+	// optimization, when copying string to string, we can skip the delete/new of the string buffer
+	if (valueType == STRING_VALUE) {
+		*strValue = s;
+		return;
+	}
 	_Clear();
 	valueType = STRING_VALUE;
 	strValue = new string( s );
+}
+
+void Value::
+SetStringValue( const char *s, size_t cch )
+{
+	// optimization, when copying string to string, we can skip the delete/new of the string buffer
+	if (valueType == STRING_VALUE) {
+		strValue->assign(s, cch);
+		return;
+	}
+	_Clear();
+	valueType = STRING_VALUE;
+	strValue = new string( s, cch );
 }
 
 void Value::
@@ -334,6 +309,15 @@ SetListValue( classad_shared_ptr<ExprList> l)
     valueType = SLIST_VALUE;
     slistValue = new classad_shared_ptr<ExprList>(l);
 }
+
+void Value::
+SetClassAdValue( classad_shared_ptr<ClassAd> ad )
+{
+	_Clear();
+	valueType = SCLASSAD_VALUE;
+    sclassadValue = new classad_shared_ptr<ClassAd>(ad);
+}
+
 
 void Value::
 SetClassAdValue( ClassAd *ad )
@@ -399,6 +383,9 @@ SameAs(const Value &otherValue) const
         case Value::CLASSAD_VALUE:
             is_same = classadValue->SameAs(otherValue.classadValue);
             break;
+        case Value::SCLASSAD_VALUE:
+            is_same = classadValue->SameAs(otherValue.sclassadValue->get());
+            break;
         case Value::RELATIVE_TIME_VALUE:
             is_same = (relTimeValueSecs == otherValue.relTimeValueSecs);
             break;
@@ -409,6 +396,8 @@ SameAs(const Value &otherValue) const
         case Value::STRING_VALUE:
             is_same = (*strValue == *otherValue.strValue);
             break;
+		default:
+			break;
         }
     }
     return is_same;
@@ -450,7 +439,8 @@ ostream& operator<<(ostream &stream, Value &value)
 	case Value::LIST_VALUE:
 	case Value::SLIST_VALUE:
 	case Value::CLASSAD_VALUE:
-	case Value::RELATIVE_TIME_VALUE: 
+	case Value::SCLASSAD_VALUE:
+	case Value::RELATIVE_TIME_VALUE:
 	case Value::ABSOLUTE_TIME_VALUE: {
 		unparser.Unparse(unparsed_text, value);
 		stream << unparsed_text;
@@ -458,6 +448,8 @@ ostream& operator<<(ostream &stream, Value &value)
 	}
 	case Value::STRING_VALUE:
 		stream << *value.strValue;
+		break;
+	default:
 		break;
 	}
 
@@ -486,6 +478,7 @@ bool convertValueToRealValue(const Value value, Value &realValue)
 
 		case Value::ERROR_VALUE:
 		case Value::CLASSAD_VALUE:
+		case Value::SCLASSAD_VALUE:
 		case Value::LIST_VALUE:
 		case Value::SLIST_VALUE:
 			realValue.SetErrorValue();
@@ -577,6 +570,7 @@ bool convertValueToIntegerValue(const Value value, Value &integerValue)
 
 		case Value::ERROR_VALUE:
 		case Value::CLASSAD_VALUE:
+		case Value::SCLASSAD_VALUE:
 		case Value::LIST_VALUE:
 		case Value::SLIST_VALUE:
 			integerValue.SetErrorValue();
@@ -671,6 +665,7 @@ bool convertValueToStringValue(const Value value, Value &stringValue)
             break;
 
 		case Value::CLASSAD_VALUE:
+		case Value::SCLASSAD_VALUE:
 		case Value::LIST_VALUE:
 		case Value::SLIST_VALUE:
 		case Value::BOOLEAN_VALUE:
@@ -719,6 +714,28 @@ IsSListValue(classad_shared_ptr<ExprList>& l)
             // in case we are called multiple times, stash a shared_ptr
             // to the copy of the list
         SetListValue(l);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+bool Value::
+IsSClassAdValue(classad_shared_ptr<ClassAd>& c)
+{
+    if (valueType == SCLASSAD_VALUE) {
+        c = (*sclassadValue);
+        return true;
+    } else if (valueType == CLASSAD_VALUE) {
+            // we must copy our list, because it does not belong
+            // to a shared_ptr
+        c = classad_shared_ptr<ClassAd>( (ClassAd*)classadValue->Copy() );
+        if( !c ) {
+            return false;
+        }
+            // in case we are called multiple times, stash a shared_ptr
+            // to the copy of the list
+        SetClassAdValue(c);
         return true;
     } else {
         return false;

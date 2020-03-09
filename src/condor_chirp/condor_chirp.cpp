@@ -27,7 +27,10 @@
 #include "chirp_protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include "MyString.h"
+
+// the documentation for the chirp tool is that it returns 1 on failure, so that is what we will do.
+// when the chirp_client API calls abort().
+void abort_handler(int /*signum*/) { exit(1); }
 
 #define DISCONNECT_AND_RETURN(client, rval) \
 	int save_errno = errno; \
@@ -89,22 +92,24 @@ chirp_client_connect_starter()
     char *default_filename;
     char host[CONDOR_HOSTNAME_MAX];
     char cookie[CHIRP_LINE_MAX];
-	MyString path;
+	std::string path;
     int port;
     int result;
 	const char *dir;
 
 	if ((default_filename = getenv("_CONDOR_CHIRP_CONFIG"))) {
-		path.formatstr( "%s", default_filename );
+		path = default_filename;
 	} else {
 		if (NULL == (dir = getenv("_CONDOR_SCRATCH_DIR"))) {
 			dir = ".";
 		}
-		path.formatstr( "%s%c%s",dir,DIR_DELIM_CHAR,".chirp.config");
+		path = dir;
+		path += DIR_DELIM_CHAR;
+		path += ".chirp.config";
 	}
-    file = safe_fopen_wrapper_follow(path.Value(),"r");
+    file = safe_fopen_wrapper_follow(path.c_str(),"r");
     if(!file) {
-		fprintf(stderr, "Can't open %s file\n",path.Value());
+		fprintf(stderr, "Can't open %s file\n",path.c_str());
 		return 0;
 	}
 
@@ -241,8 +246,18 @@ chirp_put_one_file(char *local, char *remote, int perm) {
 	}
 	
 		// Get size of file, allocate buffer
+#if defined(WIN32)
+	struct _stat stat_buf;
+	if (_fstat(fileno(rfd), &stat_buf) == -1) {
+#else
 	struct stat stat_buf;
-	stat(local, &stat_buf);
+	if (fstat(fileno(rfd), &stat_buf) == -1) {
+#endif
+		fprintf(stderr, "Can't fstat local file %s\n", local);
+		fclose(rfd);
+		DISCONNECT_AND_RETURN(client, -1);
+	}
+
 	int size = stat_buf.st_size;
 	char* buf = (char*)malloc(size);
 	if ( ! buf) {
@@ -371,6 +386,7 @@ int chirp_get_job_attr(int argc, char **argv) {
 	char *p = 0;
 	int len = chirp_client_get_job_attr(client, argv[2], &p);
 	printf("%.*s\n", len, p);
+	free(p);
 	DISCONNECT_AND_RETURN(client, 0);
 }
 
@@ -390,6 +406,7 @@ int chirp_get_job_attr_delayed(int argc, char **argv) {
 	char *p = 0;
 	int len = chirp_client_get_job_attr_delayed(client, argv[2], &p);
 	printf("%.*s\n", len, p);
+	free(p);
 	DISCONNECT_AND_RETURN(client, 0);
 }
 
@@ -510,8 +527,13 @@ int chirp_read(int argc, char **argv) {
 	if(fd < 0) {
 		DISCONNECT_AND_RETURN(client, fd);
 	}
-	void* buf = malloc(length+1);
 	
+	void* buf = malloc(length+1);
+	if ( ! buf) {
+		printf("failed to allocate %d bytes\n", length);
+		CLOSE_DISCONNECT_AND_RETURN(client, fd, -1);
+	}
+
 	int ret_val = -1;
 	// Use read
 	if(offset == 0 && stride_length == 0 && stride_skip == 0) {
@@ -709,7 +731,7 @@ int chirp_getdir(int argc, char **argv) {
 	struct chirp_client *client = 0;
 	CONNECT_STARTER(client);
 	
-	char *buffer;
+	char *buffer = NULL;
 	int status = -1;
 		
 		// Use getlongdir if '-l' specified
@@ -988,6 +1010,18 @@ main(int argc, char **argv) {
 		exit(-1);
 	}
 
+#ifdef WIN32
+	// defeat the windows abort message and/or dialog box. and also the crash dump
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+	// catch abort, and exit with code 1 instead.
+	struct sigaction act;
+	act.sa_handler = abort_handler;
+	act.sa_flags = 0;
+	sigfillset(&act.sa_mask);
+	sigaction(SIGABRT,&act,0);
+#endif
+
 	if (strcmp("fetch", argv[1]) == 0) {
 		ret_val = chirp_fetch(argc, argv);
 	} else if (strcmp("put", argv[1]) == 0) {
@@ -1046,5 +1080,4 @@ main(int argc, char **argv) {
 		printf("\tError: %d (%s)\n", errno, strerror(errno));
 	}
 	return ret_val;
-	exit(-1);
 }

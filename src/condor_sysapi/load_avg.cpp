@@ -21,7 +21,7 @@
 /* This file contains each implementation of load average that we need. */
 
 /* The essence of the format looks like this for each type of machine:
-	#if defined(HPUX) 
+	#if defined(LINUX) 
 		code
 	#endif
 
@@ -50,48 +50,7 @@ sysapi_load_avg(void)
 	}
 }
 
-#if defined(HPUX)
-/** Nicely ask the system what the one minute load average is.
-    For more info, see the pstat manpage and sys/pstat.h
-*/
-
-#include "condor_uid.h"
-
-#include <sys/pstat.h>
-
-float
-sysapi_load_avg_raw(void)
-{
-  struct pst_dynamic d;
-  	/* make numcpus static so we do not have to recompute
-	 * numcpus every time the load average is requested.
-	 * after all, the number of cpus is not going to change!
-	 * we need to multiply the value the HPUX kerenel gives
-	 * us by the number of CPUs, because on SMP HPUX the kernel
-	 * "distributes" the load average across all CPUs.  But
-	 * no other Unix does that, so our startd assumes otherwise.
-	 * So we multiply by the number of CPUs so HPUX SMP load avg
-	 * is reported the same way as other Unixes. -Todd
-	 */
-  static int numcpus = 0;  
-
-  sysapi_internal_reconfig();
-  if ( numcpus == 0 ) {
-    numcpus = sysapi_ncpus();
-	if ( numcpus < 1 ) {
-		numcpus = 1;
-	}
-  }
-
-  if ( pstat_getdynamic ( &d, sizeof(d), (size_t)1, 0) != -1 ) {
-    return (d.psd_avg_1_min * numcpus);
-  }
-  else {
-    return -1.0;
-  }
-}
-
-#elif defined(LINUX)
+#if defined(LINUX)
 
 //prototype
 void get_k_vars(void);
@@ -100,42 +59,26 @@ float
 sysapi_load_avg_raw(void)
 {
     FILE	*proc;
-	struct utsname buf;
-	int		major, minor, patch;
 	float	short_avg, medium_avg, long_avg;
 
 	sysapi_internal_reconfig();
 
-	// Obtain the kernel version so that we know what /proc looks like..
-	if( uname(&buf) < 0 )  return -1;
-	sscanf(buf.release, "%d.%d.%d", &major, &minor, &patch);
-
 	// /proc/loadavg looks like:
 
+	
 	// Kernel Version 2.0.0:
 	// 0.03 0.03 0.09 2/42 15582
+	// 
+	// Update 6/1/2015:  Looks exactly the same in kernel 4.x
 
     proc=safe_fopen_wrapper_follow("/proc/loadavg","r",0644);
     if(!proc)
-	return -1;
+		return -1;
 
-	switch(major) {
-		case 1:
-		case 2:
-		case 3:
-    		if (fscanf(proc, "%f %f %f", &short_avg, &medium_avg, &long_avg) != 3) {
-				dprintf(D_ALWAYS, "Failed to fscanf 3 floats from /proc/loadavg\n");
-				fclose(proc);
-				return -1;
-			}
-			break;
-
-		default:
-			dprintf(D_ALWAYS, "/proc format unknown for kernel version %d.%d.%d\n",
-				major, minor, patch);
-    		fclose(proc);
-			return -1;
-			break;
+    if (fscanf(proc, "%f %f %f", &short_avg, &medium_avg, &long_avg) != 3) {
+		dprintf(D_ALWAYS, "Failed to fscanf 3 floats from /proc/loadavg\n");
+		fclose(proc);
+		return -1;
 	}
 
     fclose(proc);
@@ -521,27 +464,6 @@ int main()
 
 /* END WIN32 */
 
-#elif defined(AIX)
-
-/* For now, just get this value out of uptime.... */
-
-float lookup_load_avg_via_uptime();
-
-float
-sysapi_load_avg_raw(void)
-{
-
-	float val;
-
-	sysapi_internal_reconfig();
-	val = lookup_load_avg_via_uptime();
-
-	if( IsDebugVerbose( D_LOAD ) ) {
-		dprintf( D_LOAD, "Load avg: %.2f\n", val );
-	}
-	return val;
-}
-
 #else
 
 #error You must define sysapi_load_avg_raw() for this platform!
@@ -552,7 +474,7 @@ sysapi_load_avg_raw(void)
 /*----------------------------------------------------------------------*/
 /* only include this helper function on these architectures */
 
-#if defined(Solaris) || defined(AIX)
+#if defined(Solaris)
 
 /*
  *  We will use uptime(1) to get the load average.  We will return the one

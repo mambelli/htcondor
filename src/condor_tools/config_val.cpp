@@ -81,7 +81,7 @@ enum PrintType {CONDOR_OWNER, CONDOR_TILDE, CONDOR_NONE};
 enum ModeType {CONDOR_QUERY, CONDOR_SET, CONDOR_UNSET,
 			   CONDOR_RUNTIME_SET, CONDOR_RUNTIME_UNSET};
 
-void PrintMetaParam(const char * name);
+void PrintMetaParam(const char * name, bool expand, bool verbose);
 
 // On some systems, the output from config_val sometimes doesn't show
 // up unless we explicitly flush before we exit.
@@ -92,7 +92,7 @@ my_exit( int status )
 	fflush( stderr );
 
 	if ( ! status ) {
-		clear_config();
+		clear_global_config_table();
 		// this is here to validate that we can still param() with an empty param table.
 		char *dummy = param("DUMMY"); if (dummy) free(dummy);
 	}
@@ -104,10 +104,10 @@ my_exit( int status )
 void
 usage(int retval = 1)
 {
-#if 1
 	fprintf(stderr, "Usage: %s <help>\n\n", MyName);
 	fprintf(stderr, "       %s [<location>] <edit> \n\n", MyName);
 	fprintf(stderr, "       %s [<location>] [<view>] <vars>\n\n", MyName);
+	fprintf(stderr, "       %s [<location>] use <template>\n\n", MyName);
 	fprintf(stderr,
 		"    where <edit> is one set/unset operation with one or more arguments\n"
 		"\t-set \"<var> = <value>\"\tSet persistent <var> to <value>\n"
@@ -118,14 +118,16 @@ usage(int retval = 1)
 		"\tvalue is expanded unless -raw, -evaluate, -default or -dump is\n"
 		"\tspecified. When used with -dump, <var> is regular expression.\n"
 		"\n    where <view> is one or more of\n"
+		"\t-summary\t\tPrint all variables changed by config files\n"
 		"\t-dump\t\tPrint values of all variables that match <var>\n"
-		"\t\t\tThe value is raw unless -expand, -default, or -evaluate\n"
+		"\t\t\tThe value is raw unless -expanded, -default, or -evaluate\n"
 		"\t\t\tis specified. If no <vars>, Print all variables\n"
 		"\t-default\tPrint default value\n"
-		"\t-expand\t\tPrint expanded value\n"
+		"\t-expanded\t\tPrint expanded value\n"
 		"\t-raw\t\tPrint raw value as it appears in the file\n"
 		//"\t-stats\t\tPrint statistics of the configuration system\n"
 		"\t-verbose\tPrint source, raw, expanded, and default values\n"
+		//"\t-info\t\tPrint help and usage info for variables\n" // TODO: tj uncomment this for 8.7
 		"\t-debug[:<opts>] dprintf to stderr, optionally overiding TOOL_DEBUG\n"
 		//"\t-diagnostic\t\tPrint diagnostic information about condor_config_val operation\n"
 		"      these options apply when querying a daemon with a <location> argument\n"
@@ -134,6 +136,8 @@ usage(int retval = 1)
 		"\t-unused\t\tPrint only variables not used by the specified daemon\n"
 		"      these options apply when reading configuration files\n"
 		"\t-config\t\tPrint the locations of configuration files\n"
+		"\t-macro[:path]\tMacro expand <vars> as if they were config values\n"
+		"\t\t\tif the path option is specified, canonicalize the result\n"
 		"\t-writeconfig[:<filter>[,only]] <file>\tWrite configuration to <file>\n"
 		"\t\twhere <filter> is a comma separated filter option\n"
 		"\t\t\tdefault - compile time default values\n"
@@ -149,6 +153,10 @@ usage(int retval = 1)
 		"\t\t\texpanding. The default subsystem is TOOL\n"
 		//"\t-tilde\t\tReturn the path to the Condor home directory\n"
 		//"\t-owner\t\tReturn the owner of the condor_config_val process\n"
+		"\n    where <template> is <category>:<var> or <category>\n"
+		"        for <category>:<var>\tPrint the statements in that template\n"
+		"        for <category>\t\tList available <vars> in <category>\n"
+		"            categories are ROLE, POLICY, FEATURE, and SECURITY\n"
 		"\n    where <location> is one or more of\n"
 		"\t-address <ip:port>\tConnect to the given ip/port\n"
 		"\t-pool <hostname>\tUse the given central manager to find daemons\n"
@@ -158,50 +166,11 @@ usage(int retval = 1)
 		"\t-startd\t\t\tQuery the startd\n"
 		"\t-collector\t\tQuery the collector\n"
 		"\t-negotiator\t\tQuery the negotiator\n"
+		"\t-root-config <file>\tUse <file> as the root config file\n"
 		"\n    where <help> is one of\n"
 		"\t-help\t\tPrint this screen and exit\n"
 		"\t-version\tPrint HTCondor version and exit\n"
 		);
-#else
-	fprintf( stderr, "Usage: %s [options] variable [variable] ...\n", MyName );
-	fprintf( stderr,
-			 "   or: %s [options] -set string [string] ...\n",
-			 MyName );
-	fprintf( stderr,
-			 "   or: %s [options] -rset string [string] ...\n",
-			 MyName );
-	fprintf( stderr, "   or: %s [options] -unset variable [variable] ...\n",
-			 MyName );
-	fprintf( stderr, "   or: %s [options] -runset variable [variable] ...\n",
-			 MyName );
-	fprintf( stderr, "   or: %s [options] -tilde\n", MyName );
-	fprintf( stderr, "   or: %s [options] -owner\n", MyName );
-	fprintf( stderr, "   or: %s -dump [-verbose] [-expand]\n", MyName );
-	fprintf( stderr, "\n   Valid options are:\n" );
-	fprintf( stderr, "   -name daemon_name\t(query the specified daemon for its configuration)\n" );
-	fprintf( stderr, "   -pool hostname\t(use the given central manager to find daemons)\n" );
-	fprintf( stderr, "   -address <ip:port>\t(connect to the given ip/port)\n" );
-	fprintf( stderr, "   -set\t\t\t(set a persistent config file expression)\n" );
-	fprintf( stderr, "   -rset\t\t(set a runtime config file expression\n" );
-
-	fprintf( stderr, "   -unset\t\t(unset a persistent config file expression)\n" );
-	fprintf( stderr, "   -runset\t\t(unset a runtime config file expression)\n" );
-
-	fprintf( stderr, "   -master\t\t(query the master)\n" );
-	fprintf( stderr, "   -schedd\t\t(query the schedd)\n" );
-	fprintf( stderr, "   -startd\t\t(query the startd)\n" );
-	fprintf( stderr, "   -collector\t\t(query the collector)\n" );
-	fprintf( stderr, "   -negotiator\t\t(query the negotiator)\n" );
-	fprintf( stderr, "   -tilde\t\t(return the path to the Condor home directory)\n" );
-	fprintf( stderr, "   -owner\t\t(return the owner of the condor_config_val process)\n" );
-	fprintf( stderr, "   -local-name name\t(Specify a local name for use with the config system)\n" );
-	fprintf( stderr, "   -verbose\t\t(print information about where variables are defined)\n" );
-	fprintf( stderr, "   -dump\t\t(print locally defined variables)\n" );
-	fprintf( stderr, "   -expand\t\t(with -dump, expand macros from config files)\n" );
-	fprintf( stderr, "   -evaluate\t\t(when querying <daemon>, evaluate param with respect to classad from <daemon>)\n" );
-	fprintf( stderr, "   -config\t\t(print the locations of found config files)\n" );
-	fprintf( stderr, "   -debug[:<flags>]\t\t(dprintf to stderr, optionally overiding the TOOL_DEBUG flags)\n" );
-#endif
 	my_exit(retval);
 }
 
@@ -223,7 +192,7 @@ typedef union _write_config_options {
 		unsigned int comment_env       :1;
 		unsigned int comment_5         :1;
 		unsigned int comment_6         :1;
-		unsigned int comment_7         :1;
+		unsigned int comment_version   :1;
 		unsigned int sort_name         :1;
 		unsigned int hide_obsolete     :1;
 		unsigned int hide_if_match     :1;
@@ -234,12 +203,28 @@ char* GetRemoteParam( Daemon*, char* );
 char* GetRemoteParamRaw(Daemon*, const char* name, bool & raw_supported, MyString & raw_value, MyString & file_and_line, MyString & def_value, MyString & usage_report);
 int GetRemoteParamStats(Daemon* target, ClassAd & ad);
 int   GetRemoteParamNamesMatching(Daemon*, const char* name, std::vector<std::string> & names);
-void  SetRemoteParam( Daemon*, char*, ModeType );
+void  SetRemoteParam( Daemon*, const char*, ModeType );
 static void PrintConfigSources(void);
 static void do_dump_config_stats(FILE * fh, bool dump_sources, bool dump_strings);
 static int do_write_config(const char* pathname, WRITE_CONFIG_OPTIONS opts);
 
-static const char * param_type_names[] = {"STRING","INT","BOOL","DOUBLE","LONG"};
+static const char * param_type_names[] = {"STRING","INT","BOOL","DOUBLE","LONG","PATH","ENUM"};
+
+static classad::References standard_subsystems;
+bool is_known_subsys_prefix(const char * name) {
+	const char * pdot = strchr(name, '.');
+	if ( ! pdot)
+		return false;
+
+	if (standard_subsystems.empty()) {
+		StringTokenIterator it("MASTER COLLECTOR NEGOTIATOR HAD REPLICATION SCHEDD SHADOW STARTD STARTER");
+		const std::string * sub;
+		while ((sub = it.next_string())) { standard_subsystems.insert(*sub); }
+	}
+	
+	std::string tmp(name, pdot - name);
+	return (standard_subsystems.find(tmp) != standard_subsystems.end());
+}
 
 void print_as_type(const char * name, int as_type)
 {
@@ -288,7 +273,7 @@ bool add_ref_callback(void* /*pv*/, HASHITER & it)
 		int ix = pmeta->param_id;
 
 		// save use/ref count for this item
-		macro_defaults::META tmp;
+		macro_defaults::META tmp = {0,0};
 		if (it.is_def) {
 			if (it.set.defaults && it.set.defaults->metat && ix < it.set.defaults->size) {
 				tmp = it.set.defaults->metat[ix];
@@ -368,7 +353,7 @@ bool dump_both_callback(void* pv, HASHITER & it)
 			fprintf(stdout, " # at: %s, line %d\n", filename, pmeta->source_line);
 		}
 		if (rawval && rawval[0]) {
-			char * val = expand_param(rawval, NULL, 0);
+			char * val = expand_param(rawval, NULL, NULL, 0);
 			if (val) {
 				fprintf(stdout, " # expanded: %s\n", val);
 				free(val);
@@ -396,6 +381,81 @@ bool dump_both_callback(void* pv, HASHITER & it)
 	return true;
 }
 
+int fetch_param_table_info(int param_id, const char * & descrip, const char * & tags, const char * & used_for)
+{
+	int type_and_flags = param_default_help_by_id(param_id, descrip, tags, used_for);
+	return type_and_flags;
+}
+
+const char * format_range(MyString & range, int param_id)
+{
+	const int* irng;
+	const double *drng;
+	const long long *lrng;
+
+	switch(param_default_range_by_id(param_id, irng, drng, lrng)) {
+		case PARAM_TYPE_INT:
+			formatstr(range, " from %d to %d", irng[0], irng[1]);
+			break;
+		case PARAM_TYPE_LONG:
+			formatstr(range, " from %lld to %lld", lrng[0], lrng[1]);
+			break;
+		case PARAM_TYPE_DOUBLE:
+			formatstr(range, " from %g to %g", drng[0], drng[1]);
+			break;
+		default:
+			// default is only here to make g++ shut up...
+			break;
+	}
+	return range.c_str();
+}
+
+void print_param_table_info(FILE* out, int param_id, int type_and_flags, const char * used_for, const char * tags)
+{
+	if (used_for) { fprintf(out, " # use for : %s\n", used_for); }
+	if (type_and_flags) {
+		const int PARAM_FLAGS_RESTART = 0x1000;
+		const int PARAM_FLAGS_NORECONFIG = 0x2000;
+		if (type_and_flags & PARAM_FLAGS_RESTART) {
+			fprintf(out, " # restart required : true\n");
+		} else if (type_and_flags & PARAM_FLAGS_NORECONFIG) {
+			fprintf(out, " # restart required : loaded when job starts.\n");
+		}
+
+		const int PARAM_FLAGS_CONST = 0x8000;
+		const int PARAM_FLAGS_PATH = 0x20;
+		int type = type_and_flags&7; if (type_and_flags & PARAM_FLAGS_PATH) type = 5;
+		if (type_and_flags & PARAM_FLAGS_CONST) {
+			fprintf(out, " # constant : %s\n", type ? param_type_names[type] : "true");
+		} else {
+			MyString range;
+			format_range(range, param_id);
+			if (type || ! range.empty()) { fprintf(out, " # expected values : %s%s\n", param_type_names[type], range.c_str()); }
+		}
+	}
+	if (tags) { fprintf(out, " # used by: %s\n", tags); }
+}
+
+
+//#define HAS_LAMBDA
+#ifdef HAS_LAMBDA
+#else
+bool report_obsolete_var(void* pv, HASHITER & it) {
+	MyString * pstr = (MyString*)pv;
+	const char * name = hash_iter_key(it);
+	if (is_known_subsys_prefix(name)) {
+		*pstr += "  ";
+		*pstr += name;
+		MACRO_META * pmet = hash_iter_meta(it);
+		if (pmet) {
+			*pstr += " at ";
+			param_append_location(pmet, *pstr);
+		}
+		*pstr += "\n";
+	}
+	return true; // keep iterating
+}
+#endif
 
 char* EvaluatedValue(char const* value, ClassAd const* ad) {
     classad::Value res;
@@ -446,9 +506,9 @@ main( int argc, const char* argv[] )
 {
 	char	*value = NULL, *tmp = NULL;
 	const char * pcolon;
-	const char *host = NULL;
+	const char *name_arg = NULL; // raw argument from -name (before get_daemon_name lookup)
 	const char *addr = NULL;
-	const char *name = NULL;
+	const char *name = NULL;     // cooked -name argument after get_daemon_name lookup
 	const char *pool = NULL;
 	const char *local_name = NULL;
 	const char *subsys = "TOOL";
@@ -460,23 +520,45 @@ main( int argc, const char* argv[] )
 	bool    dash_dump_both = false;
 	bool    dump_all_variables = false;
 	bool    dump_stats = false;
+	bool    show_param_info = false; // show info from param table
 	bool    expand_dumped_variables = false;
+	bool    macro_expand_this = false; // set when -macro arg is used.
+	bool    macro_expand_this_as_path = false; // set when -macro:path is used
 	bool    show_by_usage = false;
 	bool    show_by_usage_unused = false;
 	bool    evaluate_daemon_vars = false;
 	bool    print_config_sources = false;
+	const char * root_config = NULL;
 	const char * write_config = NULL;
 	WRITE_CONFIG_OPTIONS write_config_flags = {0};
+	bool    dash_summary = false;
 	bool    dash_debug = false;
 	bool    dash_raw = false;
 	bool    dash_default = false;
 	bool    stats_with_defaults = false;
 	const char * debug_flags = NULL;
 	const char * check_configif = NULL;
+	int profile_test_id=0, profile_iter=0;
+	bool    check_config_for_obsolete_syntax = true;
 
 #ifdef WIN32
-	// uncomment this if you need to debug crashes.
-	//g_ExceptionHandler.TurnOff();
+	// enable this if you need to debug crashes.
+	#if 1
+	const bool wait_for_win32_debugger = false;
+	#else
+	g_ExceptionHandler.TurnOff();
+	bool wait_for_win32_debugger = argv[1] && MATCH == strcasecmp(argv[1],"CCV_WAIT_FOR_DEBUGGER");
+	if (wait_for_win32_debugger) {
+		UINT ms = GetTickCount() - 10;
+		BOOL is_debugger = IsDebuggerPresent();
+		while ( ! is_debugger) {
+			fprintf(stderr, "waiting for debugger. PID = %d\n", GetCurrentProcessId());
+			sleep(3);
+			is_debugger = IsDebuggerPresent();
+		}
+	}
+	#endif
+
 #endif
 
 	PrintType pt = CONDOR_NONE;
@@ -486,37 +568,32 @@ main( int argc, const char* argv[] )
 	myDistro->Init( argc, argv );
 
 	for (int i = 1; i < argc; ++i) {
-#if 1
 		// arguments that don't begin with "-" are params to be looked up.
 		if (*argv[i] != '-') {
 			// allow "use category:value" syntax to query meta-params
 			if (MATCH == strcasecmp(argv[i], "use")) {
 				if (argv[i+1] && *argv[i+1] != '-') {
 					++i; // skip "use"
-					// save off the parameter name, prefixed with $ so that the code below we know it's a metaknob name.
-					std::string meta("$"); meta += argv[i];
-					params.append(strdup(meta.c_str()));
+					// save off the parameter name, prefixed with ^ so that the code below we know it's a metaknob name.
+					std::string meta("^"); meta += argv[i];
+					params.append(meta.c_str());
 				} else {
 					fprintf(stderr, "use should be followed by a category or category:option argument\n");
-					params.append(strdup("$"));
+					params.append("^");
 				}
+			#ifdef WIN32
+			} else if (i == 1 && wait_for_win32_debugger) {
+			#endif
 			} else {
-				params.append(strdup(argv[i]));
+				params.append(argv[i]);
 			}
 			continue;
 		}
 
 		// if we get here, the arg begins with "-",
 		const char * arg = argv[i]+1;
-		if (is_arg_prefix(arg, "host", 1)) { // as of 8/27/2013 -host is a secret option used by condor_init
-			host = use_next_arg("host", argv, i);
-		} else if (is_arg_prefix(arg, "name", 1)) {
-			const char * tmp = use_next_arg("name", argv, i);
-			name = get_daemon_name(tmp);
-			if ( ! name) {
-				fprintf(stderr, "%s: unknown host %s\n", MyName, get_host_part(tmp));
-				my_exit(1);
-			}
+		if (is_arg_prefix(arg, "name", 1)) {
+			name_arg = use_next_arg("name", argv, i);
 		} else if (is_arg_prefix(arg, "address", 1)) {
 			addr = use_next_arg("address", argv, i);
 			if ( ! is_valid_sinful(addr)) {
@@ -611,8 +688,16 @@ main( int argc, const char* argv[] )
 			if (pcolon && is_arg_prefix(pcolon+1, "keep_defaults", 2)) {
 				stats_with_defaults = true;
 			}
+		} else if (is_arg_colon_prefix(arg, "info", &pcolon, 3)) {
+			show_param_info = true;
+			verbose = true;
 		} else if (is_arg_prefix(arg, "expanded", 2)) {
 			expand_dumped_variables = true;
+		} else if (is_arg_colon_prefix(arg, "macro", &pcolon, 3)) {
+			macro_expand_this = true;
+			if (pcolon && is_arg_prefix(pcolon+1, "path", 4)) {
+				macro_expand_this_as_path = true;
+			}
 		} else if (is_arg_prefix(arg, "evaluate", 2)) {
 			evaluate_daemon_vars = true;
 		} else if (is_arg_prefix(arg, "unused", 4)) {
@@ -622,7 +707,22 @@ main( int argc, const char* argv[] )
 			show_by_usage = true;
 			show_by_usage_unused = false;
 			//dash_usage = true;
+		} else if (is_arg_prefix(arg, "summary", 3)){
+			if (write_config && ! dash_summary) {
+				fprintf(stderr, "%s cannot be used with -writeconfig\n", argv[i]);
+				usage();
+			}
+			write_config_flags.all = 0;
+			write_config_flags.hide_obsolete = 1;
+			write_config_flags.hide_if_match = 1;
+			write_config_flags.comment_version = 1;
+			dash_summary = true;
+			write_config = "-";
 		} else if (is_arg_colon_prefix(arg, "writeconfig", &pcolon, 3)) {
+			if (dash_summary) {
+				fprintf(stderr, "%s cannot be used with -summary\n", argv[i]);
+				usage();
+			}
 			write_config = use_next_arg("writeconfig", argv, i);
 			write_config_flags.all = 0;
 			if (pcolon) {
@@ -664,6 +764,8 @@ main( int argc, const char* argv[] )
 				write_config_flags.comment_def_match = true;
 				write_config_flags.sort_name = false;
 			}
+		} else if (is_dash_arg_prefix(argv[i], "root-config", 4)) {
+			root_config = use_next_arg("root-config", argv, i);
 		} else if (is_arg_colon_prefix(arg, "debug", &pcolon, 2)) {
 				// dprintf to console
 			dash_debug = true;
@@ -678,111 +780,17 @@ main( int argc, const char* argv[] )
 			my_exit(0);
 		} else if (is_dash_arg_prefix(argv[i], "check-if", -1)) {
 			check_configif = use_next_arg("check-if", argv, i);
+		} else if (is_dash_arg_colon_prefix(argv[i], "profile", &pcolon, -1)) {
+			check_configif = "profile"; //use_next_arg("profile", argv, i);
+			if (pcolon) {
+				StringList opts(pcolon+1,":,");
+				tmp = opts.first(); if (tmp) profile_test_id = atoi(tmp);
+				tmp = opts.next(); if (tmp) profile_iter = atoi(tmp);
+			}
 		} else {
-			fprintf(stderr, "%s is not valid argument\n", argv[i]);
+			fprintf(stderr, "%s is not a valid argument\n", argv[i]);
 			usage();
 		}
-#else
-		if( match_prefix( argv[i], "-host" ) ) {
-			if( argv[i + 1] ) {
-				host = strdup( argv[++i] );
-			} else {
-				usage();
-			}
-		} else if( match_prefix( argv[i], "-name" ) ) {
-			if( argv[i + 1] ) {
-				i++;
-				name = get_daemon_name( argv[i] );
-				if( ! name ) {
-					fprintf( stderr, "%s: unknown host %s\n", MyName, 
-							 get_host_part(argv[i]) );
-					my_exit( 1 );
-				}
-			} else {
-				usage();
-			}
-		} else if( match_prefix( argv[i], "-address" ) ) {
-			if( argv[i + 1] ) {
-				i++;
-				if( is_valid_sinful(argv[i]) ) {
-					addr = strdup( argv[i] );
-				} else {
-					fprintf( stderr, "%s: invalid address %s\n"
-						 "Address must be of the form \"<111.222.333.444:555>\n"
-						 "   where 111.222.333.444 is the ip address and 555 is the port\n"
-						 "   you wish to connect to (the punctuation is important).\n", 
-						 MyName, argv[i] );
-					my_exit( 1 );
-				}
-			} else {
-				usage();
-			}
-		} else if( match_prefix( argv[i], "-pool" ) ) {
-			if( argv[i + 1] ) {
-				i++;
-				pool = argv[i];
-			} else {
-				usage();
-			}
-		} else if( match_prefix( argv[i], "-local-name" ) ) {
-			if( argv[i + 1] ) {
-				i++;
-				local_name = argv[i];
-			} else {
-				usage();
-			}
-		} else if( match_prefix( argv[i], "-owner" ) ) {
-			pt = CONDOR_OWNER;
-		} else if( match_prefix( argv[i], "-tilde" ) ) {
-			pt = CONDOR_TILDE;
-		} else if( match_prefix( argv[i], "-master" ) ) {
-			dt = DT_MASTER;
-			ask_a_daemon = true;
-		} else if( match_prefix( argv[i], "-schedd" ) ) {
-			dt = DT_SCHEDD;
-		} else if( match_prefix( argv[i], "-startd" ) ) {
-			dt = DT_STARTD;
-		} else if( match_prefix( argv[i], "-collector" ) ) {
-			dt = DT_COLLECTOR;
-		} else if( match_prefix( argv[i], "-negotiator" ) ) {
-			dt = DT_NEGOTIATOR;
-		} else if( match_prefix( argv[i], "-set" ) ) {
-			mt = CONDOR_SET;
-		} else if( match_prefix( argv[i], "-unset" ) ) {
-			mt = CONDOR_UNSET;
-		} else if( match_prefix( argv[i], "-rset" ) ) {
-			mt = CONDOR_RUNTIME_SET;
-		} else if( match_prefix( argv[i], "-runset" ) ) {
-			mt = CONDOR_RUNTIME_UNSET;
-		} else if( match_prefix( argv[i], "-mixedcase" ) ) {
-			mixedcase = true;
-		} else if( match_prefix( argv[i], "-config" ) ) {
-			print_config_sources = true;
-		} else if( match_prefix( argv[i], "-verbose" ) ) {
-			verbose = true;
-		} else if( match_prefix( argv[i], "-dump" ) ) {
-			dump_all_variables = true;
-		} else if( match_prefix( argv[i], "-expand" ) ) {
-			expand_dumped_variables = true;
-		} else if( match_prefix( argv[i], "-evaluate" ) ) {
-			evaluate_daemon_vars = true;
-		} else if( match_prefix( argv[i], "-writeconfig" ) ) {
-			write_config = true;
-		} else if( match_prefix( argv[i], "-debug" ) ) {
-				// dprintf to console
-			debug = true;
-		} else if( match_prefix( argv[i], "-" ) ) {
-			usage();
-		} else {
-			MyString str;
-			str = argv[i];
-			// remove any case sensitivity, this is done mostly so output
-			// later can look nice. The param() subsystem inherently assumes
-			// case insensitivity, so this is perfectly fine to do here.
-			str.upper_case();
-			params.append( strdup( str.Value() ) ) ;
-		}
-#endif
 	}
 
 	// Set subsystem to tool, and subsystem name to either "TOOL" or what was 
@@ -824,8 +832,10 @@ main( int argc, const char* argv[] )
 	if (write_config || stats_with_defaults) {
 		config_options |= CONFIG_OPT_KEEP_DEFAULTS;
 	}
-	config_host(host, config_options);
-	validate_config(false); // validate, but do not abort.
+	if (root_config) { config_options |= CONFIG_OPT_USE_THIS_ROOT_CONFIG | CONFIG_OPT_NO_EXIT; }
+	set_priv_initialize(); // allow uid switching if root
+	config_host(NULL, config_options, root_config);
+	validate_config(false, 0); // validate, but do not abort.
 	if (print_config_sources) {
 		PrintConfigSources();
 	}
@@ -837,7 +847,7 @@ main( int argc, const char* argv[] )
 
 		extern const char * simulated_local_config;
 		simulated_local_config = reconfig_source;
-		config_host(host, config_options);
+		config_host(NULL, config_options, root_config);
 		if (print_config_sources) {
 			fprintf(stdout, "Reconfig with %s appended\n", reconfig_source);
 			PrintConfigSources();
@@ -855,15 +865,67 @@ main( int argc, const char* argv[] )
 
 	// handle check-if to valididate config's if/else parsing and help users to write
 	// valid if conditions.
-	if (check_configif) { 
+	if (check_configif) {
+		if (MATCH == strcmp(check_configif, "profile")) {
+			extern void profile_test(bool verbose, int test, int iter);
+			profile_test(verbose, profile_test_id, profile_iter);
+			exit(0);
+		}
 		std::string err_reason;
 		bool bb = false;
-		bool valid = config_test_if_expression(check_configif, bb, err_reason);
+		bool valid = config_test_if_expression(check_configif, bb, local_name, subsys, err_reason);
 		fprintf(stdout, "# %s: \"%s\" %s\n", 
 			valid ? "ok" : "not supported", 
 			check_configif, 
 			valid ? (bb ? "\ntrue" : "\nfalse") : err_reason.c_str());
 		exit(0);
+	}
+
+	// Check for obsolete syntax in config file
+	check_config_for_obsolete_syntax = param_boolean("ENABLE_DEPRECATION_WARNINGS", check_config_for_obsolete_syntax);
+	if (check_config_for_obsolete_syntax) {
+		Regex re; int err = 0; const char * pszMsg = 0;
+		// check for knobs of the form SUBSYS.LOCALNAME.*
+		ASSERT(re.compile("^[A-Za-z_]*\\.[A-Za-z_0-9]*\\.", &pszMsg, &err, PCRE_CASELESS));
+		MyString obsolete_vars;
+		foreach_param_matching(re, HASHITER_NO_DEFAULTS,
+#ifdef HAS_LAMBDA
+			[](void* pv, HASHITER & it) -> bool {
+				MyString * pstr = (MyString*)pv;
+				const char * name = hash_iter_key(it);
+				if (is_known_subsys_prefix(name)) {
+					*pstr += "  ";
+					*pstr += name;
+					MACRO_META * pmet = hash_iter_meta(it);
+					if (pmet) {
+						*pstr += " at ";
+						param_append_location(pmet, *pstr);
+					}
+					*pstr += "\n";
+				}
+				return true; // keep iterating
+			},
+#else
+			report_obsolete_var,
+#endif
+			&obsolete_vars // becomes pv
+		);
+		if ( ! obsolete_vars.empty()) {
+			fprintf(stderr, "WARNING: the following appear to be obsolete SUBSYS.LOCALNAME.* overrides\n%s", obsolete_vars.c_str());
+			fprintf(stderr, 
+				"\n    Use of both SUBSYS. and LOCALNAME. prefixes at the same time is not needed and not supported.\n"
+				  "    To override config for a class of daemons, or for a standard daemon use a SUBSYS. prefix.\n"
+				  "    To override config for a specific member of a class of daemons, just use a LOCALNAME. prefix like this:\n"
+				);
+			StringTokenIterator it(obsolete_vars.c_str(), 40, "\n");
+			for (const char * line = it.first(); line; line = it.next()) {
+				const char * p1 = strchr(line, '.');
+				if ( ! p1) continue;
+				const char * p2 = p1; while (p2[1] && !isspace(p2[1])) ++p2;
+				std::string name(p1+1, p2-p1);
+				fprintf(stderr, "  %s\n", name.c_str());
+			}
+		}
 	}
 
 	if (write_config) {
@@ -877,6 +939,15 @@ main( int argc, const char* argv[] )
 		}
 	}
 	
+	// now that we have loaded config, we can safely get do daemon name lookup
+	if (name_arg) {
+		name = get_daemon_name(name_arg);
+		if ( ! name || ! name[0]) {
+			fprintf(stderr, "%s: unknown host %s\n", MyName, get_host_part(name_arg));
+			my_exit(1);
+		}
+	}
+
 	if( pool && ! name ) {
 		fprintf( stderr, "Error: you must specify -name with -pool\n" );
 		my_exit( 1 );
@@ -912,7 +983,7 @@ main( int argc, const char* argv[] )
 				foreach_param(opts, dump_both_callback, (void*)&last);
 				fprintf(stdout, "%d items\n", dump_both_count);
 			} else {
-				params.append(strdup(""));
+				params.append("");
 				params.rewind();
 			}
 		}
@@ -957,6 +1028,15 @@ main( int argc, const char* argv[] )
 								fprintf(stdout, "%s = %s\n", upname.Value(), rawval ? rawval : "");
 							}
 							if (verbose) {
+								MyString range;
+								const char * tags = NULL;
+								const char * descrip = NULL;
+								const char * used_for = NULL;
+								int type_and_flags = 0;
+								if (pmet && show_param_info) {
+									type_and_flags = param_default_help_by_id(pmet->param_id, descrip, tags, used_for);
+								}
+								if (descrip) { fprintf(stdout, " # description: %s\n", descrip); }
 								param_get_location(pmet, location);
 								fprintf(stdout, " # at: %s\n", location.c_str());
 								if (expand_dumped_variables) {
@@ -966,6 +1046,9 @@ main( int argc, const char* argv[] )
 									fprintf(stdout, " # expanded: %s\n", val ? val : "");
 								}
 								if (def_val) { fprintf(stdout, " # default: %s\n", def_val); }
+								if (show_param_info) {
+									print_param_table_info(stdout, pmet->param_id, type_and_flags, used_for, tags);
+								}
 								if (dash_usage && pmet) {
 									if (pmet->ref_count) fprintf(stdout, " # use_count: %d / %d\n", pmet->use_count, pmet->ref_count);
 									else fprintf(stdout, " # use_count: %d\n", pmet->use_count);
@@ -1010,7 +1093,7 @@ main( int argc, const char* argv[] )
 	params.rewind();
 	if( ! params.number() && !print_config_sources) {
 		if (dump_all_variables || dump_stats) {
-			params.append(strdup(""));
+			params.append("");
 			params.rewind();
 			//if (diagnostic) fprintf(stderr, "querying all\n");
 		} else if (write_config) {
@@ -1020,10 +1103,10 @@ main( int argc, const char* argv[] )
 		}
 	}
 
-	Daemon* target = NULL;
+	DaemonAllowLocateFull* target = NULL;
 	if( ask_a_daemon ) {
 		if( addr ) {
-			target = new Daemon( dt, addr, NULL );
+			target = new DaemonAllowLocateFull( dt, addr, NULL );
 		} else {
 			char* collector_addr = NULL;
 			if( pool ) {
@@ -1034,7 +1117,7 @@ main( int argc, const char* argv[] )
 				ReliSock sock;
 				while (collectors->next (collector)) {
 					if (collector->locate() &&
-					    sock.connect((char*) collector->addr(), 0)) {
+					    sock.connect(collector->addr(), 0)) {
 						// Do something with the connection, 
 						// such that we won't end up with 
 						// noise in the collector log
@@ -1056,10 +1139,10 @@ main( int argc, const char* argv[] )
 				collector_addr = strdup(collector->addr());
 				delete collectors;
 			}
-			target = new Daemon( dt, name, collector_addr );
+			target = new DaemonAllowLocateFull( dt, name, collector_addr );
 			free( collector_addr );
 		}
-		if( ! target->locate() ) {
+		if( ! target->locate(evaluate_daemon_vars ? Daemon::LOCATE_FULL : Daemon::LOCATE_FOR_LOOKUP) ) {
 			fprintf( stderr, "Can't find address for this %s\n", 
 					 daemonString(dt) );
 			fprintf( stderr, "Perhaps you need to query another pool.\n" );
@@ -1077,20 +1160,34 @@ main( int argc, const char* argv[] )
 		fprintf(stdout, "# Configuration from %s on %s %s\n", daemonString(dt), target->name(), target->addr());
 	}
 
+	// handle SET/RSET etc
+	if (mt != CONDOR_QUERY) {
+		for (const char * name = params.first(); name; name = params.next()) {
+			SetRemoteParam(target, name, mt);
+		}
+		my_exit(0);
+	}
+
+	// handle query
+	// 
+	int num_not_defined = 0;
 	while( (tmp = params.next()) ) {
-		if( mt == CONDOR_SET || mt == CONDOR_RUNTIME_SET ||
-			mt == CONDOR_UNSET || mt == CONDOR_RUNTIME_UNSET ) {
-			SetRemoteParam( target, tmp, mt );
-		} else {
+		// empty parens so that we don't have to change the brace level of ALL of the code below.
+		{
 			MyString name_used, raw_value, file_and_line, def_value, usage_report;
+			const char * tags = NULL;
+			const char * descrip = NULL;
+			const char * used_for = NULL;
+			int type_and_flags = 0;
+			int param_id = -1;
 			bool raw_supported = false;
 			//fprintf(stderr, "param = %s\n", tmp);
-			if (tmp[0] == '$') { // a leading '$' indicates a meta-param
+			if (tmp[0] == '^') { // a leading '^'
 				if (target) {
 					fprintf(stderr, "remote query not supported for use %s\n", tmp+1);
 					my_exit(1);
 				}
-				PrintMetaParam(tmp+1);
+				PrintMetaParam(tmp+1, expand_dumped_variables, verbose);
 				continue;
 			}
 			if (target) {
@@ -1140,6 +1237,11 @@ main( int argc, const char* argv[] )
 								printf(" # remote HTCondor version does not support -verbose\n");
 							}
 							if (verbose) {
+								param_id = param_default_get_id(names[ii].c_str(), NULL);
+								if (show_param_info) {
+									param_default_help_by_id(param_id, descrip, tags, used_for);
+								}
+								if (descrip) { fprintf(stdout, " # description: %s\n", descrip); }
 								if ( ! file_and_line.IsEmpty()) {
 									printf(" # at: %s\n", file_and_line.Value());
 								}
@@ -1150,6 +1252,9 @@ main( int argc, const char* argv[] )
 								}
 								if ( ! def_value.IsEmpty()) {
 									printf(" # default: %s\n", def_value.Value());
+								}
+								if (show_param_info) {
+									print_param_table_info(stdout, param_id, type_and_flags, used_for, tags);
 								}
 								if (dash_usage && ! usage_report.IsEmpty()) {
 									printf(" # use_count: %s\n", usage_report.Value());
@@ -1184,6 +1289,10 @@ main( int argc, const char* argv[] )
 						free(value);
 						value = strdup(RemoteRawValuePart(raw_value));
 					}
+					if (verbose && show_param_info) {
+						param_id = param_default_get_id(tmp, NULL);
+						param_default_help_by_id(param_id, descrip, tags, used_for);
+					}
 				} else {
 					name_used = tmp;
 					name_used.upper_case();
@@ -1198,6 +1307,19 @@ main( int argc, const char* argv[] )
                         fprintf(stderr, "Warning: Failed to evaluate '%s', returning it as config value\n", value);
                     }
                 }
+			} else if (macro_expand_this) {
+				std::string result(tmp);
+				unsigned int options = (macro_expand_this_as_path ? EXPAND_MACRO_OPT_IS_PATH : 0) | EXPAND_MACRO_OPT_KEEP_DOLLARDOLLAR;
+				MACRO_SET * mset = param_get_macro_set();
+				MACRO_EVAL_CONTEXT ctx; ctx.init(subsys); ctx.localname = local_name;
+				unsigned int exist = expand_macro(result, options, *mset, ctx);
+				if (verbose) {
+					printf("%s expands to: %s\n", tmp, result.c_str());
+					printf(" # exist: 0x%0X\n", exist);
+				} else {
+					printf("%s\n", result.c_str());
+				}
+				continue;
 			} else {
 				const char * def_val;
 				const MACRO_META * pmet = NULL;
@@ -1205,8 +1327,12 @@ main( int argc, const char* argv[] )
 										name_used, &def_val, &pmet);
 										//use_count, ref_count,
 										//file_and_line, line_number);
+				if (pmet && show_param_info) {
+					param_id = pmet->param_id;
+					type_and_flags = param_default_help_by_id(pmet->param_id, descrip, tags, used_for);
+				}
+				raw_supported = true;  // local lookups always support raw
 				if ( ! name_used.empty()) {
-					raw_supported = true;
 					if (dash_raw) {
 						value = strdup(val ? val : "");
 					} else {
@@ -1216,11 +1342,13 @@ main( int argc, const char* argv[] )
 						raw_value += " = ";
 						raw_value += val;
 					}
-					param_get_location(pmet, file_and_line);
-					if (pmet->ref_count) {
-						usage_report.formatstr("%d / %d", pmet->use_count, pmet->ref_count);
-					} else {
-						usage_report.formatstr("%d", pmet->use_count);
+					if (pmet) {
+						param_get_location(pmet, file_and_line);
+						if (pmet->ref_count) {
+							usage_report.formatstr("%d / %d", pmet->use_count, pmet->ref_count);
+						} else {
+							usage_report.formatstr("%d", pmet->use_count);
+						}
 					}
 				} else {
 					name_used = tmp;
@@ -1230,7 +1358,7 @@ main( int argc, const char* argv[] )
 			}
 			if( value == NULL ) {
 				fprintf(stderr, "Not defined: %s\n", name_used.c_str());
-				my_exit( 1 );
+				++num_not_defined;
 			} else {
 				if (verbose) {
 					printf("%s = %s\n", name_used.c_str(), value);
@@ -1238,41 +1366,40 @@ main( int argc, const char* argv[] )
 					printf("%s\n", value);
 				}
 				free( value );
-				if ( ! raw_supported && (dash_raw || verbose)) {
-					printf(" # the remote HTCondor version does not support -raw or -verbose");
+			}
+			if ( ! raw_supported && (dash_raw || verbose)) {
+				printf(" # the remote HTCondor version does not support -raw or -verbose");
+			}
+			if (verbose) {
+				if (descrip) { fprintf(stdout, " # description: %s\n", descrip); }
+				if ( ! file_and_line.IsEmpty()) {
+					printf(" # at: %s\n", file_and_line.Value());
 				}
-				if (verbose) {
-#if 1
-					if ( ! file_and_line.IsEmpty()) {
-						printf(" # at: %s\n", file_and_line.Value());
-					}
-					if ( ! raw_value.IsEmpty()) {
-						printf(" # raw: %s\n", raw_value.Value());
-					}
-					if ( ! def_value.IsEmpty()) {
-						printf(" # default: %s\n", def_value.Value());
-					}
-					if (dump_both_only_type > 0) {
-						print_as_type(tmp, dump_both_only_type);
-					}
-					if (dash_usage && ! usage_report.IsEmpty()) {
-						printf(" # use_count: %s\n", usage_report.Value());
-					}
-					printf("\n");
-#else  // this is the old format, do we need to match this exactly?
-					if (line_number == -1) {
-						printf("  Defined in '%s'.\n\n", filename.Value());
-					} else {
-						printf("  Defined in '%s', line %d.\n\n",
-							   filename.Value(), line_number);
-					}
-#endif
+				if ( ! raw_value.IsEmpty()) {
+					printf(" # raw: %s\n", raw_value.Value());
 				}
+				if ( ! def_value.IsEmpty()) {
+					printf(" # default: %s\n", def_value.Value());
+				}
+				if (dump_both_only_type > 0) {
+					print_as_type(tmp, dump_both_only_type);
+				}
+				if (show_param_info) {
+					print_param_table_info(stdout, param_id, type_and_flags, used_for, tags);
+				}
+				if (dash_usage && ! usage_report.IsEmpty()) {
+					printf(" # use_count: %s\n", usage_report.Value());
+				}
+				printf("\n");
 			}
 		}
 	}
-	my_exit( 0 );
-	return 0;
+	int exitval = 0;
+	if (num_not_defined > 0 && ! show_param_info) {
+		exitval = 1;
+	}
+	my_exit(exitval);
+	return exitval;
 }
 
 
@@ -1290,7 +1417,7 @@ GetRemoteParam( Daemon* target, char* param_name )
 		// tools for fear that someone's ASCII parser will break, i'm
 		// just cheating and being lazy here by replicating the old
 		// behavior...
-	char* addr;
+	const char* addr;
 	const char* name;
 	bool connect_error = true;
 	do {
@@ -1325,7 +1452,7 @@ GetRemoteParam( Daemon* target, char* param_name )
 	}
 
 	s.decode();
-	if( !s.code(val) ) {
+	if( !s.code_nullstr(val) ) {
 		fprintf( stderr, "Can't receive reply from %s on %s %s\n",
 				 daemonString(dt), name, addr );
 		return NULL;
@@ -1359,7 +1486,7 @@ GetRemoteParamRaw(
 	def_value = "";
 	usage_report = "";
 
-	char* addr = NULL;
+	const char* addr = NULL;
 	const char* name = NULL;
 	bool connect_error = true;
 	do {
@@ -1380,7 +1507,7 @@ GetRemoteParamRaw(
 	s.encode();
 
 	if (diagnostic) fprintf(stderr, "sending %s\n", param_name);
-	if ( ! s.code(const_cast<char*&>(param_name))) {
+	if ( ! s.put(param_name)) {
 		fprintf(stderr, "Can't send request (%s)\n", param_name);
 		return NULL;
 	}
@@ -1390,7 +1517,7 @@ GetRemoteParamRaw(
 	}
 
 	s.decode();
-	if ( ! s.code(val)) {
+	if ( ! s.code_nullstr(val)) {
 		fprintf(stderr, "Can't receive reply from %s on %s %s\n", daemonString(dt), name ? name : "", addr );
 		return NULL;
 	}
@@ -1435,7 +1562,7 @@ int GetRemoteParamStats(Daemon* target, ClassAd & ad)
 	ReliSock s;
 	s.timeout(30);
 
-	char* addr = NULL;
+	const char* addr = NULL;
 	const char* name = NULL;
 	bool connect_error = true;
 	do {
@@ -1505,6 +1632,8 @@ int GetRemoteParamStats(Daemon* target, ClassAd & ad)
 			fprintf(stderr, "Can't read stats ad from %s\n", name);
 		}
 	}
+	// CRUFT: Remove this Remove() once no recent versions of Condor
+	//   automatically add CurrentTime to all ads.
 	ad.Remove("CurrentTime");
 	return 0;
 }
@@ -1516,7 +1645,7 @@ GetRemoteParamNamesMatching(Daemon* target, const char * param_pat, std::vector<
 	ReliSock s;
 	s.timeout(30);
 
-	char* addr = NULL;
+	const char* addr = NULL;
 	const char* name = NULL;
 	bool connect_error = true;
 	do {
@@ -1610,11 +1739,11 @@ GetRemoteParamNamesMatching(Daemon* target, const char * param_pat, std::vector<
 	if (names.size() > 1) {
 		std::sort(names.begin(), names.end(), sort_ascending_ignore_case);
 	}
-	return names.size();
+	return (int)names.size();
 }
 
 void
-SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
+SetRemoteParam( Daemon* target, const char* param_value, ModeType mt )
 {
 	int cmd = DC_NOP, rval;
 	ReliSock s;
@@ -1627,7 +1756,7 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 		// tools for fear that someone's ASCII parser will break, i'm
 		// just cheating and being lazy here by replicating the old
 		// behavior...
-	char* addr;
+	const char* addr;
 	const char* name;
 	bool connect_error = true;
 
@@ -1639,11 +1768,15 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 	switch (mt) {
 	case CONDOR_SET:
 		set = true;
+		// Fall through...
+		//@fallthrough@
 	case CONDOR_UNSET:
 		cmd = DC_CONFIG_PERSIST;
 		break;
 	case CONDOR_RUNTIME_SET:
 		set = true;
+		// Fall through...
+		//@fallthrough@
 	case CONDOR_RUNTIME_UNSET:
 		cmd = DC_CONFIG_RUNTIME;
 		break;
@@ -1659,10 +1792,10 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 	if (set || is_meta) {
 		config_name = is_valid_config_assignment(param_value);
 		if ( ! config_name) {
-			char * tmp = strchr(param_value, is_meta ? ':' : '=' );
+			const char * tmp = strchr(param_value, is_meta ? ':' : '=' );
 			#ifdef WARN_COLON_FOR_PARAM_ASSIGN
 			#else
-			char * tmp2 = strchr( param_name, ':' );
+			const char * tmp2 = strchr( param_name, ':' );
 			if ( ! tmp || (tmp2 && tmp2 < tmp)) tmp = tmp2;
 			#endif
 			std::string name;  name.append(param_value, 0, (int)(tmp - param_value));
@@ -1679,19 +1812,15 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 		}
 	} else {
 			// Want to do different sanity checking.
-		char * tmp;
-		if( (tmp = strchr(param_value, ':')) || 
-			(tmp = strchr(param_value, '=')) ) {
+		if (strchr(param_value, ':') || strchr(param_value, '=')) {
 			fprintf( stderr, "%s: Can't unset configuration value (\"%s\")\n"
 					 "To unset, you only specify the name of the attribute\n",
 					 MyName, param_value);
 			my_exit( 1 );
 		}
 		config_name = strdup(param_value);
-		tmp = strchr(config_name, ' ');
-		if( tmp ) {
-			*tmp = '\0';
-		}
+		char * tmp = strchr(config_name, ' ');
+		if (tmp) { *tmp = 0; }
 	}
 
 		// At this point, in either set or unset mode, param_name
@@ -1700,7 +1829,7 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 	if( !is_valid_param_name(config_name + is_meta) ) {
 		fprintf( stderr, 
 				 "%s: Error: Configuration variable name (%s) is not valid, alphanumeric and _ only\n",
-				 MyName, config_name + is_meta );
+				 MyName, ((config_name+is_meta)?(config_name+is_meta):"(null)") );
 		my_exit( 1 );
 	}
 
@@ -1737,7 +1866,7 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 		my_exit(1);
 	}
 	if( set ) {
-		if( !s.code(param_value) ) {
+		if( !s.put(param_value) ) {
 			fprintf( stderr, "Can't send config setting (%s)\n", param_value );
 			my_exit(1);
 		}
@@ -1776,11 +1905,11 @@ SetRemoteParam( Daemon* target, char* param_value, ModeType mt )
 	}
 	if (set) {
 		fprintf( stdout, "Successfully set configuration \"%s\" on %s %s "
-				 "%s.\n",
+				 "%s. The change will take effect on the next condor_reconfig.\n",
 				 param_value, daemonString(dt), name, addr );
 	} else {
 		fprintf( stdout, "Successfully unset configuration \"%s\" on %s %s "
-				 "%s.\n",
+				 "%s. The change will take effect on the next condor_reconfig.\n",
 				 param_value, daemonString(dt), name, addr );
 	}
 
@@ -1980,7 +2109,54 @@ bool write_config_callback(void* user, HASHITER & it) {
 	return true;
 }
 
-void PrintMetaParam(const char * name)
+void PrintMetaKnob(const char * metaval, bool expand, bool verbose);
+void PrintExpandedMetaParams(const char * category, const char * rhs, bool verbose)
+{
+	if (verbose) printf(" #begin-expanding# use %s : %s\n", category, rhs);
+	MACRO_TABLE_PAIR* ptable = param_meta_table(category);
+	if ( ! ptable) {
+		printf ("error: %s is not a valid use category\n", category);
+		return;
+	}
+	MetaKnobAndArgs mag;
+	auto_free_ptr metaval;
+	const char * remain = rhs;
+	while (remain) {
+		const char * ep = mag.init_from_string(remain);
+		if ( ! ep || ep == remain) break;
+		remain = ep;
+
+		const char * pmeta = param_meta_table_string(ptable, mag.knob.c_str());
+		if (pmeta) {
+			metaval.set(expand_meta_args(pmeta, mag.args));
+			PrintMetaKnob(metaval.ptr(), true, verbose);
+		}
+	}
+	if (verbose) printf(" #end-expanding# use %s : %s\n", category, rhs);
+}
+
+// print the lines of a metaknob, optionally expanding the use statements within it.
+void PrintMetaKnob(const char * metaval, bool expand, bool verbose)
+{
+	if ( ! metaval) return;
+	bool print_use = verbose || ! expand;
+	StringTokenIterator lines(metaval, 120, "\n");
+	for (const char * line = lines.first(); line; line = lines.next()) {
+		StringTokenIterator toks(line, 40, " :");
+		bool is_use = YourString("use") == toks.first();
+		if ( ! is_use || print_use) {
+			printf("%s\n", line);
+		}
+		if (is_use && expand) {
+			MyString cat(toks.next()), remain;
+			int len, ix = toks.next_token(len);
+			if (ix > 0) { remain = line + ix; }
+			PrintExpandedMetaParams(cat.Value(), remain.Value(), verbose);
+		}
+	}
+}
+
+void PrintMetaParam(const char * name, bool expand, bool verbose)
 {
 	std::string temp(name);
 	char * tmp = &temp[0];
@@ -2004,6 +2180,8 @@ void PrintMetaParam(const char * name)
 		fprintf(stderr, "%s is not valid, assuming %s was intended\n", name, tmp);
 		*parm++ = 0;
 	}
+	// separate the metaknob name from the args (if any)
+	MetaKnobAndArgs mag(parm);
 
 	MACRO_TABLE_PAIR* ptable = param_meta_table(use);
 	MACRO_DEF_ITEM * pdef = NULL;
@@ -2019,11 +2197,19 @@ void PrintMetaParam(const char * name)
 			}
 			return;
 		}
+
 		// lookup the given metaknob name in that category
-		pdef = param_meta_table_lookup(ptable, parm);
+		pdef = param_meta_table_lookup(ptable, mag.knob.c_str());
 	}
 	if (pdef) {
-		printf("use %s:%s is\n%s\n", ptable->key, pdef->key, pdef->def->psz);
+		if (expand || ! mag.args.empty()) {
+			auto_free_ptr metaval(expand_meta_args(pdef->def->psz, mag.args));
+			printf("use %s:%s %s\n", ptable->key, parm, expand ? "expands to" : "is");
+			PrintMetaKnob(metaval.ptr(), expand, verbose);
+			printf("\n");
+		} else {
+			printf("use %s:%s is\n%s\n", ptable->key, pdef->key, pdef->def->psz);
+		}
 	} else {
 		MyString name_used(use);
 		if (ptable) { name_used.formatstr("%s:%s", use, parm); }
@@ -2277,6 +2463,9 @@ static int do_write_config(const char* pathname, WRITE_CONFIG_OPTIONS opts)
 	//fprintf(fh, "\n<all done>\n");
 	if ( ! args.output.empty()) {
 		//fprintf(fh, "<not empty>\n");
+		if (opts.comment_version) {
+			fprintf(fh, "# condor_config_val %s\n", CondorVersion());
+		}
 		std::map<unsigned long long, std::string>::iterator it;
 		long last_id = -1;
 		for (it = args.output.begin(); it != args.output.end(); it++) {
@@ -2302,4 +2491,157 @@ static int do_write_config(const char* pathname, WRITE_CONFIG_OPTIONS opts)
 
 }
 
+#ifdef TEST_NTH_LIST_FUNCTIONS
+// count the number of items in the list using the given char as separator
+// this function does NOT treat repeated separators as indicating only a single item
+// this  "a, b, , c" should return 4, not 3
+static int count_list_items(const char * list, char sep)
+{
+	int cnt = (list && (*list==sep)) ? 1 : 0;
+	for (const char * p = list; p; p = strchr(p+1,sep)) ++cnt;
+	return cnt;
+}
 
+// return start and end pointers for the Nth item in the list, using the sep char as item separator
+// returns NULL if the input list is empty or it does not have an Nth item.
+// if the return value is NULL, then the end pointer is not set.
+//
+static const char * nth_list_item(const char * list, char sep, const char * & endp, int index, bool trimmed)
+{
+	int ii = 0;
+	for (const char * p = list; p; ++ii) {
+		const char * e = strchr(p,sep);
+		if (ii == index) {
+			if (trimmed) { while (isspace(*p)) ++p; }
+			if ( ! e) {
+				e = p + strlen(p);
+			}
+			if (trimmed) { while (e > p && isspace(e[-1])) --e; }
+			endp = (e > p) ? e : p;
+			return p;
+		}
+		if ( ! e) break;
+		p = e+1;
+	}
+	return NULL;
+}
+
+// set buf to the value of the Nth list item and return a pointer to the start of that item.
+// returns NULL if the input list is NULL or if it has no Nth item.
+//
+static const char * get_nth_list_item(const char * list, char sep, std::string &buf, int index, bool trimmed=true) {
+	buf.clear();
+	const char * p, *e;
+	p = nth_list_item(list, sep, e, index, trimmed);
+	if (p) {
+		// if we got non-null back. always append something to insure that buf.c_str() will not fault.
+		if (e > p) { buf.append(p, e-p); } else { buf.append(""); }
+	}
+	return p;
+}
+
+static void test_nth_list_functions()
+{
+	static const char * lists[] = {
+		NULL, "", "   ", "a", " a", "a ", "  a  ",
+		"aaa,bbbb,cc,d", "a, bbb, cccc, dddddd",
+		"a,b", "a,b,c", "a,b,c,", ",b,c,",
+		"a, b", "a , b", ",b", " ,b", " , b", "a,", "a ,", "a, ",
+		"a, b, c, d", " a , b , c , d ", "a,,c", ",,,", " a, b, , ",
+	};
+	for (size_t ii = 0; ii < COUNTOF(lists); ++ii) {
+		const char * list = lists[ii];
+		int nn = count_list_items(list, ',');
+		printf("count_list_items(%s) = %d\n", list ? list : "NULL", nn);
+		std::string val;
+		for (int jj = 0; jj < nn; ++jj) {
+			val.clear();
+			const char * p = get_nth_list_item(list, ',', val, jj, true);
+			const char * v = val.c_str();
+			printf("\t[%d]='%s' p='%s'\n", jj, v ? v : "NULL", p ? p : "NULL");
+		}
+	}
+}
+#endif
+
+void profile_test(bool /*verbose*/, int test, int iter)
+{
+	static const char * aInput[] = {
+		"/scratch/condor/alt/test/log/SchedLog",
+
+		"$(LOG)/SchedLog",
+
+		"$(FOG)/SchedLog",
+
+		"$(FOG:/scratch/condor/alt/test/log)/SchedLog",
+
+		"$(LOG)\n$(LOG)\n$(LOG)\n$(LOG)\n$(LOG)",
+
+		"* foo      $(LOG:/home)/users/local/foo     \n"
+		"* bar      $(LOG:/home)/users/local/bar     \n"
+		"* baz      $(LOG:/home)/users/local/baz     \n"
+		"* john     $(LOG:/home)/users/local/john    \n"
+		"* alice    $(LOG:/home)/users/local/alice   \n"
+		"* bob      $(LOG:/home)/users/local/bob     \n"
+		"* james    $(LOG:/home)/users/local/james   \n"
+		"* mike     $(LOG:/home)/users/local/mike    \n"
+		"* oscar    $(LOG:/home)/users/local/oscar   \n"
+		"* tango    $(LOG:/home)/users/local/tango   \n"
+		"* foxtrot  $(LOG:/home)/users/local/foxtrot \n"
+		"* sally    $(LOG:/home)/users/local/sally   ",
+
+		"* foo      $(FOG:/home)/users/local/foo     \n"
+		"* bar      $(FOG:/home)/users/local/bar     \n"
+		"* baz      $(FOG:/home)/users/local/baz     \n"
+		"* john     $(FOG:/home)/users/local/john    \n"
+		"* alice    $(FOG:/home)/users/local/alice   \n"
+		"* bob      $(FOG:/home)/users/local/bob     \n"
+		"* james    $(FOG:/home)/users/local/james   \n"
+		"* mike     $(FOG:/home)/users/local/mike    \n"
+		"* oscar    $(FOG:/home)/users/local/oscar   \n"
+		"* tango    $(FOG:/home)/users/local/tango   \n"
+		"* foxtrot  $(FOG:/home)/users/local/foxtrot \n"
+		"* sally    $(FOG:/home)/users/local/sally   ",
+	};
+
+#ifdef TEST_NTH_LIST_FUNCTIONS
+	test_nth_list_functions();
+#endif
+
+	if ( ! iter) iter = 1;
+
+	MACRO_EVAL_CONTEXT ctx; ctx.init("TOOL");
+	MACRO_SET & mset = *param_get_macro_set();
+	std::string result;
+	auto_free_ptr ares;
+	unsigned int options = EXPAND_MACRO_OPT_KEEP_DOLLARDOLLAR; // EXPAND_MACRO_OPT_IS_PATH;
+	const char * input = aInput[(test/2)%COUNTOF(aInput)];
+	bool new_algorithm = test&1;
+
+	// to make testing consistent between linux and windows.
+	insert_macro("RELEASE_DIR","/scratch/condor/alt/test",mset,DetectedMacro,ctx);
+	insert_macro("LOCAL_DIR","$(RELEASE_DIR)",mset,DetectedMacro,ctx);
+
+	double tBegin = _condor_debug_get_time_double();
+
+	for (int ixi = 0; ixi < iter; ++ixi) {
+		for (size_t ii = 0; ii < COUNTOF(aInput); ++ii) {
+			if ( ! new_algorithm) {
+				ares.set(expand_macro(input, mset, ctx));
+			} else {
+				result = input;
+				expand_macro(result, options, mset, ctx);
+			}
+		}
+	}
+
+	double tEnd = _condor_debug_get_time_double();
+
+	const char * test_name = new_algorithm ? "std::string" : "strdup";
+	const char * test_result = new_algorithm ? result.c_str() : ((const char *)ares);
+
+	printf("----------------------------\nTest %s (%d iter)\n", test_name, iter);
+	printf("Elapsed time = %.3f ms\n\n", (tEnd - tBegin)*1000.0);
+	printf("from input:\n%s\n------\n", input);
+	printf("%s\n", test_result);
+}

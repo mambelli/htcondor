@@ -21,7 +21,6 @@
 #include "condor_common.h"
 #include "condor_debug.h"
 #include "condor_config.h"
-#include "condor_string.h"
 #include "condor_ver_info.h"
 #include "condor_attributes.h"
 
@@ -39,7 +38,7 @@ DCShadow::DCShadow( const char* tName ) : Daemon( DT_SHADOW, tName, NULL )
 			// We must have been given a sinful string instead of a hostname.
 			// Just use the sinful string in place of a hostname, contrary
 			// to the default behavior in Daemon::Daemon().
-		_name = strnewp(_addr);
+		_name = strdup(_addr);
 	}
 }
 
@@ -74,20 +73,19 @@ DCShadow::initFromClassAd( ClassAd* ad )
 		return false;
 	} else {
 		if( is_valid_sinful(tmp) ) {
-			New_addr( strnewp(tmp) );
+			New_addr( tmp );
 			is_initialized = true;
 		} else {
 			dprintf( D_FULLDEBUG, 
 					 "ERROR: DCShadow::initFromClassAd(): invalid %s in ad (%s)\n", 
 					 ATTR_SHADOW_IP_ADDR, tmp );
+			free( tmp );
 		}
-		free( tmp );
 		tmp = NULL;
 	}
 
 	if( ad->LookupString(ATTR_SHADOW_VERSION, &tmp) ) {
-		New_version( strnewp(tmp) );
-		free( tmp );
+		New_version( tmp );
 		tmp = NULL;
 	}
 
@@ -96,7 +94,7 @@ DCShadow::initFromClassAd( ClassAd* ad )
 
 
 bool
-DCShadow::locate( void )
+DCShadow::locate( LocateType /*method=LOCATE_FULL*/ )
 {
 	return is_initialized;
 }
@@ -171,3 +169,125 @@ DCShadow::updateJobInfo( ClassAd* ad, bool insure_update )
 	}
 	return true;
 }
+
+bool
+DCShadow::getUserPassword( const char* user, const char* domain, MyString& passwd)
+{
+	ReliSock reli_sock;
+	bool  result;
+
+		// For now, if we have to ensure that the update gets
+		// there, we use a ReliSock (TCP).
+	reli_sock.timeout(20);   // years of research... :)
+	if( ! reli_sock.connect(_addr) ) {
+		dprintf( D_ALWAYS, "getUserCredential: Failed to connect to shadow "
+				 "(%s)\n", _addr );
+		return false;
+	}
+	result = startCommand( CREDD_GET_PASSWD, (Sock*)&reli_sock );
+
+	if( ! result ) {
+		dprintf( D_FULLDEBUG,
+				 "Failed to send CREDD_GET_PASSWD command to shadow\n" );
+		return false;
+	}
+
+	// Enable encryption if available. If it's not available, our peer
+	// will close the connection.
+	reli_sock.set_crypto_mode(true);
+
+	MyString senduser = user;
+	MyString senddomain = domain;
+	MyString recvcredential;
+
+	if(!reli_sock.code(senduser)) {
+		dprintf( D_FULLDEBUG, "Failed to send user (%s) to shadow\n", senduser.c_str() );
+		return false;
+	}
+	if(!reli_sock.code(senddomain)) {
+		dprintf( D_FULLDEBUG, "Failed to send domain (%s) to shadow\n", senddomain.c_str() );
+		return false;
+	}
+	if(!reli_sock.end_of_message()) {
+		dprintf( D_FULLDEBUG, "Failed to send EOM to shadow\n" );
+		return false;
+	}
+
+	reli_sock.decode();
+	if(!reli_sock.code(recvcredential)) {
+		dprintf( D_FULLDEBUG, "Failed to receive credential from shadow\n");
+		return false;
+	}
+	if(!reli_sock.end_of_message()) {
+		dprintf( D_FULLDEBUG, "Failed to receive EOM from shadow\n");
+		return false;
+	}
+
+	passwd = recvcredential;
+	return true;
+}
+
+bool DCShadow::getUserCredential(const char *user, const char *domain, int mode, unsigned char* & cred, int & credlen)
+{
+	ReliSock reli_sock;
+
+	// For now, if we have to ensure that the update gets
+	// there, we use a ReliSock (TCP).
+	reli_sock.timeout(20);   // years of research... :)
+	if( ! reli_sock.connect(_addr) ) {
+		dprintf( D_ALWAYS, "getUserCredential: Failed to connect to shadow (%s)\n", _addr );
+		return false;
+	}
+	if ( ! startCommand( CREDD_GET_CRED, (Sock*)&reli_sock )) {
+		dprintf( D_FULLDEBUG, "startCommand(CREDD_GET_CRED) failed to shadow (%s)\n", _addr );
+		return false;
+	}
+
+	// Enable encryption if available. If it's not available, our peer
+	// will close the connection.
+	reli_sock.set_crypto_mode(true);
+
+	if(!reli_sock.put(user)) {
+		dprintf( D_FULLDEBUG, "Failed to send user (%s) to shadow\n", user );
+		return false;
+	}
+	if(!reli_sock.put(domain)) {
+		dprintf( D_FULLDEBUG, "Failed to send domain (%s) to shadow\n", domain );
+		return false;
+	}
+	if(!reli_sock.put(mode)) {
+		dprintf( D_FULLDEBUG, "Failed to send mode (%d) to shadow\n", mode );
+		return false;
+	}
+	if(!reli_sock.end_of_message()) {
+		dprintf( D_FULLDEBUG, "Failed to send EOM to shadow\n" );
+		return false;
+	}
+
+	reli_sock.decode();
+
+	if (!reli_sock.get(credlen)) {
+		dprintf( D_FULLDEBUG, "Failed to send get credential size from shadow\n" );
+		return false;
+	}
+
+	// set a 10Mb limit on the credential
+	if (credlen < 0 || credlen > 0x1000 * 0x1000 * 10) {
+		dprintf( D_ALWAYS, "Unexpected credential size from shadow : %d\n", credlen );
+		return false;
+	}
+
+	unsigned char * cred_data = (unsigned char*)malloc (credlen);
+	if ( ! reli_sock.get_bytes(cred_data, credlen) || 
+		 ! reli_sock.end_of_message()) {
+		dprintf( D_FULLDEBUG, "Failed to receive credential or EOM from shadow\n");
+		free (cred_data);
+		cred_data = NULL;
+		return false;
+	}
+
+	cred = cred_data;
+	return true;
+}
+
+

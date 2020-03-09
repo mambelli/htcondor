@@ -21,7 +21,6 @@
 #define AMAZON_COMMANDS_H
 
 #include "condor_common.h"
-#include "condor_string.h"
 #include "MyString.h"
 #include "string_list.h"
 
@@ -46,58 +45,111 @@
 #define AMAZON_COMMAND_VM_REGISTER_IMAGE    "EC2_VM_REGISTER_IMAGE"
 #define AMAZON_COMMAND_VM_DEREGISTER_IMAGE  "EC2_VM_DEREGISTER_IMAGE"
 #define AMAZON_COMMAND_VM_ASSOCIATE_ADDRESS "EC2_VM_ASSOCIATE_ADDRESS"
-//#define AMAZON_COMMAND_VM_DISASSOCIATE_ADDRESS   "EC2_VM_DISASSOCIATE_ADDRESS"
-#define AMAZON_COMMAND_VM_ATTACH_VOLUME		"EC2_VM_ATTACH_VOLUME"
-#define AMAZON_COMMAND_VM_CREATE_TAGS		"EC2_VM_CREATE_TAGS"
-#define AMAZON_COMMAND_VM_SERVER_TYPE		"EC2_VM_SERVER_TYPE"
+#define AMAZON_COMMAND_VM_ATTACH_VOLUME     "EC2_VM_ATTACH_VOLUME"
+#define AMAZON_COMMAND_VM_CREATE_TAGS       "EC2_VM_CREATE_TAGS"
+#define AMAZON_COMMAND_VM_SERVER_TYPE       "EC2_VM_SERVER_TYPE"
 
 #define AMAZON_COMMAND_VM_START_SPOT        "EC2_VM_START_SPOT"
 #define AMAZON_COMMAND_VM_STOP_SPOT         "EC2_VM_STOP_SPOT"
 #define AMAZON_COMMAND_VM_STATUS_SPOT       "EC2_VM_STATUS_SPOT"
 #define AMAZON_COMMAND_VM_STATUS_ALL_SPOT   "EC2_VM_STATUS_ALL_SPOT"
 
-// S3 Commands
-#define AMAZON_COMMAND_S3_ALL_BUCKETS       "AMAZON_S3_ALL_BUCKETS"
-#define AMAZON_COMMAND_S3_CREATE_BUCKET     "AMAZON_S3_CREATE_BUCKET"
-#define AMAZON_COMMAND_S3_DELETE_BUCKET     "AMAZON_S3_DELETE_BUCKET"
-#define AMAZON_COMMAND_S3_LIST_BUCKET       "AMAZON_S3_LIST_BUCKET"
-#define AMAZON_COMMAND_S3_UPLOAD_FILE       "AMAZON_S3_UPLOAD_FILE"
-#define AMAZON_COMMAND_S3_UPLOAD_DIR        "AMAZON_S3_UPLOAD_DIR"
-#define AMAZON_COMMAND_S3_DELETE_FILE       "AMAZON_S3_DELETE_FILE"
-#define AMAZON_COMMAND_S3_DOWNLOAD_FILE     "AMAZON_S3_DOWNLOAD_FILE"
-#define AMAZON_COMMAND_S3_DOWNLOAD_BUCKET   "AMAZON_S3_DOWNLOAD_BUCKET"
+// For condor_annex.
+#define AMAZON_COMMAND_BULK_START           "EC2_BULK_START"
+#define AMAZON_COMMAND_PUT_RULE             "CWE_PUT_RULE"
+#define AMAZON_COMMAND_PUT_TARGETS          "CWE_PUT_TARGETS"
+#define AMAZON_COMMAND_BULK_STOP            "EC2_BULK_STOP"
+#define AMAZON_COMMAND_DELETE_RULE          "CWE_DELETE_RULE"
+#define AMAZON_COMMAND_REMOVE_TARGETS       "CWE_REMOVE_TARGETS"
+#define AMAZON_COMMAND_GET_FUNCTION         "AWS_GET_FUNCTION"
+#define AMAZON_COMMAND_S3_UPLOAD            "S3_UPLOAD"
+#define AMAZON_COMMAND_CF_CREATE_STACK      "CF_CREATE_STACK"
+#define AMAZON_COMMAND_CF_DESCRIBE_STACKS   "CF_DESCRIBE_STACKS"
+#define AMAZON_COMMAND_CALL_FUNCTION        "AWS_CALL_FUNCTION"
+#define AMAZON_COMMAND_BULK_QUERY           "EC2_BULK_QUERY"
+
 
 #define GENERAL_GAHP_ERROR_CODE             "GAHPERROR"
 #define GENERAL_GAHP_ERROR_MSG              "GAHP_ERROR"
 
 class AmazonRequest {
     public:
-        AmazonRequest();
+        AmazonRequest( int i, const char * c, int sv = 4 ) :
+            responseCode(0), includeResponseHeader(false), 
+			requestID(i), requestCommand(c),
+            signatureVersion(sv), httpVerb( "POST" ) {
+				mutexReleased = lockGained = requestBegan = requestEnded =
+					signatureTime = mutexGained = sleepBegan = liveLine = sleepEnded = {0,0};
+			}
         virtual ~AmazonRequest();
 
         virtual bool SendRequest();
+        virtual bool SendURIRequest();
+        virtual bool SendJSONRequest( const std::string & payload );
+        virtual bool SendS3Request( const std::string & payload );
 
-    protected:    
+    protected:
         typedef std::map< std::string, std::string > AttributeValueMap;
         AttributeValueMap query_parameters;
-        
+        AttributeValueMap headers;
+
         std::string serviceURL;
         std::string accessKeyFile;
         std::string secretKeyFile;
-        
+
         std::string errorMessage;
         std::string errorCode;
-        
-        std::string resultString;
 
-		bool includeResponseHeader;
+        std::string resultString;
+        unsigned long responseCode;
+
+        bool includeResponseHeader;
+
+		// For tracing.
+		int requestID;
+		std::string requestCommand;
+		struct timespec mutexReleased;
+		struct timespec lockGained;
+		struct timespec requestBegan;
+		struct timespec requestEnded;
+		struct timespec mutexGained;
+		struct timespec sleepBegan;
+		struct timespec liveLine;
+		struct timespec sleepEnded;
+
+		// So that we don't bother to send expired signatures.
+		struct timespec signatureTime;
+
+		int signatureVersion;
+
+		// For signature v4.  Use if the URL is not of the form
+		// '<service>.<region>.provider.tld'.  (Includes S3.)
+		std::string region;
+		std::string service;
+
+		// Some odd services (Lambda) require the use of GET.
+		// Some odd services (S3) requires the use of PUT.
+		std::string httpVerb;
+
+	private:
+		bool sendV2Request();
+		bool sendV4Request( const std::string & payload, bool sendContentSHA = false );
+
+		std::string canonicalizeQueryString();
+		bool createV4Signature( const std::string & payload, std::string & authorizationHeader, bool sendContentSHA = false );
+
+	// This happens to be useful for obtaining metadata information.
+	protected:
+		bool sendPreparedRequest(	const std::string & protocol,
+									const std::string & uri,
+									const std::string & payload );
 };
 
 // EC2 Commands
 
 class AmazonVMStart : public AmazonRequest {
 	public:
-		AmazonVMStart();
+		AmazonVMStart( int i, const char * c ) : AmazonRequest( i, c ) { }
 		virtual ~AmazonVMStart();
 
         virtual bool SendRequest();
@@ -107,15 +159,16 @@ class AmazonVMStart : public AmazonRequest {
 
     protected:
         std::string instanceID;
+        std::vector< std::string > instanceIDs;
 };
 
 class AmazonVMStartSpot : public AmazonVMStart {
     public:
-        AmazonVMStartSpot();
+		AmazonVMStartSpot( int i, const char * c ) : AmazonVMStart( i, c ) { }
         virtual ~AmazonVMStartSpot();
-        
+
         virtual bool SendRequest();
-        
+
         static bool ioCheck( char ** argv, int argc );
         static bool workerFunction( char ** argv, int argc, std::string & result_string );
 
@@ -125,7 +178,7 @@ class AmazonVMStartSpot : public AmazonVMStart {
 
 class AmazonVMStop : public AmazonRequest {
 	public:
-		AmazonVMStop();
+		AmazonVMStop( int i, const char * c ) : AmazonRequest( i, c ) { }
 		virtual ~AmazonVMStop();
 
 		static bool ioCheck(char **argv, int argc);
@@ -134,9 +187,9 @@ class AmazonVMStop : public AmazonRequest {
 
 class AmazonVMStopSpot : public AmazonVMStop {
     public:
-        AmazonVMStopSpot();
+		AmazonVMStopSpot( int i, const char * c ) : AmazonVMStop( i, c ) { }
         virtual ~AmazonVMStopSpot();
-        
+
         // EC2_VM_STOP_SPOT uses the same argument structure as EC2_VM_STOP.
 		// static bool ioCheck( char ** argv, int argc );
 		static bool workerFunction( char ** argv, int argc, std::string & result_string );
@@ -158,13 +211,15 @@ class AmazonStatusResult {
 		std::string instancetype;
         std::string stateReasonCode;
         std::string clientToken;
+        std::string spotFleetRequestID;
+        std::string annexName;
 
         std::vector< std::string > securityGroups;
 };
 
 class AmazonVMStatusAll : public AmazonRequest {
 	public:
-		AmazonVMStatusAll();
+		AmazonVMStatusAll( int i, const char * c ) : AmazonRequest( i, c ) { }
 		virtual ~AmazonVMStatusAll();
 
         virtual bool SendRequest();
@@ -178,7 +233,7 @@ class AmazonVMStatusAll : public AmazonRequest {
 
 class AmazonVMStatus : public AmazonVMStatusAll {
 	public:
-		AmazonVMStatus();
+		AmazonVMStatus( int i, const char * c ) : AmazonVMStatusAll( i, c ) { }
 		virtual ~AmazonVMStatus();
 
 		static bool ioCheck(char **argv, int argc);
@@ -196,11 +251,11 @@ class AmazonStatusSpotResult {
 
 class AmazonVMStatusSpot : public AmazonVMStatus {
     public:
-        AmazonVMStatusSpot();
+		AmazonVMStatusSpot( int i, const char * c ) : AmazonVMStatus( i, c ) { }
         virtual ~AmazonVMStatusSpot();
 
         virtual bool SendRequest();
-        
+
         // EC2_VM_STATUS_SPOT uses the same argument structure as EC2_VM_STATUS_SPOT.
 		// static bool ioCheck( char ** argv, int argc );
 		static bool workerFunction( char ** argv, int argc, std::string & result_string );
@@ -211,7 +266,7 @@ class AmazonVMStatusSpot : public AmazonVMStatus {
 
 class AmazonVMStatusAllSpot : public AmazonVMStatusSpot {
     public:
-        AmazonVMStatusAllSpot();
+		AmazonVMStatusAllSpot( int i, const char * c ) : AmazonVMStatusSpot( i, c ) { }
         virtual ~AmazonVMStatusAllSpot();
 
 		static bool ioCheck( char ** argv, int argc );
@@ -220,7 +275,7 @@ class AmazonVMStatusAllSpot : public AmazonVMStatusSpot {
 
 class AmazonVMCreateKeypair : public AmazonRequest {
 	public:
-		AmazonVMCreateKeypair();
+		AmazonVMCreateKeypair( int i, const char * c ) : AmazonRequest( i, c ) { }
 		virtual ~AmazonVMCreateKeypair();
 
         virtual bool SendRequest();
@@ -234,7 +289,7 @@ class AmazonVMCreateKeypair : public AmazonRequest {
 
 class AmazonVMDestroyKeypair : public AmazonRequest {
 	public:
-		AmazonVMDestroyKeypair();
+		AmazonVMDestroyKeypair( int i, const char * c ) : AmazonRequest( i, c ) { }
 		virtual ~AmazonVMDestroyKeypair();
 
 		static bool ioCheck(char **argv, int argc);
@@ -243,7 +298,7 @@ class AmazonVMDestroyKeypair : public AmazonRequest {
 
 class AmazonAssociateAddress : public AmazonRequest {
     public:
-        AmazonAssociateAddress();
+		AmazonAssociateAddress( int i, const char * c ) : AmazonRequest( i, c ) { }
         virtual ~AmazonAssociateAddress();
 
         static bool ioCheck(char **argv, int argc);
@@ -252,7 +307,7 @@ class AmazonAssociateAddress : public AmazonRequest {
 
 class AmazonCreateTags : public AmazonRequest {
     public:
-        AmazonCreateTags();
+		AmazonCreateTags( int i, const char * c ) : AmazonRequest( i, c ) { }
         virtual ~AmazonCreateTags();
 
         static bool ioCheck(char **argv, int argc);
@@ -265,7 +320,7 @@ class AmazonCreateTags : public AmazonRequest {
  */
 class AmazonAttachVolume : public AmazonRequest {
     public:
-        AmazonAttachVolume();
+        AmazonAttachVolume( int i, const char * c ) : AmazonRequest( i, c ) { }
         virtual ~AmazonAttachVolume();
 
         static bool ioCheck(char **argv, int argc);
@@ -275,7 +330,7 @@ class AmazonAttachVolume : public AmazonRequest {
 
 class AmazonVMServerType : public AmazonRequest {
 	public:
-		AmazonVMServerType();
+        AmazonVMServerType( int i, const char * c ) : AmazonRequest( i, c ) { }
 		virtual ~AmazonVMServerType();
 
 		virtual bool SendRequest();
@@ -285,6 +340,182 @@ class AmazonVMServerType : public AmazonRequest {
 
 	protected:
 		std::string serverType;
+};
+
+// Spot Fleet commands
+class AmazonBulkStart : public AmazonRequest {
+	public:
+		AmazonBulkStart( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonBulkStart();
+
+        virtual bool SendRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+    protected:
+    	void setLaunchSpecificationAttribute( int, std::map< std::string, std::string > &, const char *, const char * = NULL );
+
+		std::string bulkRequestID;
+};
+
+class AmazonBulkStop : public AmazonRequest {
+	public:
+		AmazonBulkStop( int i, const char * c ) : AmazonRequest( i, c ), success( true ) { }
+		virtual ~AmazonBulkStop();
+
+        virtual bool SendRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+	protected:
+		bool success;
+};
+
+class AmazonPutRule : public AmazonRequest {
+	public:
+		AmazonPutRule( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonPutRule();
+
+		virtual bool SendJSONRequest( const std::string & payload );
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+    protected:
+		std::string ruleARN;
+};
+
+class AmazonDeleteRule : public AmazonRequest {
+	public:
+		AmazonDeleteRule( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonDeleteRule();
+
+		virtual bool SendJSONRequest( const std::string & payload );
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+};
+
+class AmazonPutTargets : public AmazonRequest {
+	public:
+		AmazonPutTargets( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonPutTargets();
+
+		virtual bool SendJSONRequest( const std::string & payload );
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+};
+
+class AmazonRemoveTargets : public AmazonRequest {
+	public:
+		AmazonRemoveTargets( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonRemoveTargets();
+
+		virtual bool SendJSONRequest( const std::string & payload );
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+};
+
+class AmazonGetFunction : public AmazonRequest {
+	public:
+		AmazonGetFunction( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonGetFunction();
+
+		virtual bool SendURIRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+    protected:
+		std::string functionHash;
+};
+
+class AmazonS3Upload : public AmazonRequest {
+	public:
+		AmazonS3Upload( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonS3Upload();
+
+		virtual bool SendRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+	protected:
+		std::string path;
+};
+
+class AmazonCreateStack : public AmazonRequest {
+	public:
+		AmazonCreateStack( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonCreateStack();
+
+		virtual bool SendRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+	protected:
+		std::string stackID;
+};
+
+class AmazonDescribeStacks : public AmazonRequest {
+	public:
+		AmazonDescribeStacks( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonDescribeStacks();
+
+		virtual bool SendRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+	protected:
+		std::string stackStatus;
+		std::vector< std::string > outputs;
+};
+
+class AmazonCallFunction : public AmazonRequest {
+	public:
+		AmazonCallFunction( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonCallFunction();
+
+		virtual bool SendJSONRequest( const std::string & payload );
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+    protected:
+    	std::string success;
+		std::string instanceID;
+};
+
+class AmazonBulkQuery : public AmazonRequest {
+	public:
+		AmazonBulkQuery( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonBulkQuery();
+
+        virtual bool SendRequest();
+
+		static bool ioCheck(char **argv, int argc);
+		static bool workerFunction(char **argv, int argc, std::string &result_string);
+
+	protected:
+		StringList resultList;
+};
+
+class AmazonMetadataQuery : public AmazonRequest {
+	public:
+		AmazonMetadataQuery( int i, const char * c ) : AmazonRequest( i, c ) { }
+		virtual ~AmazonMetadataQuery() { }
+
+		virtual bool SendRequest( const std::string & uri );
+
+		virtual std::string & getResultString() {
+			return resultString;
+		}
 };
 
 #endif

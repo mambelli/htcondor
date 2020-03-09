@@ -21,13 +21,11 @@
 #include "condor_common.h"
 #include "condor_debug.h"
 #include "condor_daemon_core.h"
-#include "MyString.h"
 #include "self_draining_queue.h"
 
 
 SelfDrainingQueue::SelfDrainingQueue( const char* queue_name, int per )
-	: queue( 32, NULL ),
-	  m_hash( SelfDrainingHashItem::HashFn ),
+	: m_hash( SelfDrainingHashItem::HashFn ),
 	  m_count_per_interval(1)
 {
 	if( queue_name ) {
@@ -35,9 +33,9 @@ SelfDrainingQueue::SelfDrainingQueue( const char* queue_name, int per )
 	} else {
 		name = strdup( "(unnamed)" );
 	}
-	MyString t_name;
-	t_name.formatstr( "SelfDrainingQueue::timerHandler[%s]", name );
-	timer_name = strdup( t_name.Value() );
+	std::string t_name;
+	formatstr( t_name, "SelfDrainingQueue::timerHandler[%s]", name );
+	timer_name = strdup( t_name.c_str() );
 
 	handler_fn = NULL;
 	handlercpp_fn = NULL;
@@ -137,10 +135,10 @@ SelfDrainingQueue::enqueue( ServiceData* data, bool allow_dups )
 			return false;
 		}
 	}
-	queue.enqueue(data);
+	queue.push(data);
 	dprintf( D_FULLDEBUG,
 			 "Added data to SelfDrainingQueue %s, now has %d element(s)\n",
-			 name, queue.Length() );
+			 name, (int)queue.size() );
 	registerTimer();
 	return true;
 }
@@ -157,16 +155,16 @@ SelfDrainingQueue::timerHandler( void )
 	dprintf( D_FULLDEBUG,
 			 "Inside SelfDrainingQueue::timerHandler() for %s\n", name );
 
-	if( queue.IsEmpty() ) {
+	if( queue.empty() ) {
 		dprintf( D_FULLDEBUG, "SelfDrainingQueue %s is empty, "
 				 "timerHandler() has nothing to do\n", name );
 		cancelTimer();
 		return;
 	}
 	int count;
-	for( count=0; count<m_count_per_interval && !queue.IsEmpty(); count++ ) {
-		ServiceData* d = NULL;
-		queue.dequeue(d);
+	for( count=0; count<m_count_per_interval && !queue.empty(); count++ ) {
+		ServiceData* d = queue.front();
+		queue.pop();
 
 		SelfDrainingHashItem hash_item(d);
 		m_hash.remove(hash_item);
@@ -178,7 +176,7 @@ SelfDrainingQueue::timerHandler( void )
 		}
 	}
 
-	if( queue.IsEmpty() ) {
+	if( queue.empty() ) {
 		dprintf( D_FULLDEBUG,
 				 "SelfDrainingQueue %s is empty, not resetting timer\n",
 				 name );
@@ -187,7 +185,7 @@ SelfDrainingQueue::timerHandler( void )
 			// if there's anything left in the queue, reset our timer
 		dprintf( D_FULLDEBUG,
 				 "SelfDrainingQueue %s still has %d element(s), "
-				 "resetting timer\n", name, queue.Length() );
+				 "resetting timer\n", name, (int)queue.size() );
 		resetTimer();
 	}
 }
@@ -248,7 +246,7 @@ SelfDrainingQueue::resetTimer( void )
 			 "period: %d (id: %d)\n", name, period, tid );
 }
 
-unsigned int
+size_t
 SelfDrainingHashItem::HashFn(SelfDrainingHashItem const &item)
 {
 	return item.m_service->HashFn();

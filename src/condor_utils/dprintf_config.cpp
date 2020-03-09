@@ -26,17 +26,17 @@
 ************************************************************************/
 #include "condor_common.h"
 #include "condor_debug.h"
-#include "condor_string.h" 
 #include "condor_sys_types.h"
 #include "condor_config.h"
 #include "dprintf_internal.h"
+
+#include "subsystem_info.h"
 
 #include <string>
 using std::string;
 
 extern char		*DebugLock;
 extern const char* const _condor_DebugCategoryNames[D_CATEGORY_COUNT];
-extern int		DebugUseTimestamps;
 extern int		DebugContinueOnOpenFailure;
 extern int		log_keep_open;
 extern char*	DebugTimeFormat;
@@ -98,7 +98,7 @@ dprintf_config_tool_on_error(int cat_and_flags)
 }
 
 int
-dprintf_config_tool(const char* subsys, int /*flags*/)
+dprintf_config_tool(const char* subsys, int /*flags*/, const char * logfile /*=NULL*/)
 {
 	char *pval = NULL;
 	char pname[ BUFSIZ ];
@@ -137,9 +137,9 @@ dprintf_config_tool(const char* subsys, int /*flags*/)
 	If LOGS_USE_TIMESTAMP is enabled, we will print out Unix timestamps
 	instead of the standard date format in all the log messages
 	*/
-	DebugUseTimestamps = param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );//dprintf_param_funcs->param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );
-	if (DebugUseTimestamps) HeaderOpts |= D_TIMESTAMP;
-	char * time_format = param( "DEBUG_TIME_FORMAT" );//dprintf_param_funcs->param( "DEBUG_TIME_FORMAT" );
+	int UseTimestamps = param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );
+	if (UseTimestamps) HeaderOpts |= D_TIMESTAMP;
+	char * time_format = param( "DEBUG_TIME_FORMAT" );
 	if (time_format) {
 		if(DebugTimeFormat)
 			free(DebugTimeFormat);
@@ -155,7 +155,7 @@ dprintf_config_tool(const char* subsys, int /*flags*/)
 		}
 	}
 
-	tool_output[0].logPath = "2>";
+	tool_output[0].logPath = (logfile&&logfile[0]) ? logfile : "2>";
 	tool_output[0].HeaderOpts = HeaderOpts;
 	tool_output[0].VerboseCats = verbose;
 	int cOutputs = 1;
@@ -165,7 +165,7 @@ dprintf_config_tool(const char* subsys, int /*flags*/)
 	return 0;
 }
 
-static bool parse_size_with_unit(
+bool dprintf_parse_log_size (
 	const char * input,
 	long long  & value,
 	bool       & is_time)
@@ -230,6 +230,31 @@ static bool parse_size_with_unit(
 	return !*p;
 }
 
+// make a log name from daemon name by Capitalizing each word
+// and removing _.  so SHARED_PORT becomes SharedPort
+static void make_log_name_from_daemon_name( std::string &str )
+{
+	if (str.length() == 0) return;
+	bool upper = true;
+	unsigned int j=0;
+	for (unsigned int i=0; i < str.length(); ++i) {
+		char ch = str[i];
+		if (isspace(ch) || ch == '_') {
+			upper = true;
+		} else {
+			if (ch >= 'a' && ch <= 'z' && upper) {
+				ch = _toupper(ch);
+			} else if (ch >= 'A' && ch <= 'Z' && ! upper) {
+				ch = _tolower(ch);
+			}
+			str[j++] = ch;
+			upper = false;
+		}
+	}
+	str[j] = 0;
+}
+
+
 int
 dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = NULL*/, int c_info /*= 0*/)
 {
@@ -254,23 +279,6 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 	DebugParams[0].accepts_all = true;
 
 	/*
-	 * The duplication of the param_function instance is to ensure no one else can change
-	 * the data structure out from under dprintf.  It is also to prevent transfer of ownership/
-	 * responsibility for the block of memory used to store the function pointers.
-	 */
-	/*
-	if(!dprintf_param_funcs)
-		dprintf_param_funcs = new param_functions();
-	if(p_funcs)
-	{
-		dprintf_param_funcs->set_param_func(p_funcs->get_param_func());
-		dprintf_param_funcs->set_param_bool_int_func(p_funcs->get_param_bool_int_func());
-		dprintf_param_funcs->set_param_wo_default_func(p_funcs->get_param_wo_default_func());
-		dprintf_param_funcs->set_param_int_func(p_funcs->get_param_int_func());
-	}
-	*/
-
-	/*
 	** First, add the debug flags that are shared by everyone.
 	*/
 	pval = param("ALL_DEBUG");//dprintf_param_funcs->param("ALL_DEBUG");
@@ -286,7 +294,7 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 	if (pval) {
 		long long maxlog = 0;
 		bool unit_is_time = false;
-		bool r = parse_size_with_unit(pval, maxlog, unit_is_time);
+		bool r = dprintf_parse_log_size(pval, maxlog, unit_is_time);
 		if (!r || (maxlog < 0)) {
 			std::string m;
 			formatstr(m, "Invalid config %s = %s: %s must be an integer literal >= 0 and may be followed by a units value\n", pname, pval, pname);
@@ -354,8 +362,8 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 	If LOGS_USE_TIMESTAMP is enabled, we will print out Unix timestamps
 	instead of the standard date format in all the log messages
 	*/
-	DebugUseTimestamps = param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );//dprintf_param_funcs->param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );
-	if (DebugUseTimestamps) HeaderOpts |= D_TIMESTAMP;
+	int UseTimestamps = param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );//dprintf_param_funcs->param_boolean_int( "LOGS_USE_TIMESTAMP", FALSE );
+	if (UseTimestamps) HeaderOpts |= D_TIMESTAMP;
 	char * time_format = param( "DEBUG_TIME_FORMAT" );//dprintf_param_funcs->param( "DEBUG_TIME_FORMAT" );
 	if (time_format) {
 		if(DebugTimeFormat)
@@ -371,6 +379,11 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 			}
 		}
 	}
+
+	/*
+	 * Allow the configuration to override all logs to syslog.
+	 */
+	bool to_syslog = param_boolean("LOG_TO_SYSLOG", false);
 
 	/*
 	**	pick up the name of the log file, maximum log size, and the name of the
@@ -390,7 +403,7 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 			** index 1
 			*/
 			subsys_and_level += _condor_DebugCategoryNames[debug_level]+1;
-			param_index = DebugParams.size();
+			param_index = (int)DebugParams.size();
 		}
 
 		(void)sprintf(pname, "%s_LOG", subsys_and_level.c_str());
@@ -399,19 +412,38 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 		if(debug_level == D_ALWAYS)
 		{
 
-			logPathParam = param(pname);//dprintf_param_funcs->param(pname);
-			if (logPathParam) {
-				logPath.insert(0, logPathParam);
+			logPathParam = param(pname);
+
+			// See ticket #5849: daemons started with a local name should
+			// not by default share logs with other daemons of the same
+			// subsystem.  If this daemon has a local name, then, we check
+			// <LOCALNAME>.<SUBSYS>_LOG explicitly, to make sure we don't
+			// "inherit" the value of <SUBSYS>_LOG.  Likewise, if the daemon
+			// has a local name but no log path, we default to <Localname>Log
+			// instead of <SUBSYS>Log (below).
+			const char * localName = get_mySubSystem()->getLocalName();
+			if( localName != NULL ) {
+				std::string lln( localName );
+				lln += "."; lln += pname;
+				if( logPathParam ) { free( logPathParam ); }
+				logPathParam = param( lln.c_str() );
+			}
+
+			if (to_syslog) {
+				logPath = "SYSLOG";
+			} else if (logPathParam) {
+				logPath = logPathParam;
 			} else {
-				// No default value found, so use $(LOG)/$(SUBSYSTEM)Log
-				char *lsubsys = param("SUBSYSTEM");//dprintf_param_funcs->param("SUBSYSTEM");
-				if ( ! DebugLogDir || ! lsubsys) {
-					EXCEPT("Unable to find LOG or SUBSYSTEM.\n");
+				// No default value found, so use $(LOG)/$(SUBSYSTEM)Log or $(LOG)/$(LOCALNAME)Log
+				std::string ln;
+				if (localName) {
+					ln = localName;
+				} else {
+					char * lsubsys = param("SUBSYSTEM");
+					if (lsubsys) { ln = lsubsys; free(lsubsys); } else { ln = subsys; }
 				}
-
-				formatstr(logPath, "%s%c%sLog", DebugLogDir, DIR_DELIM_CHAR, lsubsys);
-
-				free(lsubsys);
+				make_log_name_from_daemon_name( ln );
+				formatstr(logPath, "%s%c%sLog", DebugLogDir, DIR_DELIM_CHAR, ln.c_str() );
 			}
 
 			DebugParams[0].accepts_all = true;
@@ -432,8 +464,11 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 			// param_without_default.
 			// tristan 5/29/09
 			logPathParam = param(pname);
-			if(logPathParam)
-				logPath.insert(0, logPathParam);
+			if(logPathParam && to_syslog) {
+				logPath = "SYSLOG";
+			} else if(logPathParam) {
+				logPath = logPathParam;
+			}
 
 			if(!DebugParams.empty())
 			{
@@ -490,7 +525,7 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 		if (pval != NULL) {
 			long long maxlog = 0;
 			bool unit_is_time = false;
-			bool r = parse_size_with_unit(pval, maxlog, unit_is_time);
+			bool r = dprintf_parse_log_size(pval, maxlog, unit_is_time);
 			if (!r || (maxlog < 0)) {
 				std::string m;
 				formatstr(m, "Invalid config %s = %s: %s must be an integer literal >= 0 and may be followed by a units value\n", pname, pval, pname);
@@ -528,11 +563,11 @@ dprintf_config( const char *subsys, struct dprintf_output_settings *p_info /* = 
 			p_info[ii].VerboseCats   = DebugParams[ii].VerboseCats;
 		}
 		// return the NEEDED size of the p_info array, even if it is bigger than c_info
-		return DebugParams.size();
+		return (int)DebugParams.size();
 	}
 	else
 	{
-		dprintf_set_outputs(&DebugParams[0], DebugParams.size());
+		dprintf_set_outputs(&DebugParams[0], (int)DebugParams.size());
 	}
 	return 0;
 }

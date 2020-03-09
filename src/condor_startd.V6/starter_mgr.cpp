@@ -38,7 +38,7 @@
 #include "my_popen.h"
 
 
-StarterMgr::StarterMgr()
+StarterMgr::StarterMgr() : _haveStandardUni(false)
 {
 }
 
@@ -104,7 +104,7 @@ StarterMgr::init( void )
 			// starter.  try to run it with a -classad option and grab
 			// the output (which should be a classad), and construct
 			// the appropriate Starter object for it.
-		tmp_starter = makeStarter( starter_path );
+		tmp_starter = registerStarter( starter_path );
 		if( tmp_starter ) {
 			starters.Append( tmp_starter );
 		}
@@ -159,7 +159,7 @@ StarterMgr::publish( ClassAd* ad, amask_t mask )
 
 
 Starter*
-StarterMgr::findStarter( ClassAd* job_ad, ClassAd* mach_ad, bool &no_starter,
+StarterMgr::newStarter( ClassAd* job_ad, ClassAd* mach_ad, bool &no_starter,
 						 int starter_num ) 
 {
 	Starter *new_starter, *tmp_starter;
@@ -199,7 +199,7 @@ StarterMgr::findStarter( ClassAd* job_ad, ClassAd* mach_ad, bool &no_starter,
 			break;
 		default:
 			dprintf( D_ALWAYS, "ERROR: unknown starter type (%d) in "
-					 "StarterMgr::findStarter(), returning failure\n",
+					 "StarterMgr::newStarter(), returning failure\n",
 					 starter_num );
 			return NULL;
 			break;
@@ -217,18 +217,25 @@ StarterMgr::findStarter( ClassAd* job_ad, ClassAd* mach_ad, bool &no_starter,
 
 
 Starter*
-StarterMgr::makeStarter( const char* path )
+StarterMgr::registerStarter( const char* path )
 {
 	Starter* new_starter;
 	FILE* fp;
-	char *args[] = { const_cast<char*>(path),
-					 const_cast<char*>("-classad"),
+	const char *args[] = { path,
+					 "-classad",
 					 NULL };
 	char buf[1024];
 
 		// first, try to execute the given path with a "-classad"
 		// option, and grab the output as a ClassAd
-	fp = my_popenv( args, "r", FALSE );
+		// note we run the starter here as root if possible,
+		// since that is how the starter will be invoked for real,
+		// and the real uid of the starter may influence the
+		// list of capabilities the "-classad" option returns.
+	{
+		TemporaryPrivSentry sentry(PRIV_ROOT);
+		fp = my_popenv( args, "r", FALSE );
+	}
 
 	if( ! fp ) {
 		dprintf( D_ALWAYS, "Failed to execute %s, ignoring\n", path );
@@ -258,9 +265,15 @@ StarterMgr::makeStarter( const char* path )
 	new_starter = new Starter();
 	new_starter->setAd( ad );
 	new_starter->setPath( path );
-	int is_dc = 0;
+	bool is_dc = false;
 	ad->LookupBool( ATTR_IS_DAEMON_CORE, is_dc );
-	new_starter->setIsDC( (bool)is_dc );
+	new_starter->setIsDC( is_dc );
+
+	bool has_checkpoint = false;
+	ad->LookupBool( ATTR_HAS_CHECKPOINTING, has_checkpoint);
+	if (has_checkpoint) {
+		_haveStandardUni = true;
+	}
 
 	return new_starter;
 }

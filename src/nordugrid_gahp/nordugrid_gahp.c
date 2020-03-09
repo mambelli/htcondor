@@ -26,6 +26,7 @@
 #include <strings.h>
 #include <libgen.h>
 #include <ldap.h>
+#include <dlfcn.h>
 
 #include "config.h"
 
@@ -2143,7 +2144,7 @@ handle_nordugrid_ldap_query( char **input_line )
 	next_entry = ldap_first_entry( hdl, search_result );
 	while ( next_entry ) {
 		BerElement *ber;
-		const char *next_attr;
+		char *next_attr;
 //		char *dn;
 
 		if ( !first_entry ) {
@@ -2173,6 +2174,7 @@ handle_nordugrid_ldap_query( char **input_line )
 
 			ldap_value_free( values );
 
+			ldap_memfree( next_attr );
 			next_attr = ldap_next_attribute( hdl, next_entry, ber );
 		}
 
@@ -2585,11 +2587,10 @@ handle_refresh_proxy_from_file( char **input_line )
 		return 0;
 	}
 
-	// if setenv copies it's second argument, this leaks memory
-	if(file_name) {
-		environ_variable = (char *) malloc(strlen(file_name) + 1);
-		strcpy(environ_variable, file_name); 
-		setenv("X509_USER_PROXY", environ_variable, 1);	
+	environ_variable = getenv("X509_USER_PROXY");
+	if ( file_name &&
+		 ( !environ_variable || strcmp( environ_variable, file_name ) ) ) {
+		setenv("X509_USER_PROXY", file_name, 1);
 	}
 
 	// this is a macro, not a function - hence the lack of a semicolon
@@ -2606,6 +2607,7 @@ handle_refresh_proxy_from_file( char **input_line )
 			return 0;
 	} 
 
+	gss_release_cred( &minor_status, &credential_handle );
 /*
 	globus_gram_client_set_credentials(credential_handle);
 */
@@ -2919,17 +2921,6 @@ main_activate_globus()
 {
 	int err;
 
-	err = globus_thread_set_model(GLOBUS_THREAD_MODEL_NONE);
-	if ( err != GLOBUS_SUCCESS ) {
-		return err;
-	}
-/*
-	err = globus_module_activate( GLOBUS_GRAM_CLIENT_MODULE );
-	if ( err != GLOBUS_SUCCESS ) {
-		globus_module_deactivate( GLOBUS_GRAM_CLIENT_MODULE );
-		return err;
-	}
-*/
 	err = globus_module_activate( GLOBUS_FTP_CLIENT_MODULE );
 	if ( err != GLOBUS_SUCCESS ) {
 		globus_module_deactivate( GLOBUS_FTP_CLIENT_MODULE );
@@ -3099,6 +3090,7 @@ service_commands(void *arg,globus_io_handle_t* gio_handle,globus_result_t rest)
 		}
 
 		if ( input_line[0] == NULL ) {
+			free( input_line );
 			goto reregister_and_return;
 		}
 
@@ -3281,6 +3273,26 @@ int main(int argc, char ** argv)
 	unsetenv("X509_USER_CERT");
 
 	/* Parse command line args */
+
+	// When loading a driver library for XIO, Globus
+	// uses lt_dlopen(), which ignores our RPATH. This means that
+	// it won't find the globus_xio_gsi_driver library that we
+	// include in UW builds of Condor.
+	// If we load the library with dlopen() first, then lt_dlopen()
+	// will find it.
+#if defined(LINUX)
+	void *dl_ptr = dlopen( "libglobus_xio_gsi_driver.so", RTLD_LAZY);
+	if ( dl_ptr == NULL ) {
+		fprintf( stderr, "Failed to open globus_xio_gsi_driver.\n" );
+		return 1;
+	}
+#endif
+
+	// TODO Try enabling threaded mode.
+	if ( globus_thread_set_model(GLOBUS_THREAD_MODEL_NONE) != GLOBUS_SUCCESS ) {
+		printf("Unable to set Globus thread model!\n");
+		_exit(1);
+	}
 
 	/* Activate Globus modules we intend to use */
     err = globus_module_activate( GLOBUS_COMMON_MODULE );

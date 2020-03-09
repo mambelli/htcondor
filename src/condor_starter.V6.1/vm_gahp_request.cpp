@@ -35,6 +35,15 @@
 
 #define NULLSTRING "NULL"
 
+const char * VMGAHP_REQ_RETURN_TABLE[] = {
+	"VMGAHP_REQ_COMMAND_PENDING",
+	"VMGAHP_REQ_COMMAND_DONE",
+	"VMGAHP_REQ_COMMAND_TIMED_OUT",
+	"VMGAHP_REQ_COMMAND_NOT_SUPPORTED",
+	"VMGAHP_REQ_VMTYPE_NOT_SUPPORTED",
+	"VMGAHP_REQ_COMMAND_ERROR"
+	};
+
 VMGahpRequest::VMGahpRequest(VMGahpServer *server)
 {
 	m_mode = NORMAL;
@@ -87,20 +96,15 @@ VMGahpRequest::clearPending()
 	}
 }
 
-int
+void
 VMGahpRequest::pending_timer_fn()
 {
-	int retval = TRUE;
-
-	//this function will be called by 
-	//either real pending timeout or detachVMGahpServer
 	if( m_user_timer_id != -1 ) {
-		retval = daemonCore->Reset_Timer(m_user_timer_id, 0);
+		daemonCore->Reset_Timer(m_user_timer_id, 0);
 		m_user_timer_id = -1;
 	}
 
 	m_pending_timeout_tid = -1;
-	return retval;
 }
 
 void
@@ -398,16 +402,23 @@ VMGahpRequest::setResult(Gahp_Args *result)
 	m_pending_result = result;
 }
 
-Gahp_Args* 
+Gahp_Args*
 VMGahpRequest::getResult() {
 	return m_pending_result;
 }
 
-bool 
+bool
+VMGahpRequest::hasValidResult() {
+	if( !m_pending_result || m_pending_result->argc != 3 ) {
+		dprintf( D_ALWAYS, "Bad Result of VM Request('%s')\n", m_command.Value());
+		return false;
+	}
+	return true;
+}
+
+bool
 VMGahpRequest::checkResult(MyString& errmsg) {
-	if( !m_pending_result || m_pending_result->argc != 3) {
-		dprintf(D_ALWAYS, "Bad Result of VM Request('%s')\n", 
-				m_command.Value());
+	if( ! hasValidResult() ) {
 		errmsg = VMGAHP_ERR_INTERNAL;
 		return false;
 	}

@@ -29,9 +29,9 @@
 #include "userlog_to_classads.h"
 
 typedef long condor_time_t;
-static condor_time_t getEventTime(ULogEvent *event)
+static condor_time_t getEventTime(const ULogEvent *event)
 {
-  return condor_time_t(mktime(&(event->eventTime)));
+  return condor_time_t( event->GetEventclock() );
 }
 
 static double tmval2double(struct timeval &t)
@@ -57,7 +57,9 @@ static bool isSuperset(CondorID &myID, CondorID &testID)
   }
 }
 
-bool userlog_to_classads(const char *filename, ClassAdList &classads, CondorID* JobIds, int cJobIds, const char * constr)
+bool userlog_to_classads(const char *filename,
+	bool (*pfnProcess)(void* pv, ClassAd* ad), void* pvProcess,
+	CondorID* JobIds, int cJobIds, ExprTree *constraintExpr)
 {
   std::map<CondorID,ClassAd *> cmap;   // classad map ... current classad for job
   std::map<CondorID,ULogEvent *> emap; // event map ... previous event for job
@@ -549,8 +551,8 @@ bool userlog_to_classads(const char *filename, ClassAdList &classads, CondorID* 
 	//   the classad attributes of the previous event
 	// So I need to do a diff to get only the interesting ones
 
-	ClassAd *eventClassAd=event->toClassAd();
-	ClassAd *prevEventClassAd=emap[jobid]->toClassAd();
+	ClassAd *eventClassAd=event->toClassAd(false);
+	ClassAd *prevEventClassAd=emap[jobid]->toClassAd(false);
 	ClassAd *jobClassAd = cmap[jobid];
 
 	// delete attributes from the previous event
@@ -565,7 +567,6 @@ bool userlog_to_classads(const char *filename, ClassAdList &classads, CondorID* 
 	eventClassAd->Delete("Cluster");
 	eventClassAd->Delete("Proc");
 	eventClassAd->Delete("Subproc");
-	eventClassAd->Delete("CurrentTime");
 	eventClassAd->Delete("EventTypeNumber");
 	eventClassAd->Delete("TriggerEventTypeNumber");
 	eventClassAd->Delete("TriggerEventTypeName");
@@ -609,21 +610,19 @@ bool userlog_to_classads(const char *filename, ClassAdList &classads, CondorID* 
 
     bool include_classad=true;
     // Check if it passed the constraint
-    if (constr && constr[0]) {
+    if (constraintExpr) {
       include_classad=false;
       classad::Value result;
-      if (classad->EvaluateExpr(constr,result)) {
+      if (classad->EvaluateExpr(constraintExpr,result)) {
         if ( ! result.IsBooleanValueEquiv(include_classad)) {
           include_classad=false;
         }
       }
     }
 
-    if (include_classad) {
-      // output the classad
-      // the list now gets the ownership
-      classads.Insert(classad);
-    } else {
+    // if the processing function was called, and it returns false
+    // then it took ownership of the ad, otherwise we need to delete it.
+    if ( ! include_classad || pfnProcess(pvProcess, classad)) {
       delete classad;
     }
   }

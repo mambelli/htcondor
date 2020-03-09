@@ -61,7 +61,8 @@ void
 ClassAdLogProber::setJobQueueName(const char* jqn)
 {
 	assert(jqn);
-	strcpy(job_queue_name, jqn);
+	strncpy(job_queue_name, jqn, PATH_MAX);
+	job_queue_name[PATH_MAX - 1] = '\0';
 }
 
 char*
@@ -138,7 +139,7 @@ ClassAdLogProber::probe(ClassAdLogEntry *curCALogEntry,
 			  FILE * job_queue_fp)
 {
 	FileOpErrCode   st;
-	int op_type;
+	int op_type = -1;
 	struct stat filestat;
 	int job_queue_fd = fileno(job_queue_fp);
 	//TODO: uncomment and possibly change
@@ -158,7 +159,7 @@ ClassAdLogProber::probe(ClassAdLogEntry *curCALogEntry,
 		   "fsize: %ld\t\tmtime: %ld", 
 		   (long)filestat.st_size, (long)filestat.st_mtime);
 #else
-		dprintf(D_ALWAYS,"ERROR: calling stat()\n");
+		dprintf(D_ALWAYS,"ERROR: calling stat() on %p - %s (errno=%d)\n", job_queue_fp, strerror(errno), errno);
 	
 	dprintf(D_FULLDEBUG, "=== Current Probing Information ===\n");
 	dprintf(D_FULLDEBUG, "fsize: %ld\t\tmtime: %ld\n", 
@@ -191,12 +192,6 @@ ClassAdLogProber::probe(ClassAdLogEntry *curCALogEntry,
 			   "type %d, but sees %d instead.",
 			   CondorLogOp_LogHistoricalSequenceNumber,
 			   caLogParser.getCurCALogEntry()->op_type);
-#else
-		dprintf(D_ALWAYS,
-				"ERROR: quill prober expects first classad log entry to be "
-				"type %d, but sees %d instead.",
-				CondorLogOp_LogHistoricalSequenceNumber,
-				caLogParser.getCurCALogEntry()->op_type);
 #endif
 		return PROBE_FATAL_ERROR;
 	}
@@ -217,11 +212,6 @@ ClassAdLogProber::probe(ClassAdLogEntry *curCALogEntry,
 		atol(((ClassAdLogEntry *)caLogParser.getCurCALogEntry())->key);
 	cur_probed_creation_time = 
 		atol(((ClassAdLogEntry *)caLogParser.getCurCALogEntry())->value);
-
-	if (last_size == 0) {
-			// starting phase
-		return INIT_QUILL;
-	}	
 
 	if(cur_probed_seq_num != last_seq_num) {
 		return COMPRESSED;

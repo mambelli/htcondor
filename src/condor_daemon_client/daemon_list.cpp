@@ -21,11 +21,12 @@
 #include "condor_common.h"
 #include "condor_debug.h"
 #include "condor_config.h"
-#include "condor_string.h"
 #include "daemon_list.h"
 #include "dc_collector.h"
 #include "internet.h"
 #include "ipv6_hostname.h"
+#include "condor_daemon_core.h"
+
 #include <vector>
 
 DaemonList::DaemonList()
@@ -68,6 +69,19 @@ DaemonList::init( daemon_t type, const char* host_list, const char* pool_list )
 		tmp = buildDaemon( type, host, pool );
 		append( tmp );
 	}
+}
+
+
+bool
+DaemonList::shouldTryTokenRequest()
+{
+	list.Rewind();
+	Daemon *daemon = nullptr;
+	bool try_token_request = false;
+	while( list.Next(daemon) ) {
+		try_token_request |= daemon->shouldTryTokenRequest();
+	}
+	return try_token_request;
 }
 
 
@@ -156,17 +170,19 @@ DaemonList::DeleteCurrent() {
 }
 
 
-CollectorList::CollectorList() {
+CollectorList::CollectorList(DCCollectorAdSequences * adseq /*=NULL*/)
+	: adSeq(adseq) {
 }
 
 CollectorList::~CollectorList() {
+	if (adSeq) { delete adSeq; adSeq = NULL; }
 }
 
 
 CollectorList *
-CollectorList::create( const char * pool )
+CollectorList::create(const char * pool, DCCollectorAdSequences * adseq)
 {
-	CollectorList * result = new CollectorList();
+	CollectorList * result = new CollectorList(adseq);
 	DCCollector * collector = NULL;
 
 		// Read the new names from config file or use the given parameter
@@ -250,10 +266,29 @@ CollectorList::resortLocal( const char *preferred_collector )
 	return 0;
 }
 
+// return a ref to the collection of ad sequence counters, creating it if necessary
+DCCollectorAdSequences & CollectorList::getAdSeq()
+{
+	if ( ! adSeq) adSeq = new DCCollectorAdSequences();
+	return *adSeq;
+}
 
 int
-CollectorList::sendUpdates (int cmd, ClassAd * ad1, ClassAd* ad2, bool nonblocking) {
+CollectorList::sendUpdates (int cmd, ClassAd * ad1, ClassAd* ad2, bool nonblocking,
+	DCTokenRequester *token_requester, const std::string &identity,
+	const std::string authz_name)
+{
 	int success_count = 0;
+
+	if ( ! adSeq) {
+		adSeq = new DCCollectorAdSequences();
+	}
+
+	// advance the sequence numbers for these ads
+	//
+	time_t now = time(NULL);
+	DCCollectorAdSeq * seqgen = adSeq->getAdSeq(*ad1);
+	if (seqgen) { seqgen->advance(now); }
 
 	this->rewind();
 	DCCollector * daemon;
@@ -261,7 +296,14 @@ CollectorList::sendUpdates (int cmd, ClassAd * ad1, ClassAd* ad2, bool nonblocki
 		dprintf( D_FULLDEBUG, 
 				 "Trying to update collector %s\n", 
 				 daemon->addr() );
-		if( daemon->sendUpdate(cmd, ad1, ad2, nonblocking) ) {
+		void *data = nullptr;
+		if (token_requester && daemon->name()) {
+			data = token_requester->createCallbackData(daemon->name(),
+				identity, authz_name);
+		}
+		if( daemon->sendUpdate(cmd, ad1, *adSeq, ad2, nonblocking,
+			DCTokenRequester::daemonUpdateCallback, data) )
+		{
 			success_count++;
 		} 
 	}
@@ -270,7 +312,7 @@ CollectorList::sendUpdates (int cmd, ClassAd * ad1, ClassAd* ad2, bool nonblocki
 }
 
 QueryResult
-CollectorList::query(CondorQuery & cQuery, ClassAdList & adList, CondorError *errstack) {
+CollectorList::query (CondorQuery & cQuery, bool (*callback)(void*, ClassAd *), void* pv, CondorError * errstack) {
 
 	int num_collectors = this->number();
 	if (num_collectors < 1) {
@@ -283,17 +325,15 @@ CollectorList::query(CondorQuery & cQuery, ClassAdList & adList, CondorError *er
 
 	bool problems_resolving = false;
 
-	
 	// switch containers for easier random access.
 	this->rewind();
 	while (this->next(daemon)) {
 		vCollectors.push_back(daemon);
 	}
-	
 
 	while ( vCollectors.size() ) {
 		// choose a random collector in the list to query.
-		unsigned int idx = get_random_int() % vCollectors.size() ;
+		unsigned int idx = get_random_int_insecure() % vCollectors.size() ;
 		daemon = vCollectors[idx];
 
 		if ( ! daemon->addr() ) {
@@ -306,7 +346,7 @@ CollectorList::query(CondorQuery & cQuery, ClassAdList & adList, CondorError *er
 						 "Can't resolve nameless collector; skipping\n" );
 			}
 			problems_resolving = true;
-		} else if ( daemon->isBlacklisted() ) {
+		} else if ( daemon->isBlacklisted() && vCollectors.size() > 1 ) {
 			dprintf( D_ALWAYS,"Collector %s blacklisted; skipping\n",
 					 daemon->name() );
 		} else {
@@ -318,7 +358,7 @@ CollectorList::query(CondorQuery & cQuery, ClassAdList & adList, CondorError *er
 				daemon->blacklistMonitorQueryStarted();
 			}
 
-			result = cQuery.fetchAds (adList, daemon->addr(), errstack);
+			result = cQuery.processAds (callback, pv, daemon->addr(), errstack);
 
 			if( num_collectors > 1 ) {
 				daemon->blacklistMonitorQueryFinished( result == Q_OK );
@@ -342,7 +382,6 @@ CollectorList::query(CondorQuery & cQuery, ClassAdList & adList, CondorError *er
 		// If we've gotten here, there are no good collectors
 	return result;
 }
-
 
 
 bool

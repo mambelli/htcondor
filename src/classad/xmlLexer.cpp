@@ -403,8 +403,7 @@ BreakdownTag(const char *complete_tag)
 			}
 		}
 		bool validStr = true;
-		value += " ";
-		convert_escapes(value, validStr);		
+		convert_escapes(value, validStr);
 		if(!validStr) {  // contains a \0 escape char
 			current_token.tag_type = tagType_Invalid;
 		}

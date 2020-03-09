@@ -34,52 +34,12 @@
 #include "HashTable.h"
 #include "condor_id.h"
 #include "CondorError.h"
-#include "stat_struct.h"
 #include <iosfwd>
 #include <string>
 
 class MultiLogFiles
 {
 public:
-		/** Gets values from a file, where the file contains lines of
-			the form
-				<keyword> <value>
-			with arbitrary whitespace between the two tokens.
-			@param fileName: the name of the file to parse
-			@param keyword: the keyword string
-			@param values: the list of values found
-			@param skipTokens: number of tokens to skip between keyword
-				and value
-			@return "" if okay, an error message otherwise
-		*/
-	static MyString getValuesFromFile(const MyString &fileName,
-			const MyString &keyword, StringList &values, int skipTokens = 0);
-
-		/** getValuesFromFileNew() performs exactly the same function as
-			getValuesFromFile(); the difference is that
-			getValuesFromFileNew() reads the given file line-by-line
-			rather than reading the whole thing into one string (this
-			fixes gittrac #4171).  As of 8.0.6 we are keeping both
-			versions so the new one can be turned off with configuration,
-			but eventually the old version should be torn out completely
-			(see gittrac #4189).
-		*/
-	static MyString getValuesFromFileNew(const MyString &fileName,
-			const MyString &keyword, StringList &values, int skipTokens = 0);
-
-	    /** Gets the log file from a Condor submit file.
-		    on success, the return value will be the log file name
-		    on failure, it will be ""
-			@param strSubFilename: the submit file name
-			@param directory: the directory of the submit file (can be blank)
-			@param isXml: reference to a binary variable that will be
-				set to true if log_xml is "true" in the submit file
-			@return the log file name from the submit file if successful,
-				or "" if unsuccessful
-		 */
-    static MyString loadLogFileNameFromSubFile(const MyString &strSubFilename,
-			const MyString &directory, bool &isXml, bool usingDefaultLog);
-
 		/** Gets the specified value from a submit file (looking for the
 			syntax <keyword> = <value>).
 			@param strSubFilename: the submit file name
@@ -96,27 +56,6 @@ public:
 			@return true if successful, false if failed
 		 */
 	static bool makePathAbsolute(MyString &filename, CondorError &errstack);
-
-	    /** Gets the log files from a Stork submit file.
-		 * @param The submit file name.
-		 * @param The directory containing the submit file.
-		 * @param Output string list of log file names.
-		 * @return "" if okay, or else an error message.
-		 */
-    static MyString loadLogFileNamesFromStorkSubFile(
-		const MyString &strSubFilename,
-		const MyString &directory,
-		StringList &listLogFilenames);
-
-		/** Gets the number of job procs queued by a submit file
-			@param The submit file name
-			@param The submit file directory
-			@param A MyString to receive any error message
-			@return -1 if an error, otherwise the number of job procs
-				queued by the submit file
-		*/
-	static int getQueueCountFromSubmitFile(const MyString &strSubFilename,
-	            const MyString &directory, MyString &errorMsg);
 
 		/** Initializes the given file -- creates it if it doesn't exist,
 			possibly truncates it if it does.
@@ -160,7 +99,7 @@ public:
 
 			/** Real the next "logical" line from the file.  (This means
 				lines are combined if they end with a continuation character.)
-				@param line: a MyString to recieve the line string
+				@param line: a MyString to receive the line string
 				@return: true iff we got any data
 			 */
 		bool NextLogicalLine( MyString &line );
@@ -212,27 +151,6 @@ private:
 		 */
 	static MyString CombineLines(StringList &listIn, char continuation,
 			const MyString &filename, StringList &listOut);
-
-		/**
-		 * Skip whitespace in a std::string buffer.  This is a helper function
-		 * for loadLogFileNamesFromStorkSubFile().  When the new ClassAds
-		 * parser can skip whitespace on it's own, this function can be
-		 * removed.
-		 * @param buffer name
-		 * @param input/output offset into buffer
-		 * @return void
-		 */
-	static void skip_whitespace(std::string const &s,int &offset);
-
-		/**
-		 * Read a file into a std::string helper function for
-		 * loadLogFileNamesFromStorkSubFile().
-		 * @param Filename to read.
-		 * @param output buffer
-		 * @return "" if okay, or else an error message.
-		 */
-	static MyString readFile(char const *filename,std::string& buf);
-
 };
 
 class ReadMultipleUserLogs
@@ -247,10 +165,13 @@ public:
     	*/
     ULogEventOutcome readEvent (ULogEvent * & event);
 
-	    /** Returns true iff any of the logs we're monitoring grew since
-		    the last time this method was called.
+		/** Returns a status code for the set of all log files currently being
+			monitored (typically only a single file).
+			If any of the files has grown, return ReadUserLog::LOG_STATUS_GROWN
+			If any of the files is in error state, return ReadUserLog::LOG_STATUS_ERROR
+			Otherwise, return ReadUserLog::LOG_STATUS_NOCHANGE
 		 */
-	bool detectLogGrowth();
+	ReadUserLog::FileStatus GetLogStatus();
 
 		/** Returns the total number of user logs this object "knows
 			about".
@@ -292,7 +213,7 @@ public:
 protected:
 	friend class CheckEvents;
 
-	static unsigned int hashFuncJobID(const CondorID &key);
+	static size_t hashFuncJobID(const CondorID &key);
 
 private:
 	void cleanup();
@@ -354,16 +275,6 @@ private:
 	// For instantiation in programs that use this class.
 #define MULTI_LOG_HASH_INSTANCE template class \
 		HashTable<MyString, ReadMultipleUserLogs::LogFileMonitor *>
-
-		/** Returns true iff the given log grew since the last time
-		    we called this method on it.
-		    @param The LogFileMonitor object to test.
-			@param The filename this corresponds to (for error messages
-				only).
-		    @return True iff the log grew.
-
-		 */
-	static bool LogGrew( LogFileMonitor *monitor );
 
 		/**
 		 * Read an event from a log monitor.

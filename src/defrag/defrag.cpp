@@ -33,6 +33,8 @@
 #include "dc_startd.h"
 #include "get_daemon_name.h"
 #include <algorithm>
+#include <iterator>
+#include <sstream>
 #include "defrag.h"
 
 
@@ -144,6 +146,9 @@ void Defrag::config()
 	ASSERT( param(m_defrag_requirements,"DEFRAG_REQUIREMENTS") );
 	validateExpr( m_defrag_requirements.c_str(), "DEFRAG_REQUIREMENTS" );
 
+	ASSERT( param( m_draining_start_expr, "DEFRAG_DRAINING_START_EXPR" ) );
+	validateExpr( m_draining_start_expr.c_str(), "DEFRAG_DRAINING_START_EXPR" );
+
 	ASSERT( param(m_whole_machine_expr,"DEFRAG_WHOLE_MACHINE_EXPR") );
 	validateExpr( m_whole_machine_expr.c_str(), "DEFRAG_WHOLE_MACHINE_EXPR" );
 
@@ -155,7 +160,7 @@ void Defrag::config()
 	else {
 		m_draining_schedule = getDrainingScheduleNum(m_draining_schedule_str.c_str());
 		if( m_draining_schedule < 0 ) {
-			EXCEPT("Invalid draining schedule: %s\n",m_draining_schedule_str.c_str());
+			EXCEPT("Invalid draining schedule: %s",m_draining_schedule_str.c_str());
 		}
 	}
 
@@ -166,12 +171,12 @@ void Defrag::config()
 	}
 	else {
 		if( !m_rank_ad.AssignExpr(ATTR_RANK,rank.Value()) ) {
-			EXCEPT("Invalid expression for DEFRAG_RANK: %s\n",
+			EXCEPT("Invalid expression for DEFRAG_RANK: %s",
 				   rank.Value());
 		}
 	}
 
-	int update_interval = param_integer("DEFRAG_UPDATE_INTERVAL", 600);
+	int update_interval = param_integer("DEFRAG_UPDATE_INTERVAL", 300);
 	if(m_public_ad_update_interval != update_interval) {
 		m_public_ad_update_interval = update_interval;
 
@@ -220,8 +225,8 @@ static int StartdSortFunc(ClassAd *ad1,ClassAd *ad2,void *data)
 
 	float rank1 = 0;
 	float rank2 = 0;
-	rank_ad->EvalFloat(ATTR_RANK,ad1,rank1);
-	rank_ad->EvalFloat(ATTR_RANK,ad2,rank2);
+	EvalFloat(ATTR_RANK,rank_ad,ad1,rank1);
+	EvalFloat(ATTR_RANK,rank_ad,ad2,rank2);
 
 	return rank1 > rank2;
 }
@@ -232,7 +237,7 @@ void Defrag::validateExpr(char const *constraint,char const *constraint_source)
 
 	if( ParseClassAdRvalExpr( constraint, requirements )!=0 || requirements==NULL )
 	{
-		EXCEPT("Invalid expression for %s: %s\n",
+		EXCEPT("Invalid expression for %s: %s",
 			   constraint_source,constraint);
 	}
 	delete requirements;
@@ -387,13 +392,13 @@ void Defrag::saveState()
 	formatstr(new_state_file,"%s.new",m_state_file.c_str());
 	FILE *fp;
 	if( !(fp = safe_fopen_wrapper_follow(new_state_file.c_str(), "w")) ) {
-		EXCEPT("failed to save state to %s\n",new_state_file.c_str());
+		EXCEPT("failed to save state to %s",new_state_file.c_str());
 	}
 	else {
 		fPrintAd(fp, ad);
 		fclose( fp );
 		if( rotate_file(new_state_file.c_str(),m_state_file.c_str())!=0 ) {
-			EXCEPT("failed to save state to %s\n",m_state_file.c_str());
+			EXCEPT("failed to save state to %s",m_state_file.c_str());
 		}
 	}
 }
@@ -406,12 +411,13 @@ void Defrag::loadState()
 			dprintf(D_ALWAYS,"State file %s does not yet exist.\n",m_state_file.c_str());
 		}
 		else {
-			EXCEPT("failed to load state from %s\n",m_state_file.c_str());
+			EXCEPT("failed to load state from %s",m_state_file.c_str());
 		}
 	}
 	else {
 		int isEOF=0, errorReadingAd=0, adEmpty=0;
-		ClassAd *ad = new ClassAd(fp, "...", isEOF, errorReadingAd, adEmpty);
+		ClassAd *ad = new ClassAd;
+		InsertFromFile(fp, *ad, "...", isEOF, errorReadingAd, adEmpty);
 		fclose( fp );
 
 		if( errorReadingAd ) {
@@ -500,8 +506,6 @@ void Defrag::poll_cancel(MachineSet &cancelled_machines)
 	ClassAd *startd_ad_ptr;
 	while ( (startd_ad_ptr=startdAds.Next()) )
 	{
-		if (!startd_ad_ptr) continue;
-
 		ClassAd &startd_ad = *startd_ad_ptr;
 		std::string machine;
 		std::string name;
@@ -599,7 +603,7 @@ void Defrag::poll()
 
 	dprintf_set("Set of current whole machines is ", &whole_machines);
 	dprintf_set("Set of current draining machine is ", &draining_machines);
-	dprintf_set("Newly Arrived new machines is ", &new_machines);
+	dprintf_set("Newly Arrived whole machines is ", &new_machines);
 	dprintf_set("Newly departed draining machines is ", &no_longer_whole_machines);
 
 	m_prev_draining_machines = draining_machines;
@@ -627,7 +631,7 @@ void Defrag::poll()
 		m_last_whole_machine_arrival = current;
 	}
 
-	dprintf(D_ALWAYS, "Lifetime new machines arrived: %d\n", m_whole_machines_arrived);
+	dprintf(D_ALWAYS, "Lifetime whole machines arrived: %d\n", m_whole_machines_arrived);
 	if (m_whole_machine_arrival_sum > 0) {
 		double lifetime_mean = m_whole_machines_arrived / m_whole_machine_arrival_sum;
 		dprintf(D_ALWAYS, "Lifetime mean arrival rate: %g machines / hour\n", 3600.0 * lifetime_mean);
@@ -721,7 +725,6 @@ void Defrag::poll()
 	MachineSet machines_done;
 	while( (startd_ad_ptr=startdAds.Next()) ) {
 
-		if (!startd_ad_ptr) continue;
 		ClassAd &startd_ad = *startd_ad_ptr;
 
 		std::string machine;
@@ -816,7 +819,7 @@ Defrag::drain(const ClassAd &startd_ad)
 
 	std::string request_id;
 	bool resume_on_completion = true;
-	bool rval = startd.drainJobs( m_draining_schedule, resume_on_completion, draining_check_expr.c_str(), request_id );
+	bool rval = startd.drainJobs( m_draining_schedule, resume_on_completion, draining_check_expr.c_str(), m_draining_start_expr.c_str(), request_id );
 	if( !rval ) {
 		dprintf(D_ALWAYS,"Failed to send request to drain %s: %s\n",startd.name(),startd.error());
 		m_stats.DrainFailures += 1;
@@ -854,12 +857,12 @@ Defrag::publish(ClassAd *ad)
 	char *valid_name = build_valid_daemon_name(m_defrag_name.c_str());
 	ASSERT( valid_name );
 	m_daemon_name = valid_name;
-	delete [] valid_name;
+	free(valid_name);
 
 	SetMyTypeName(*ad, "Defrag");
 	SetTargetTypeName(*ad, "");
 
-	ad->Assign(ATTR_NAME,m_daemon_name.c_str());
+	ad->Assign(ATTR_NAME,m_daemon_name);
 
 	m_stats.Tick();
 	m_stats.Publish(*ad);
@@ -882,6 +885,6 @@ Defrag::invalidatePublicAd() {
 
 	formatstr(line,"%s == \"%s\"", ATTR_NAME, m_daemon_name.c_str());
 	invalidate_ad.AssignExpr(ATTR_REQUIREMENTS, line.c_str());
-	invalidate_ad.Assign(ATTR_NAME, m_daemon_name.c_str());
+	invalidate_ad.Assign(ATTR_NAME, m_daemon_name);
 	daemonCore->sendUpdates(INVALIDATE_ADS_GENERIC, &invalidate_ad, NULL, false);
 }

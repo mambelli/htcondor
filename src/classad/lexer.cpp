@@ -26,6 +26,8 @@
 
 using namespace std;
 
+#define EMPTY -2
+
 namespace classad {
 
 // ctor
@@ -34,13 +36,14 @@ Lexer ()
 {
 	// initialize lexer state (token, etc.) variables
 	tokenType = LEX_END_OF_INPUT;
-	lexBufferCount = 0;
 	savedChar = 0;
-	ch = 0;
+	ch = EMPTY;
 	inString = false;
 	tokenConsumed = true;
 	accumulating = false;
     initialized = false;
+	oldClassAdLex = false;
+	jsonLex = false;
 
 	// debug flag
 	debug = false;
@@ -61,11 +64,10 @@ bool Lexer::
 Initialize(LexerSource *source)
 {
 	lexSource = source;
-	ch = lexSource->ReadCharacter();
+	ch = EMPTY;
 
 	// token state initialization
-	lexBuffer = ch;
-	lexBufferCount = 0;
+	lexBuffer.clear();
 	inString = false;
 	tokenConsumed = true;
 	accumulating = false;
@@ -77,10 +79,9 @@ Initialize(LexerSource *source)
 bool Lexer::
 Reinitialize(void)
 {
-	ch = lexSource->ReadCharacter();
+	ch = EMPTY;
 	// token state initialization
-	lexBuffer = ch;
-	lexBufferCount = 0;
+	lexBuffer.clear();
 	inString = false;
 	tokenConsumed = true;
 	accumulating = false;
@@ -92,6 +93,24 @@ bool Lexer::
 WasInitialized(void)
 {
     return initialized;
+}
+
+bool Lexer::
+SetOldClassAdLex( bool do_old )
+{
+	bool prev = oldClassAdLex;
+	oldClassAdLex = do_old;
+	jsonLex = false;
+	return prev;
+}
+
+bool Lexer::
+SetJsonLex( bool do_json )
+{
+	bool old = jsonLex;
+	jsonLex = do_json;
+	oldClassAdLex = false;
+	return old;
 }
 
 // FinishedParse:  This function implements the cleanup phase of a parse.
@@ -106,12 +125,21 @@ FinishedParse ()
 }
 
 
+// fetch:  Fetch the next character to be examined, if we don't have
+//   it already.
+void Lexer::
+fetch (void)
+{
+	if (ch == EMPTY) {
+		ch = lexSource->ReadCharacter();
+	}
+}
+
 // Mark:  This function is called when the beginning of a token is detected
 void Lexer::
 mark (void)
 {
-	lexBuffer = ch;
-	lexBufferCount = 0;
+	lexBuffer.clear();
 	accumulating = true;
 	return;
 }
@@ -121,28 +149,28 @@ mark (void)
 void  Lexer::
 cut (void)
 {
-	if(lexBufferCount < lexBuffer.length())
-	{
-		lexBuffer[lexBufferCount] = '\0';
-	}
 	accumulating = false;
 	return;
 }
 
 
-// Wind:  This function is called when an additional character must be read
-//        from the input source; the conceptual action is to move the cursor
+// Wind:  This function is called when we're done with the current character
+//        and want to either dispose of it or add it to the current token.
+//        By default, we also read the next character from the input source,
+//        though this can be suppressed (when the caller knows we're at the
+//        end of a token.
 void Lexer::
-wind (void)
+wind (bool fetch)
 {
-	if(ch == -1) return;
-	ch = lexSource->ReadCharacter();
-	++lexBufferCount;
-	if( ch == -1 ) return;
-	if( accumulating ) {
-		lexBuffer += ch; 
+	if(ch == EOF) return;
+	if (accumulating && ch != EMPTY) {
+		lexBuffer += ch;
 	}
-	return;
+	if (fetch) {
+		ch = lexSource->ReadCharacter();
+	} else {
+		ch = EMPTY;
+	}
 }
 
 			
@@ -174,7 +202,10 @@ PeekToken (TokenValue *lvalp)
 
 	// Set the token to unconsumed
 	tokenConsumed = false;
-	
+
+	// Fetch the next character, if we haven't already
+	fetch();
+
 	// consume white space
 	while( 1 ) {
 		if( isspace( ch ) ) {
@@ -195,7 +226,11 @@ PeekToken (TokenValue *lvalp)
 				do {
 					oldCh = ch;
 					wind( );
-				} while( oldCh != '*' || ch != '/' );
+				} while( (oldCh != '*' || ch != '/') && (ch > 0));
+				if (ch == EOF) {
+					tokenType = LEX_TOKEN_ERROR;
+					return( tokenType );
+				}
 				wind( );
 			} else {
 				// just a division operator
@@ -233,9 +268,6 @@ PeekToken (TokenValue *lvalp)
 		case LEX_CLOSE_BOX:
 		case LEX_CLOSE_PAREN:
 		case LEX_CLOSE_BRACE:
-		case LEX_BACKSLASH:
-		case LEX_ABSOLUTE_TIME_VALUE:
-		case LEX_RELATIVE_TIME_VALUE:
 			tokenizePunctOperator();
 			break;
 		default:
@@ -332,11 +364,11 @@ tokenizeNumber (void)
 			// get octal or real
 			numberType = INTEGER;
 			while( isdigit( ch ) ) {
-				wind( );
-				if( !isodigit( ch ) ) {
+				if( numberType == INTEGER && !isodigit( ch ) ) {
 					// not an octal number
 					numberType = REAL;
 				}
+				wind();
 			}
 			if( ch == '.' || tolower( ch ) == 'e' ) {
 				numberType = REAL;
@@ -398,10 +430,14 @@ tokenizeNumber (void)
 		cut( );
 		long long l;
 		int base = 0;
-		if ( _useOldClassAdSemantics ) {
-			// Old ClassAds don't support octal or hexidecimal
+		if ( _useOldClassAdSemantics || jsonLex ) {
+			// Old ClassAds and JSON don't support octal or hexidecimal
 			// representations for integers.
 			base = 10;
+			if ( lexBuffer[0] == '0' && lexBuffer.length() > 1 ) {
+				tokenType = LEX_TOKEN_ERROR;
+				return( tokenType );
+			}
 		}
 #ifdef WIN32
 		l = _strtoi64( lexBuffer.c_str(), NULL, base );
@@ -422,7 +458,10 @@ tokenizeNumber (void)
 			CLASSAD_EXCEPT("Should not reach here");
 	}
 
-	switch( toupper( ch ) ) {
+	if ( jsonLex ) {
+		f = Value::NO_FACTOR;
+	} else {
+		switch( toupper( ch ) ) {
 		case 'B': f = Value::B_FACTOR; wind( ); break;	
 		case 'K': f = Value::K_FACTOR; wind( ); break;
 		case 'M': f = Value::M_FACTOR; wind( ); break;
@@ -430,6 +469,7 @@ tokenizeNumber (void)
 		case 'T': f = Value::T_FACTOR; wind( ); break;
 		default:
 			f = Value::NO_FACTOR;
+		}
 	}
 
 	if( numberType == INTEGER ) {
@@ -455,6 +495,9 @@ tokenizeAlphaHead (void)
 	mark( );
 	while (isalpha (ch)) {
 		wind ();
+		// in Visual Studio 2017 x64 isalpha returns 258 when ch==EOF
+		// which could make this an infinite loop if we don't test for EOF explicitly here.
+		if (ch == EOF) break;
 	}
 
 	if (isdigit (ch) || ch == '_') {
@@ -462,6 +505,9 @@ tokenizeAlphaHead (void)
 		wind ();
 		while (isalnum (ch) || ch == '_') {
 			wind ();
+			// in Visual Studio 2017 x64 isalpha returns 258 when ch==EOF
+			// which could make this an infinite loop if we don't test for EOF explicitly here.
+			if (ch == EOF) break;
 		}
 		cut ();
 
@@ -479,7 +525,9 @@ tokenizeAlphaHead (void)
 	} else if (strcasecmp(lexBuffer.c_str(), "false") == 0) {
 		tokenType = LEX_BOOLEAN_VALUE;
 		yylval.SetBoolValue( false );
-	} else if (strcasecmp(lexBuffer.c_str(), "undefined") == 0) {
+	} else if (!jsonLex && strcasecmp(lexBuffer.c_str(), "undefined") == 0) {
+		tokenType = LEX_UNDEFINED_VALUE;
+	} else if (jsonLex && strcasecmp(lexBuffer.c_str(), "null") == 0) {
 		tokenType = LEX_UNDEFINED_VALUE;
 	} else if (strcasecmp(lexBuffer.c_str(), "error") == 0) {
 		tokenType = LEX_ERROR_VALUE;
@@ -505,6 +553,9 @@ tokenizeString(char delim)
 {
 	bool stringComplete = false;
 
+	if ( oldClassAdLex ) {
+		return tokenizeStringOld(delim);
+	}
 	// need to mark() after the quote
 	inString = true;
 	wind ();
@@ -532,13 +583,11 @@ tokenizeString(char delim)
 				tempch = lexSource->ReadCharacter();
 			}
 			if (tempch != delim) {  // a new token exists after the string
-                if (tempch != -1) {
-                    lexSource->UnreadCharacter();
-                }
+				ch = tempch;
 				stringComplete = true;
 			} else {    // the adjacent string is to be concatenated to the existing string
-				lexBuffer.erase(lexBufferCount--); // erase the lagging '\"'
 				wind();
+				lexBuffer.erase(lexBuffer.length() - 1); // erase the lagging '\"'
 			}
 		}
 		else {
@@ -548,9 +597,17 @@ tokenizeString(char delim)
 		}    
 	}
 	cut( );
-	wind( );	// skip over the close quote
+	if (ch == delim) {
+		wind(false);	// skip over the close quote
+	}
 	bool validStr = true; // to check if string is valid after converting escape
-	convert_escapes(lexBuffer, validStr);
+	bool quoted_expr = false; // for JSON, does string look like a quoted expression
+	if ( jsonLex ) {
+		convert_escapes_json(lexBuffer, validStr, quoted_expr);
+		yylval.SetQuotedExpr( quoted_expr );
+	} else {
+		convert_escapes(lexBuffer, validStr);
+	}
 	yylval.SetStringValue( lexBuffer.c_str( ) );
 	if (validStr) {
 		if(delim == '\"') {
@@ -567,6 +624,76 @@ tokenizeString(char delim)
 	return tokenType;
 }
 
+// Escaping is different in old ClassAd syntax.
+// Backslash isn't special unless it preceeds a quote character,
+// unless that quote character is the last character in the expression.
+int Lexer::
+tokenizeStringOld(char delim)
+{
+	bool stringComplete = false;
+
+	// need to mark() after the quote
+	inString = true;
+	wind ();
+	mark ();
+
+	while (!stringComplete) {
+		int oldCh = 0;
+		// consume the string literal; read upto " ignoring \"
+		while( ( ch > 0 ) && ( ch != delim ) ) {
+			oldCh = ch;
+			wind( );
+		}
+
+		if( ch == delim ) {
+			int tempch = ' ';
+			if ( oldCh != '\\' ) {
+				stringComplete = true;
+				continue;
+			}
+			// TODO any character after <backslash><quote> other than
+			//   newline means the quote is literal and the string
+			//   continues onwards. So you can't have trailing
+			//   whitespace after a string that ends with a backslash.
+			//   With some contortions, we can handle trailing whitespace.
+			tempch = lexSource->ReadCharacter();
+			if ( tempch > 0 && tempch != '\n' ) {
+				// more text after quote, quote is part of the string value
+				// remove backslash before quote
+				lexBuffer[lexBuffer.length()-1] = delim;
+				ch = tempch;
+			} else {
+				// string ends with a backslash
+				stringComplete = true;
+			}
+		}
+		else {
+			// loop quit due to ch == 0 or ch == EOF
+			tokenType = LEX_TOKEN_ERROR;
+			return tokenType;
+		}
+	}
+	cut( );
+	if (ch == delim) {
+		wind(false);	// skip over the close quote
+	}
+	bool validStr = true; // to check if string is valid after converting escape
+	yylval.SetStringValue( lexBuffer.c_str( ) );
+	if (validStr) {
+		if(delim == '\"') {
+			tokenType = LEX_STRING_VALUE;
+		}
+		else {
+			tokenType = LEX_IDENTIFIER;
+		}
+	}
+	else {
+		tokenType = LEX_TOKEN_ERROR; // string conatins a '\0' character inbetween
+	}
+
+	return tokenType;
+}
+
 
 // tokenizePunctOperator:  Tokenize puncutation and operators 
 int Lexer::
@@ -577,7 +704,7 @@ tokenizePunctOperator (void)
 	int extra_lookahead;
 
 	mark( );
-	wind ();
+	wind (false);
 	switch (oldch) {
 		// these cases don't need lookaheads
 		case '.':
@@ -674,33 +801,36 @@ tokenizePunctOperator (void)
 
 		case '&':
 			tokenType = LEX_BITWISE_AND;
+			fetch();
 			if (ch == '&') {
 				tokenType = LEX_LOGICAL_AND;
-				wind ();
+				wind (false);
 			}
 			break;
 
 
 		case '|':
 			tokenType = LEX_BITWISE_OR;
+			fetch();
 			if (ch == '|') {
 				tokenType = LEX_LOGICAL_OR;
-				wind ();
+				wind (false);
 			}
 			break;
 
 
 		case '<':
 			tokenType = LEX_LESS_THAN;
+			fetch();
 			switch (ch) {
 				case '=':
 					tokenType = LEX_LESS_OR_EQUAL;
-					wind ();
+					wind (false);
 					break;
 
 				case '<':
 					tokenType = LEX_LEFT_SHIFT;
-					wind ();
+					wind (false);
 					break;
 
 				default:
@@ -712,10 +842,11 @@ tokenizePunctOperator (void)
 
 		case '>':
 			tokenType = LEX_GREATER_THAN;
+			fetch();
 			switch (ch) {
 				case '=':
 					tokenType = LEX_GREATER_OR_EQUAL;
-					wind ();
+					wind (false);
 					break;
 
 				case '>':
@@ -723,7 +854,7 @@ tokenizePunctOperator (void)
 					wind ();
 					if (ch == '>') {
 						tokenType = LEX_URIGHT_SHIFT;
-						wind ();
+						wind (false);
 					}
 					break;
 				
@@ -736,10 +867,11 @@ tokenizePunctOperator (void)
 
 		case '=':
 			tokenType = LEX_BOUND_TO;
+			fetch();
 			switch (ch) {
 				case '=':
 					tokenType = LEX_EQUAL;
-					wind ();
+					wind (false);
 					break;
 
 				case '?':
@@ -753,7 +885,7 @@ tokenizePunctOperator (void)
 						return tokenType;
 					}
 
-					wind ();
+					wind (false);
 					break;
 
 				case '!':
@@ -762,7 +894,7 @@ tokenizePunctOperator (void)
 					if (extra_lookahead == '=') {
 						tokenType = LEX_META_NOT_EQUAL;
 						wind();
-						wind();
+						wind(false);
 					}
 					break;
 
@@ -775,10 +907,11 @@ tokenizePunctOperator (void)
 
 		case '!':
 			tokenType = LEX_LOGICAL_NOT;
+			fetch();
 			switch (ch) {
 				case '=':
 					tokenType = LEX_NOT_EQUAL;
-					wind ();
+					wind (false);
 					break;
 
 				default:
@@ -859,9 +992,6 @@ strLexToken (int tokenValue)
 		case LEX_CLOSE_PAREN:            return "LEX_CLOSE_PAREN";
 		case LEX_OPEN_BRACE: 			 return "LEX_OPEN_BRACE";
 		case LEX_CLOSE_BRACE: 			 return "LEX_CLOSE_BRACE";
-		case LEX_BACKSLASH:              return "LEX_BACKSLASH";
-	    case LEX_ABSOLUTE_TIME_VALUE:    return "LEX_ABSOLUTE_TIME_VALUE";
-	    case LEX_RELATIVE_TIME_VALUE:    return "LEX_RELATIVE_TIME_VALUE";
 
 		default:
 				return "** Unknown **";

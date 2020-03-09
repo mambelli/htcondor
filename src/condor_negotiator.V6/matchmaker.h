@@ -27,14 +27,12 @@
 #include "string_list.h"
 #include "dc_collector.h"
 #include "condor_ver_info.h"
+#include "matchmaker_negotiate.h"
 
 #include <vector>
 #include <string>
 #include <map>
 #include <algorithm>
-
-/* FILESQL include */
-#include "file_sql.h"
 
 typedef struct MapEntry {
 	char *remoteHost;
@@ -43,8 +41,6 @@ typedef struct MapEntry {
 } MapEntry;
 /* ODBC object extern */
 //extern ODBC *DBObj;
-/* FILESQL object extern */
-extern FILESQL *FILEObj;
 
 struct GroupEntry {
     typedef vector<int>::size_type size_type;
@@ -107,7 +103,7 @@ class Matchmaker : public Service
 		~Matchmaker();
 
 		// initialization method (registers command handlers, etc)
-		void initialize ();
+		void initialize (const char *neg_name = NULL);
 
 		// reinitialization method (reconfig)
 		int reinitialize ();	
@@ -144,8 +140,17 @@ class Matchmaker : public Service
 
 		bool getGroupInfoFromUserId(const char* user, string& groupName, float& groupQuota, float& groupUsage);
 
+		void forwardAccountingData(std::set<std::string> &names);
+		void forwardGroupAccounting(CollectorList *cl, GroupEntry *ge);
+
+		void calculateRanks(ClassAd &request, ClassAd *offer, PreemptState candidatePreemptState, double &candidateRankValue, double &candidatePreJobRankValue, double &candidatePostJobRankValue, double &candidatePreemptRankValue);
+
+		void setDryRun(bool d) {m_dryrun = d;}
+		bool getDryRun() const {return m_dryrun;}
+
     protected:
 		char * NegotiatorName;
+		bool NegotiatorNameInConfig;
 		int update_interval;
 		
 
@@ -155,15 +160,45 @@ class Matchmaker : public Service
 
 		int update_collector_tid;
 		void updateCollector();
-
-		// auxillary functions
-		bool obtainAdsFromCollector (ClassAdList&, ClassAdListDoesNotDeleteAds&, ClassAdListDoesNotDeleteAds&, ClaimIdHash& );	
-		char * compute_significant_attrs(ClassAdListDoesNotDeleteAds & startdAds);
-		bool consolidate_globaljobprio_submitter_ads(ClassAdListDoesNotDeleteAds & scheddAds);
 		
+		// auxillary functions
+		bool obtainAdsFromCollector (ClassAdList &allAds, ClassAdListDoesNotDeleteAds &startdAds, ClassAdListDoesNotDeleteAds &submitterAds, std::set<std::string> &submitterNames, ClaimIdHash &claimIds );	
+		char * compute_significant_attrs(ClassAdListDoesNotDeleteAds & startdAds);
+		bool consolidate_globaljobprio_submitter_ads(ClassAdListDoesNotDeleteAds & submitterAds);
+
+		void SetupMatchSecurity(ClassAdListDoesNotDeleteAds &submitterAds);
+
+		/**
+		 * Start the network communication necessary for a negotiation cycle.
+		 */
+		typedef classad_shared_ptr<ResourceRequestList> RRLPtr;
+		bool startNegotiateProtocol(const std::string &submitter, const ClassAd &submitterAd, ReliSock *&sock, RRLPtr &request_list);
+
+		/**
+		 * Get a resource request list for purposes of negotiation
+		 */
+		RRLPtr startNegotiate(const std::string &submitter, const ClassAd &submitterAd, ReliSock *&sock);
+		void endNegotiate(const std::string &scheddAddr);
+
+		/**
+		 * Try starting negotiations with all schedds in parallel.
+		 */
+		void prefetchResourceRequestLists(ClassAdListDoesNotDeleteAds &submitterAds);
+		typedef std::map<std::string, classad_shared_ptr<ResourceRequestList> > RRLHash;
+		RRLHash m_cachedRRLs;
+
+		struct JobRanks {
+               double PreJobRankValue;
+               double PostJobRankValue;
+               double PreemptRankValue;
+		};
+
+		typedef std::map<ClassAd *, JobRanks> RanksMapType;
+		RanksMapType ranksMap;
+
 		/** Negotiate w/ one schedd for one user, for one 'pie spin'.
             @param groupName name of group negotiating under (or NULL)
-			@param scheddName Name attribute from the submitter ad.
+			@param submitterName Name attribute from the submitter ad.
 			@param scheddAddr Sinful string of schedd for this submitter.
 			@param priority Priority of this user from the accountant.
 			@param share Priority w/o up-down (just relative prio factor).
@@ -180,7 +215,7 @@ class Matchmaker : public Service
 					MM_DONE if schedd got all the resources it wanted,
 					MM_ERROR if problem negotiating w/ this schedd.
 		**/
-		int negotiate(char const* groupName, char const *scheddName, const ClassAd *scheddAd, 
+		int negotiate(char const* groupName, char const *submitterName, const ClassAd *submitterAd,
 		   double priority,
            double submitterLimit, double submitterLimitUnclaimed,
 		   ClassAdListDoesNotDeleteAds &startdAds, ClaimIdHash &claimIds, 
@@ -191,24 +226,29 @@ class Matchmaker : public Service
 								 double untrimmedSlotWeightTotal,
 								 double minSlotWeight,
 			ClassAdListDoesNotDeleteAds& startdAds, 
-			ClaimIdHash& claimIds, ClassAdListDoesNotDeleteAds& scheddAds, 
+			ClaimIdHash& claimIds, ClassAdListDoesNotDeleteAds& submitterAds, 
 			float groupQuota=INT_MAX, const char* groupName=NULL);
 
 		
-		ClassAd *matchmakingAlgorithm(const char* scheddName, const char* scheddAddr, ClassAd& request, ClassAdListDoesNotDeleteAds& startdAds,
+		ClassAd *matchmakingAlgorithm(const char* submitterName, const char* scheddAddr, ClassAd& request, ClassAdListDoesNotDeleteAds& startdAds,
 									  double preemptPrio, 
                                       double limitUsed, double limitUsedUnclaimed,
                                       double submitterLimit, double submitterLimitUnclaimed, 
                                       double pieLeft, bool only_for_startdrank);
 		int matchmakingProtocol(ClassAd &request, ClassAd *offer, 
 						ClaimIdHash &claimIds, Sock *sock,
-						const char* scheddName, const char* scheddAddr);
-		void calculateNormalizationFactor (ClassAdListDoesNotDeleteAds &, double &, double &,
-										   double &, double &);
+						const char* submitterName, const char* scheddAddr);
+		void calculateNormalizationFactor (ClassAdListDoesNotDeleteAds &submitterAds, double &max, double &normalFactor,
+										   double &maxAbs, double &normalAbsFactor);
+
+		// Check to see if any concurrency limit is violated with the given set of limits.
+		// *Note* limits will be changed to lower-case.
+		bool rejectForConcurrencyLimits(std::string &limits);
+
 
 		/** Calculate a submitter's share of the pie.
 			@param quiet Do not emitt debug information about the calculation
-			@param scheddName Name attribute from the submitter ad.
+			@param submitterName Name attribute from the submitter ad.
 			@param groupAccountingName Group name from the submitter ad.
 			@param groupQuota Usage limit for this group.
 			@param maxPrioValue Largest prio value of any submitter.
@@ -224,7 +264,7 @@ class Matchmaker : public Service
 			@param submitterPrio User priority
 			@param submitterPrioFactor Result is this submitter's prio factor
 		**/
-		void calculateSubmitterLimit(char const *scheddName,
+		void calculateSubmitterLimit(const string &submitterName,
 		                          char const *groupAccountingName,
 		                          float groupQuota,
 					  float groupusage,
@@ -244,7 +284,7 @@ class Matchmaker : public Service
 
 		/** Calculate how much pie might be dished out in this round.
 			@param quiet Do not emitt debug information about the calculation
-			@param scheddAds List of submitters
+			@param submitterAds List of submitters
 			@param groupAccountingName Group name for all of these submitters
 			@param groupQuota Usage limit for this group.
 			@param maxPrioValue Largest prio value of any submitter.
@@ -253,7 +293,7 @@ class Matchmaker : public Service
 			@param normalAbsFactor Normalization for prio factors
 			@param pieLeft Sum of submitterLimits
 		**/
-		void calculatePieLeft( ClassAdListDoesNotDeleteAds &scheddAds,
+		void calculatePieLeft( ClassAdListDoesNotDeleteAds &submitterAds,
 		                       char const *groupAccountingName,
 		                       float groupQuota,
 				       float groupusage,
@@ -279,10 +319,14 @@ class Matchmaker : public Service
 		void insertNegotiatorMatchExprs( ClassAdListDoesNotDeleteAds &cal );
 		void reeval( ClassAd *ad );
 		void updateNegCycleEndTime(time_t startTime, ClassAd *submitter);
-		static unsigned int HashFunc(const MyString &Key);
-		friend int comparisonFunction (AttrList *, AttrList *,
+		friend int comparisonFunction (ClassAd *, ClassAd *,
 										void *);
-		bool pslotMultiMatch(ClassAd *job, ClassAd *machine);
+
+		std::vector<std::pair<ClassAd*,ClassAd*> > unmutatedSlotAds;
+		std::map<std::string, ClassAd *> m_slotNameToAdMap;
+
+		bool pslotMultiMatch(ClassAd *job, ClassAd *machine, const char* submitterName,
+			bool only_startd_rank, string &dslot_claims, PreemptState &candidatePreemptState);
 
 		/** trimStartdAds will throw out startd ads have no business being 
 			visible to the matchmaking engine, but were fetched from the 
@@ -304,7 +348,12 @@ class Matchmaker : public Service
 		/* ODBC insert functions */
 		void insert_into_rejects(char const *userName, ClassAd& job);
 		void insert_into_matches(char const *userName, ClassAd& request, ClassAd& offer);
-		
+
+			// Returns a pslot to the match list (after consumption policies have been applied).
+			// Recalculates ranks and re-sorts match list.
+			// ASSUMES NO_PREEMPTION for pslots.
+		bool returnPslotToMatchList(ClassAd &request, ClassAd *offer);
+
 
 		void RegisterAttemptedOfflineMatch( ClassAd *job_ad, ClassAd *startd_ad );
 
@@ -315,6 +364,7 @@ class Matchmaker : public Service
 		int  MaxTimePerCycle;		// how long for total negotiation cycle
 		int  MaxTimePerSubmitter;   // how long to talk to any one submitter
 		int  MaxTimePerSpin;        // How long per pie spin
+		int  MaxTimePerSchedd;		// How long to talk to any one schedd
 		ExprTree *PreemptionReq;	// only preempt if true
 		ExprTree *PreemptionRank; 	// rank preemption candidates
 		bool preemption_req_unstable;
@@ -323,6 +373,7 @@ class Matchmaker : public Service
 		ExprTree *NegotiatorPostJobRank; // rank applied after job rank
 		bool want_globaljobprio;	// cached value of config knob USE_GLOBAL_JOB_PRIOS
 		bool want_matchlist_caching;	// should we cache matches per autocluster?
+		bool PublishCrossSlotPrios; // value of knob NEGOTIATOR_CROSS_SLOT_PRIOS, default of false
 		bool ConsiderPreemption; // if false, negotiation is faster (default=true)
 		bool ConsiderEarlyPreemption; // if false, do not preempt slots that still have retirement time
 		/// Should the negotiator inform startds of matches?
@@ -334,8 +385,15 @@ class Matchmaker : public Service
                                          // constraint before calculating quotas
                                          // formerly DynQuotaMachConstraint Added for CDF.
 
+		std::string m_SubmitterConstraintStr;
+		std::string m_JobConstraintStr;
+
+		bool m_staticRanks;
+
 		StringList NegotiatorMatchExprNames;
 		StringList NegotiatorMatchExprValues;
+
+		map<string, int> ScheddsTimeInCycle;
 
 		CollectorList* Collectors;
 
@@ -375,7 +433,9 @@ class Matchmaker : public Service
 		int rejPreemptForPolicy; //   - PREEMPTION_REQUIREMENTS == False?
 		int rejPreemptForRank;	//   - startd RANKs new job lower?
 		int rejForSubmitterLimit;   //   - not enough group quota?
-        string rejectedConcurrencyLimit; // the name of concurrency limit rejected
+	std::set<std::string> rejectedConcurrencyLimits;
+	std::string lastRejectedConcurrencyString;
+		bool m_dryrun;
 
 
 		// Class used to store each individual entry in the
@@ -396,7 +456,26 @@ class Matchmaker : public Service
 			double			PostJobRankValue;
 			double			PreemptRankValue;
 			PreemptState	PreemptStateValue;
+			MyString			DslotClaims;
 			ClassAd *ad;
+		};
+
+		/** This class is just like ClassAdList, expept that it will
+		    also invoke Matchmaker::DeleteMatchList in the destructor.
+			We want this because DeleteMatchList will dereference pointers
+			to ads in this ClassAdList, so this must hapen before the
+			ads are deleted.
+		*/
+		class ClassAdList_DeleteAdsAndMatchList: public ClassAdList
+		{
+		public:
+			ClassAdList_DeleteAdsAndMatchList(Matchmaker * const p) : 
+				pMatchmaker(p) {};
+			virtual ~ClassAdList_DeleteAdsAndMatchList() {
+				pMatchmaker->DeleteMatchList();
+			};
+		private:
+			Matchmaker * const pMatchmaker;
 		};
 
 		void DeleteMatchList();
@@ -416,7 +495,17 @@ class Matchmaker : public Service
 		{
 		public:
 
-			ClassAd* pop_candidate();
+			ClassAd* pop_candidate(string &dslot_claims);
+				// Return the previously-pop'd candidate back into the list.
+				// Note that this assumes there is empty space in the front of the list
+				// Also assume list was already sorted.
+				// Returns false if there was no space (i.e., this wasn't previously pop'd).
+			bool insert_candidate(ClassAd * candidate,
+					double candidateRankValue,
+					double candidatePreJobRankValue,
+					double candidatePostJobRankValue,
+					double candidatePreemptRankValue,
+					PreemptState candidatePreemptState);
 			bool cache_still_valid(ClassAd &request,ExprTree *preemption_req,
 				ExprTree *preemption_rank,bool preemption_req_unstable, bool preemption_rank_unstable);
 			void get_diagnostics(int & rejForNetwork,
@@ -438,7 +527,8 @@ class Matchmaker : public Service
 					double candidatePreJobRankValue,
 					double candidatePostJobRankValue,
 					double candidatePreemptRankValue,
-					PreemptState candidatePreemptState);
+					PreemptState candidatePreemptState,
+					const string &candidateDslotClaims);
 			void sort();
 			int length() { return adListLen - adListHead; }
 
@@ -449,7 +539,7 @@ class Matchmaker : public Service
 
 
 		private:
-
+			
 			// AdListEntry* peek_candidate();
 			static int sort_compare(const void*, const void*);
 			AdListEntry* AdListArray;			
@@ -509,6 +599,8 @@ class Matchmaker : public Service
 
 		int prevLHF;
 
+		char *slotWeightStr;
+		
 		#define MAX_NEGOTIATION_CYCLE_STATS 100
 		class NegotiationCycleStats *negotiation_cycle_stats[MAX_NEGOTIATION_CYCLE_STATS];
 		int num_negotiation_cycle_stats;

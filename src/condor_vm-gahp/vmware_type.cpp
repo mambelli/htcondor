@@ -19,7 +19,7 @@
 
 #include "condor_common.h"
 #include "condor_config.h"
-#include "condor_string.h"
+#include "basename.h"
 #include "string_list.h"
 #include "condor_attributes.h"
 #include "condor_classad.h"
@@ -30,7 +30,6 @@
 #include "vmgahp_error_codes.h"
 #include "condor_vm_universe_types.h"
 #include "vmware_type.h"
-#include "../condor_privsep/condor_privsep.h"
 
 #define VMWARE_TMP_FILE "vmware_status.condor"
 #define VMWARE_TMP_TEMPLATE		"vmXXXXXX"
@@ -448,16 +447,16 @@ VMwareType::adjustConfigDiskPath()
 		return;
 	}
 
-	if( m_vmware_dir.IsEmpty() ) {
+	if( m_vmware_dir.empty() ) {
 		return;
 	}
 
-	MyString iwd;
+	std::string iwd;
 	if( m_classAd.LookupString(ATTR_ORIG_JOB_IWD, iwd) == 1 ) {
-		if( strcmp(iwd.Value(), m_vmware_dir.Value()) == 0 ) {
+		if( strcmp(iwd.c_str(), m_vmware_dir.c_str()) == 0 ) {
 			vmprintf(D_FULLDEBUG, "job_iwd(%s) is the same to vmware dir "
 					"so we will still use basename for parent disk of snapshot disk\n", 
-					iwd.Value());
+					iwd.c_str());
 			return;
 		}
 	}
@@ -511,13 +510,13 @@ VMwareType::adjustConfigDiskPath()
 	char *one_file = NULL;
 	snapshot_disks.rewind();
 	while( (one_file = snapshot_disks.next()) != NULL ) {
-		change_snapshot_vmdk_file(one_file, true, m_vmware_dir.Value(), parent_filenames);
+		change_snapshot_vmdk_file(one_file, true, m_vmware_dir.c_str(), parent_filenames);
 	}
 
 	// Change vmsd file
 	MyString vmsd_file(m_configfile);
 	vmsd_file.replaceString(VMWARE_TMP_CONFIG_SUFFIX, "_condor.vmsd");
-	change_snapshot_vmsd_file(vmsd_file.Value(), &parent_filenames, true, m_vmware_dir.Value());
+	change_snapshot_vmsd_file(vmsd_file.Value(), &parent_filenames, true, m_vmware_dir.c_str());
 }
 
 void
@@ -815,7 +814,7 @@ VMwareType::readVMXfile(const char *filename, const char *dirpath)
 				 && (MATCH == strcasecmp(value.Value(), FLOPPY_DEVICE)))) {
 				pos = name.FindChar('.', 0);
 				if( pos > 0 ) {
-					name.setChar(pos, '\0');
+					name.truncate(pos);
 					strip_devices.append(name.Value());
 					continue;
 				}
@@ -829,7 +828,7 @@ VMwareType::readVMXfile(const char *filename, const char *dirpath)
 			pos = name.FindChar('.', 0);
 			if (pos > 0) {
 				const char * field = name.Value()+pos+1;
-				name.setChar(pos, '\0');
+				name.truncate(pos);
 				if (MATCH == strcasecmp(field, "autodetect")) {
 					strip = (MATCH == strcasecmp(value.Value(), "true"));
 				} else if (MATCH == strcasecmp(field, "filename")) {
@@ -939,7 +938,7 @@ VMwareType::readVMXfile(const char *filename, const char *dirpath)
 				// It means to disable write cache
 				pos = tmp_name.FindChar('.', 0);
 				if( pos > 0 ) {
-					tmp_name.setChar(pos, '\0');
+					tmp_name.truncate(pos);
 					tmp_line.formatstr("%s.writeThrough = \"TRUE\"", tmp_name.Value());
 					m_configVars.append(tmp_line.Value());
 				}
@@ -1090,19 +1089,6 @@ VMwareType::Start()
 			vmprintf(D_ALWAYS, "Failed to restart with checkpointed files\n");
 			vmprintf(D_ALWAYS, "So, we will try to create a new configuration file\n");
 
-#if !defined(WIN32)
-			if (privsep_enabled()) {
-				if (!privsep_chown_dir(get_condor_uid(),
-				                       job_user_uid,
-				                       workingdir.Value()))
-				{
-					m_result_msg = VMGAHP_ERR_CRITICAL;
-					return false;
-				}
-				m_file_owner = PRIV_CONDOR;
-			}
-#endif
-
 			deleteNonTransferredFiles();
 			m_configfile = "";
 			m_restart_with_ckpt = false;
@@ -1116,19 +1102,6 @@ VMwareType::Start()
 			// Keep going..
 		}
 	}
-
-#if !defined(WIN32)
-	if (privsep_enabled()) {
-		if (!privsep_chown_dir(job_user_uid,
-		                       get_condor_uid(),
-		                       workingdir.Value()))
-		{
-			m_result_msg = VMGAHP_ERR_CRITICAL;
-			return false;
-		}
-		m_file_owner = PRIV_USER;
-	}
-#endif
 
 	if( m_need_snapshot ) {
 		if( Snapshot() == false ) {
@@ -1168,7 +1141,7 @@ VMwareType::Start()
 	}
 
 	setVMStatus(VM_RUNNING);
-	m_start_time.getTime();
+	m_start_time = time(NULL);
     //m_cpu_time = 0;
 	return true;
 }
@@ -1221,19 +1194,6 @@ bool
 VMwareType::Shutdown()
 {
 	vmprintf(D_FULLDEBUG, "Inside VMwareType::Shutdown\n");
-
-#if !defined(WIN32)
-	if (privsep_enabled()) {
-		if (!privsep_chown_dir(get_condor_uid(),
-		                       job_user_uid,
-		                       workingdir.Value()))
-		{
-			m_result_msg = VMGAHP_ERR_CRITICAL;
-			return false;
-		}
-		m_file_owner = PRIV_CONDOR;
-	}
-#endif
 
 	if( (m_scriptname.Length() == 0) ||
 			(m_configfile.Length() == 0)) {
@@ -1296,7 +1256,7 @@ VMwareType::Shutdown()
 	
 	m_vm_pid = 0;
 	setVMStatus(VM_STOPPED);
-	m_stop_time.getTime();
+	m_stop_time = time(NULL);
 	return true;
 }
 
@@ -1517,11 +1477,9 @@ VMwareType::Status()
 	// We will not execute status again.
 	// Maybe this case may happen when it took long time 
 	// to execute the last status.
-	UtcTime cur_time;
 	long diff_seconds = 0;
 
-	cur_time.getTime();
-	diff_seconds = cur_time.seconds() - m_last_status_time.seconds();
+	diff_seconds = time(NULL) - m_last_status_time;
 
 	if( (diff_seconds < 10) && !m_last_status_result.IsEmpty() ) {
 		m_result_msg = m_last_status_result;
@@ -1650,21 +1608,17 @@ VMwareType::Status()
 		}
 		m_vm_pid = vm_pid;
 
-		m_result_msg += "Running";
-		m_result_msg += " ";
+		formatstr_cat( m_result_msg, "Running %s=%d",
+		               VMGAHP_STATUS_COMMAND_PID, m_vm_pid );
 
-		m_result_msg += VMGAHP_STATUS_COMMAND_PID;
-		m_result_msg += "=";
-		m_result_msg += m_vm_pid;
 		if( cputime > 0 ) {
 			// Update vm running time
 			m_cpu_time = cputime;
 
-			m_result_msg += " ";
-			m_result_msg += VMGAHP_STATUS_COMMAND_CPUTIME;
-			m_result_msg += "=";
-			m_result_msg += m_cpu_time;
-			//m_result_msg += (double)(m_cpu_time + m_cputime_before_suspend);
+			formatstr_cat( m_result_msg, " %s=%f",
+			               VMGAHP_STATUS_COMMAND_CPUTIME,
+			               m_cpu_time );
+			//               m_cpu_time + m_cputime_before_suspend );
 		}
 
 		return true;
@@ -1691,7 +1645,7 @@ VMwareType::Status()
 		m_result_msg += "Stopped";
 		if( getVMStatus() != VM_STOPPED ) {
 			setVMStatus(VM_STOPPED);
-			m_stop_time.getTime();
+			m_stop_time = time(NULL);
 		}
 		return true;
 	}else {
@@ -1769,7 +1723,7 @@ VMwareType::CreateConfigFile()
 	// Read the directory where vmware files are on a submit machine
 	m_vmware_dir = "";
 	m_classAd.LookupString(VMPARAM_VMWARE_DIR, m_vmware_dir);
-	m_vmware_dir.trim();
+	trim(m_vmware_dir);
 
 	// Read the parameter of vmware vmx file
 	if( m_classAd.LookupString(VMPARAM_VMWARE_VMX_FILE, m_vmware_vmx) != 1 ) {
@@ -1778,11 +1732,11 @@ VMwareType::CreateConfigFile()
 		m_result_msg = VMGAHP_ERR_JOBCLASSAD_NO_VMWARE_VMX_PARAM;
 		return false;
 	}
-	m_vmware_vmx.trim();
+	trim(m_vmware_vmx);
 
 	// Read the parameter of vmware vmdks
 	if( m_classAd.LookupString(VMPARAM_VMWARE_VMDK_FILES, m_vmware_vmdk) == 1 ) {
-		m_vmware_vmdk.trim();
+		trim(m_vmware_vmdk);
 	}
 
 	if( !m_vmware_transfer ) {
@@ -1845,9 +1799,9 @@ VMwareType::CreateConfigFile()
 	// Read transferred vmx file
 	MyString ori_vmx_file;
 	ori_vmx_file.formatstr("%s%c%s",m_workingpath.Value(), 
-			DIR_DELIM_CHAR, m_vmware_vmx.Value());
+			DIR_DELIM_CHAR, m_vmware_vmx.c_str());
 
-	if( readVMXfile(ori_vmx_file.Value(), m_vmware_dir.Value()) 
+	if( readVMXfile(ori_vmx_file.Value(), m_vmware_dir.c_str()) 
 			== false ) {
 		IGNORE_RETURN unlink(tmp_config_name.Value());
 		return false;
@@ -1859,7 +1813,7 @@ VMwareType::CreateConfigFile()
 	m_configVars.append(tmp_line.Value());
 
 	// Add displyName to m_configVars
-	tmp_line.formatstr("displayName = \"%s\"", m_vm_name.Value());
+	tmp_line.formatstr("displayName = \"%s\"", m_vm_name.c_str());
 	m_configVars.append(tmp_line.Value());
 
 	// Add networking parameters to m_configVars
@@ -1892,11 +1846,11 @@ VMwareType::CreateConfigFile()
 		tmp_line.formatstr("ethernet0.connectionType = \"%s\"", 
 				networking_type.Value());
 		m_configVars.append(tmp_line.Value());
-        if (!m_vm_job_mac.IsEmpty())
+        if (!m_vm_job_mac.empty())
         {
-            vmprintf(D_FULLDEBUG, "mac address is %s\n", m_vm_job_mac.Value());
+            vmprintf(D_FULLDEBUG, "mac address is %s\n", m_vm_job_mac.c_str());
             m_configVars.append("ethernet0.addressType = \"static\"");
-            tmp_line.formatstr("ethernet0.address = \"%s\"", m_vm_job_mac.Value());
+            tmp_line.formatstr("ethernet0.address = \"%s\"", m_vm_job_mac.c_str());
             m_configVars.append(tmp_line.Value());
             //**********************************************************************
             // LIMITATION: the mac address has to be in the range
@@ -2009,7 +1963,7 @@ VMwareType::createCkptFiles()
 					!has_suffix(tmp_file, ".log") &&
 					!has_suffix(tmp_file, VMWARE_WRITELOCK_SUFFIX ) &&
 					!has_suffix(tmp_file, VMWARE_READLOCK_SUFFIX ) &&
-					strcmp(condor_basename(tmp_file), m_vmware_vmx.Value())) {
+					strcmp(condor_basename(tmp_file), m_vmware_vmx.c_str())) {
 				// We update mtime and atime of all files 
 				// except vmdk, iso, log, lock files, cdrom file, and 
 				// the original vmx file.

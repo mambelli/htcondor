@@ -29,15 +29,12 @@ double pfc_lc_rt_write_pipe = 0;
 double pfc_lc_rt_end_connection = 0;
 double pfc_lc_rt_read_data = 0;
 
-#if defined(HAVE__FTIME)
-# include <sys/timeb.h>
-#endif
-
-// can't use _condor_auto_save_runtime in this file because it pulls in
+// can't use _condor_auto_accum_runtime in this file because it pulls in
 // other things as well. 
 class _lc_auto_save_runtime
 {
 public:
+#ifdef PROFILE_PROCAPI
    double & runtime;
    double   begin;
    double   begin_step;
@@ -50,19 +47,11 @@ public:
       begin_step = now; 
       return ret; 
    }
-   double   current_time() {
-#if defined(HAVE__FTIME)
-	struct _timeb timebuffer;
-	_ftime( &timebuffer );
-	return ( timebuffer.time + (timebuffer.millitm * 0.001) );
-#elif defined(HAVE_GETTIMEOFDAY)
-	struct timeval	tv;
-	gettimeofday( &tv, NULL );
-	return ( tv.tv_sec + ( tv.tv_usec * 0.000001 ) );
 #else
-    return 0.0;
+   _lc_auto_save_runtime(double & store) {}
+   double step() { return 0; }
 #endif
-   }
+   double current_time() const { return _condor_debug_get_time_double(); }
 };
 
 
@@ -119,7 +108,13 @@ LocalClient::start_connection(void* buffer, int len)
 		}
 		DWORD error = GetLastError();
 		if (error != ERROR_PIPE_BUSY) {
-			dprintf(D_ALWAYS, "CreateFile error: %u\n", error);
+			if (error == ERROR_FILE_NOT_FOUND) {
+				dprintf(D_ALWAYS | D_BACKTRACE,
+					"Could not open pipe handle '%s'. error %u : The system cannot find the file specified.\n",
+					m_pipe_addr, error);
+			} else {
+				dprintf(D_ALWAYS, "CreateFile error: %u\n", error);
+			}
 			return false;
 		}
 		if (WaitNamedPipe(m_pipe_addr, NMPWAIT_WAIT_FOREVER) == FALSE) {

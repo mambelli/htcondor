@@ -27,15 +27,26 @@
 #include "VMRegister.h"
 #include "overflow.h"
 #include <math.h>
+#include "credmon_interface.h"
+#include "condor_auth_passwd.h"
+#include "condor_netdb.h"
+#include "token_utils.h"
+#include "data_reuse.h"
 
 #include "slot_builder.h"
 
-ResMgr::ResMgr()
+#include "strcasestr.h"
+
+ResMgr::ResMgr() :
+	extras_classad( NULL ),
+	max_job_retirement_time_override(-1),
+	m_token_requester(&ResMgr::token_request_callback, this)
 {
 	totals_classad = NULL;
 	config_classad = NULL;
 	up_tid = -1;
 	poll_tid = -1;
+	m_cred_sweep_tid = -1;
 
 	draining = false;
 	draining_is_graceful = false;
@@ -113,19 +124,19 @@ void ResMgr::Stats::Init()
 
 double ResMgr::Stats::BeginRuntime(stats_recent_counter_timer &  /*probe*/)
 {
-   return UtcTime::getTimeDouble();
+   return _condor_debug_get_time_double();
 }
 
 double ResMgr::Stats::EndRuntime(stats_recent_counter_timer & probe, double before)
 {
-   double now = UtcTime::getTimeDouble();
+   double now = _condor_debug_get_time_double();
    probe.Add(now - before);
    return now;
 }
 
 double ResMgr::Stats::BeginWalk(VoidResourceMember  /*memberfunc*/)
 {
-   return UtcTime::getTimeDouble();
+   return _condor_debug_get_time_double();
 }
 
 double ResMgr::Stats::EndWalk(VoidResourceMember memberfunc, double before)
@@ -142,10 +153,10 @@ double ResMgr::Stats::EndWalk(VoidResourceMember memberfunc, double before)
 ResMgr::~ResMgr()
 {
 	int i;
+	if( extras_classad ) delete extras_classad;
 	if( config_classad ) delete config_classad;
 	if( totals_classad ) delete totals_classad;
 	if( id_disp ) delete id_disp;
-	delete m_attr;
 
 #if HAVE_BACKFILL
 	if( m_backfill_mgr ) {
@@ -188,6 +199,7 @@ ResMgr::~ResMgr()
 	if( new_type_nums ) {
 		delete [] new_type_nums;
 	}
+	delete m_attr;
 }
 
 
@@ -245,10 +257,13 @@ ResMgr::init_config_classad( void )
 		config_classad->AssignExpr( ATTR_SLOT_WEIGHT, ATTR_CPUS );
 	}
 
-		// Next, try the IS_OWNER expression.  If it's not there, give
-		// them a resonable default, instead of leaving it undefined.
+		// First, try the IsOwner expression.  If it's not there, try
+		// what's defined in IS_OWNER (for backwards compatibility).
+		// If that's not there, give them a reasonable default.
 	if( ! configInsert(config_classad, ATTR_IS_OWNER, false) ) {
-		config_classad->AssignExpr( ATTR_IS_OWNER, "(START =?= False)" );
+		if( ! configInsert(config_classad, "IS_OWNER", ATTR_IS_OWNER, false) ) {
+			config_classad->AssignExpr( ATTR_IS_OWNER, "(START =?= False)" );
+		}
 	}
 		// Next, try the CpuBusy expression.  If it's not there, try
 		// what's defined in cpu_busy (for backwards compatibility).
@@ -264,10 +279,6 @@ ResMgr::init_config_classad( void )
 	// Publish all DaemonCore-specific attributes, which also handles
 	// STARTD_ATTRS for us.
 	daemonCore->publish(config_classad);
-
-#if defined(ADD_TARGET_SCOPING)
-	config_classad->AddTargetRefs( TargetJobAttrs, false );
-#endif
 }
 
 
@@ -438,13 +449,7 @@ ResMgr::init_resources( void )
 
 		// These things can only be set once, at startup, so they
 		// don't need to be in build_cpu_attrs() at all.
-	if (param_boolean("ALLOW_VM_CRUFT", false)) {
-		max_types = param_integer("MAX_SLOT_TYPES",
-								  param_integer("MAX_VIRTUAL_MACHINE_TYPES",
-												10));
-	} else {
-		max_types = param_integer("MAX_SLOT_TYPES", 10);
-	}
+	max_types = param_integer("MAX_SLOT_TYPES", 10);
 
 	max_types += 1;
 
@@ -457,7 +462,7 @@ ResMgr::init_resources( void )
 		// string lists for each type definition.  This only happens
 		// once!  If you change the type definitions, you must restart
 		// the startd, or else too much weirdness is possible.
-	SlotType::init_types(max_types);
+	SlotType::init_types(max_types, true);
 	initTypes( max_types, type_strings, 1 );
 
 		// First, see how many slots of each type are specified.
@@ -466,7 +471,7 @@ ResMgr::init_resources( void )
 	if( ! num_res ) {
 			// We're not configured to advertise any nodes.
 		resources = NULL;
-		id_disp = new IdDispenser( num_cpus(), 1 );
+		id_disp = new IdDispenser( 1 );
 		return;
 	}
 
@@ -485,7 +490,7 @@ ResMgr::init_resources( void )
 	}
 
 		// We can now seed our IdDispenser with the right slot id.
-	id_disp = new IdDispenser( num_cpus(), i+1 );
+	id_disp = new IdDispenser( i+1 );
 
 		// Finally, we can free up the space of the new_cpu_attrs
 		// array itself, now that all the objects it was holding that
@@ -502,6 +507,15 @@ ResMgr::init_resources( void )
 	m_hook_mgr = new StartdHookMgr;
 	m_hook_mgr->initialize();
 #endif
+
+	std::string reuse_dir;
+	if (param(reuse_dir, "DATA_REUSE_DIRECTORY")) {
+		if (!m_reuse_dir.get() || (m_reuse_dir->GetDirectory() != reuse_dir)) {
+			m_reuse_dir.reset(new htcondor::DataReuseDirectory(reuse_dir, true));
+		}
+	} else {
+		m_reuse_dir.reset();
+	}
 }
 
 
@@ -546,6 +560,8 @@ ResMgr::reconfig_resources( void )
 
 		// See if any new types were defined.  Don't except if there's
 		// any errors, just dprintf().
+	ASSERT(max_types > 0);
+	SlotType::init_types(max_types, false);
 	initTypes( max_types, type_strings, 0 );
 
 		// First, see how many slots of each type are specified.
@@ -580,6 +596,7 @@ ResMgr::reconfig_resources( void )
 	ASSERT( sorted_resources != NULL );
 	for( i=0; i<max_types; i++ ) {
 		sorted_resources[i] = new Resource* [max_num];
+		ASSERT(sorted_resources[i] != NULL);
 		memset( sorted_resources[i], 0, (max_num*sizeof(Resource*)) );
 	}
 
@@ -655,6 +672,16 @@ ResMgr::reconfig_resources( void )
 					  "State change: resource no longer needed by configuration\n" );
 		rip->set_destination_state( delete_state );
 	}
+
+	std::string reuse_dir;
+	if (param(reuse_dir, "DATA_REUSE_DIRECTORY")) {
+		if (!m_reuse_dir.get() || (m_reuse_dir->GetDirectory() != reuse_dir)) {
+			m_reuse_dir.reset(new htcondor::DataReuseDirectory(reuse_dir, true));
+		}
+	} else {
+		m_reuse_dir.reset();
+	}
+
 
 		// Finally, call our helper, so that if all the slots we need to
 		// get rid of are gone by now, we'll allocate the new ones.
@@ -736,8 +763,15 @@ ResMgr::adlist_register( StartdNamedClassAd *ad )
 	return extra_ads.Register( ad );
 }
 
+StartdNamedClassAd *
+ResMgr::adlist_find( const char * name )
+{
+	NamedClassAd * nad = extra_ads.Find(name);
+	return dynamic_cast<StartdNamedClassAd*>(nad);
+}
+
 int
-ResMgr::adlist_replace( const char *name, const char *prefix, ClassAd *newAd, bool report_diff )
+ResMgr::adlist_replace( const char *name, ClassAd *newAd, bool report_diff, const char *prefix )
 {
 	if( report_diff ) {
 		StringList ignore_list;
@@ -751,21 +785,16 @@ ResMgr::adlist_replace( const char *name, const char *prefix, ClassAd *newAd, bo
 	}
 }
 
-int
-ResMgr::adlist_delete( const char *name )
-{
-	return extra_ads.Delete( name );
-}
 
 int
-ResMgr::adlist_publish( unsigned r_id, ClassAd *resAd, amask_t mask )
+ResMgr::adlist_publish( unsigned r_id, ClassAd *resAd, amask_t mask, const char * r_id_str )
 {
 	// Check the mask
 	if (  ( mask & ( A_PUBLIC | A_UPDATE ) ) != ( A_PUBLIC | A_UPDATE )  ) {
 		return 0;
 	}
 
-	return extra_ads.Publish( resAd, r_id );
+	return extra_ads.Publish( resAd, r_id, r_id_str );
 }
 
 
@@ -878,7 +907,7 @@ ResMgr::findRipForNewCOD( ClassAd* ad )
 	if( ! resources ) {
 		return NULL;
 	}
-	int requirements;
+	bool requirements;
 	int i;
 
 		/*
@@ -899,9 +928,9 @@ ResMgr::findRipForNewCOD( ClassAd* ad )
 
 		// find the first one that matches our requirements
 	for( i = 0; i < nresources; i++ ) {
-		if( ad->EvalBool( ATTR_REQUIREMENTS, resources[i]->r_classad,
+		if( EvalBool( ATTR_REQUIREMENTS, ad, resources[i]->r_classad,
 						  requirements ) == 0 ) {
-			requirements = 0;
+			requirements = false;
 		}
 		if( requirements ) {
 			return resources[i];
@@ -923,24 +952,13 @@ ResMgr::get_by_cur_id(const char* id )
 		if( resources[i]->r_cur->idMatches(id) ) {
 			return resources[i];
 		}
-        if (resources[i]->r_has_cp) {
-            for (Resource::claims_t::iterator j(resources[i]->r_claims.begin());  j != resources[i]->r_claims.end();  ++j) {
-                if ((*j)->idMatches(id)) {
-                    delete resources[i]->r_cur;
-                    resources[i]->r_cur = *j;
-                    resources[i]->r_claims.erase(*j);
-                    resources[i]->r_claims.insert(new Claim(resources[i]));
-                    return resources[i];
-                }
-            }
-        }
 	}
 	return NULL;
 }
 
 
 Resource*
-ResMgr::get_by_any_id(const char* id )
+ResMgr::get_by_any_id(const char* id, bool move_cp_claim )
 {
 	if( ! resources ) {
 		return NULL;
@@ -958,17 +976,19 @@ ResMgr::get_by_any_id(const char* id )
 			resources[i]->r_pre_pre->idMatches(id) ) {
 			return resources[i];
 		}
-        if (resources[i]->r_has_cp) {
-            for (Resource::claims_t::iterator j(resources[i]->r_claims.begin());  j != resources[i]->r_claims.end();  ++j) {
-                if ((*j)->idMatches(id)) {
-                    delete resources[i]->r_cur;
-                    resources[i]->r_cur = *j;
-                    resources[i]->r_claims.erase(*j);
-                    resources[i]->r_claims.insert(new Claim(resources[i]));
-                    return resources[i];
-                }
-            }
-        }
+		if (resources[i]->r_has_cp) {
+			for (Resource::claims_t::iterator j(resources[i]->r_claims.begin());  j != resources[i]->r_claims.end();  ++j) {
+				if ((*j)->idMatches(id)) {
+					if ( move_cp_claim ) {
+						delete resources[i]->r_cur;
+						resources[i]->r_cur = *j;
+						resources[i]->r_claims.erase(*j);
+						resources[i]->r_claims.insert(new Claim(resources[i]));
+					}
+					return resources[i];
+				}
+			}
+		}
 	}
 	return NULL;
 }
@@ -1058,10 +1078,34 @@ int
 ResMgr::send_update( int cmd, ClassAd* public_ad, ClassAd* private_ad,
 					 bool nonblock )
 {
+	static bool first_time = true;
+
 		// Increment the resmgr's count of updates.
 	num_updates++;
-		// Actually do the updates, and return the # of updates sent.
-	return daemonCore->sendUpdates(cmd, public_ad, private_ad, nonblock);
+
+	int res = daemonCore->sendUpdates(cmd, public_ad, private_ad, nonblock, &m_token_requester,
+		DCTokenRequester::default_identity, "ADVERTISE_STARTD");
+
+	if (first_time) {
+		first_time = false;
+		dprintf( D_ALWAYS, "Initial update sent to collector(s)\n");
+		if ( ! param_boolean("STARTD_SEND_READY_AFTER_FIRST_UPDATE", true)) return res;
+
+		// send a DC_SET_READY message to the master to indicate the STARTD is ready to go
+		MyString master_sinful(daemonCore->InfoCommandSinfulString(-2));
+		if ( ! master_sinful.empty()) {
+			dprintf( D_ALWAYS, "Sending DC_SET_READY message to master %s\n", master_sinful.c_str());
+			ClassAd readyAd;
+			readyAd.Assign("DaemonPID", getpid());
+			readyAd.Assign("DaemonName", "STARTD"); // fix to use the environment
+			readyAd.Assign("DaemonState", "Ready");
+			classy_counted_ptr<Daemon> dmn = new Daemon(DT_ANY,master_sinful.c_str());
+			classy_counted_ptr<ClassAdMsg> msg = new ClassAdMsg(DC_SET_READY, readyAd);
+			dmn->sendMsg(msg.get());
+		}
+	}
+
+	return res;
 }
 
 
@@ -1236,22 +1280,117 @@ ResMgr::publish( ClassAd* cp, amask_t how_much )
 {
 	if( IS_UPDATE(how_much) && IS_PUBLIC(how_much) ) {
 		cp->Assign(ATTR_TOTAL_SLOTS, numSlots());
-		if (param_boolean("ALLOW_VM_CRUFT", false)) {
-			cp->Assign(ATTR_TOTAL_VIRTUAL_MACHINES, numSlots());
-		}
+	}
+	if (IS_PUBLIC(how_much) && m_reuse_dir) {
+		m_reuse_dir->Publish(*cp);
 	}
 
 	starter_mgr.publish( cp, how_much );
 	m_vmuniverse_mgr.publish(cp, how_much);
-	startd_stats.pool.Publish(*cp, 0);
+	startd_stats.Publish(*cp, 0);
 	startd_stats.Tick(time(0));
 
 #if HAVE_HIBERNATION
     m_hibernation_manager->publish( *cp );
 #endif
 
+	if( extras_classad ) { cp->Update( * extras_classad ); }
 }
 
+
+void
+ResMgr::updateExtrasClassAd( ClassAd * cap ) {
+	// It turns out to be colossal pain to use the ClassAd for persistence.
+	static classad::References offlineUniverses;
+
+	if( ! cap ) { return; }
+	if( ! extras_classad ) { extras_classad = new ClassAd(); }
+
+	int topping = 0;
+	int obsolete_univ = false;
+
+	//
+	// The startd maintains the set offline universes, and the offline
+	// universe timestamps.
+	//
+	// We start with the current set of offline universes, and add or remove
+	// universes as directed by the update ad.  This obviates the need for
+	// the need for the starter to know anything about the state of the rest
+	// of the machine.
+	//
+
+	ExprTree * expr = NULL;
+	const char * attr = NULL;
+	for ( auto itr = cap->begin(); itr != cap->end(); itr++ ) {
+		attr = itr->first.c_str();
+		expr = itr->second;
+		//
+		// Copy the whole ad over, excepting special or computed attributes.
+		//
+		if( strcasecmp( attr, "MyType" ) == 0 ) { continue; }
+		if( strcasecmp( attr, "TargetType" ) == 0 ) { continue; }
+		if( strcasecmp( attr, "OfflineUniverses" ) == 0 ) { continue; }
+		if( strcasestr( attr, "OfflineReason" ) != NULL ) { continue; }
+		if( strcasestr( attr, "OfflineTime" ) != NULL ) { continue; }
+
+		ExprTree * copy = expr->Copy();
+		extras_classad->Insert( attr, copy );
+
+		//
+		// Adjust OfflineUniverses based on the Has<Universe> attributes.
+		//
+		const char * uo = strcasestr( attr, "Has" );
+		if( uo != attr ) { continue; }
+
+		std::string universeName( attr + 3 );
+		int univ = CondorUniverseInfo( universeName.c_str(), &topping, &obsolete_univ );
+		if( univ == 0 || obsolete_univ) {
+			continue;
+		}
+
+		// convert universe name to canonical form
+		universeName = CondorUniverseOrToppingName(univ, topping);
+
+		std::string reasonTime = universeName + "OfflineTime";
+		std::string reasonName = universeName + "OfflineReason";
+
+		bool universeOnline = false;
+		ASSERT( cap->LookupBool( attr, universeOnline ) );
+		if( ! universeOnline ) {
+			offlineUniverses.insert( universeName );
+			extras_classad->Assign( reasonTime, time( NULL ) );
+
+			std::string reason = "[unknown reason]";
+			cap->LookupString( reasonName, reason );
+			extras_classad->Assign( reasonName, reason );
+		} else {
+			// The universe is online, so it can't have an offline reason
+			// or a time that it entered the offline state.
+			offlineUniverses.erase( universeName );
+			extras_classad->AssignExpr( reasonTime, "undefined" );
+			extras_classad->AssignExpr( reasonName, "undefined" );
+		}
+	}
+
+	//
+	// Construct the OfflineUniverses attribute and set it in extras_classad.
+	//
+	std::string ouListString;
+	ouListString.reserve(10 + offlineUniverses.size()*20);
+	ouListString = "{";
+	classad::References::const_iterator i = offlineUniverses.begin();
+	for( ; i != offlineUniverses.end(); ++i ) {
+		int univ = CondorUniverseInfo( i->c_str(), &topping, &obsolete_univ );
+		if ( ! univ || obsolete_univ) { continue; }
+
+		if (ouListString.size() > 1) { ouListString += ", "; }
+		formatstr_cat(ouListString, "\"%s\"", i->c_str() );
+		if ( ! topping) { formatstr_cat(ouListString, ",%d", univ ); }
+	}
+	ouListString += "}";
+	dprintf( D_ALWAYS, "OfflineUniverses = %s\n", ouListString.c_str() );
+	extras_classad->AssignExpr( "OfflineUniverses", ouListString.c_str() );
+}
 
 void
 ResMgr::publishSlotAttrs( ClassAd* cap )
@@ -1363,6 +1502,34 @@ ResMgr::check_polling( void )
 }
 
 
+void
+ResMgr::sweep_timer_handler( void )
+{
+	dprintf(D_FULLDEBUG, "STARTD: calling and resetting sweep_timer_handler()\n");
+	auto_free_ptr cred_dir(param("SEC_CREDENTIAL_DIRECTORY_KRB"));
+	credmon_sweep_creds(cred_dir, credmon_type_KRB);
+	int sec_cred_sweep_interval = param_integer("SEC_CREDENTIAL_SWEEP_INTERVAL", 30);
+	daemonCore->Reset_Timer (m_cred_sweep_tid, sec_cred_sweep_interval, sec_cred_sweep_interval);
+}
+
+int
+ResMgr::start_sweep_timer( void )
+{
+	// only sweep if we have a cred dir
+	auto_free_ptr p(param("SEC_CREDENTIAL_DIRECTORY_KRB"));
+	if(!p) {
+		return TRUE;
+	}
+
+	dprintf(D_FULLDEBUG, "STARTD: setting start_sweep_timer()\n");
+	int sec_cred_sweep_interval = param_integer("SEC_CREDENTIAL_SWEEP_INTERVAL", 30);
+	m_cred_sweep_tid = daemonCore->Register_Timer( sec_cred_sweep_interval, sec_cred_sweep_interval,
+							(TimerHandlercpp)&ResMgr::sweep_timer_handler,
+							"sweep_timer_handler", this );
+	return TRUE;
+}
+
+
 int
 ResMgr::start_update_timer( void )
 {
@@ -1444,10 +1611,22 @@ ResMgr::reset_timers( void )
 								 update_interval );
 	}
 
+	int sec_cred_sweep_interval = param_integer("SEC_CREDENTIAL_SWEEP_INTERVAL", 30);
+	if( m_cred_sweep_tid != -1 ) {
+		daemonCore->Reset_Timer( m_cred_sweep_tid, sec_cred_sweep_interval,
+								 sec_cred_sweep_interval );
+	}
+
 #if HAVE_HIBERNATION
 	resetHibernateTimer();
 #endif /* HAVE_HIBERNATE */
 
+		// Clear out any pending token requests.
+	m_token_client_id = "";
+	m_token_request_id = "";
+
+		// This is a borrowed reference; do not delete.
+	m_token_daemon = nullptr;
 }
 
 
@@ -1457,14 +1636,14 @@ ResMgr::addResource( Resource *rip )
 	Resource** new_resources = NULL;
 
 	if( !rip ) {
-		EXCEPT("Error: attempt to add a NULL resource\n");
+		EXCEPT("Error: attempt to add a NULL resource");
 	}
 
 	calculateAffinityMask(rip);
 
 	new_resources = new Resource*[nresources + 1];
 	if( !new_resources ) {
-		EXCEPT("Failed to allocate memory for new resource\n");
+		EXCEPT("Failed to allocate memory for new resource");
 	}
 
 		// Copy over the old Resource pointers.  If nresources is 0
@@ -1484,7 +1663,7 @@ ResMgr::addResource( Resource *rip )
 	nresources++;
 
 	// if this newly added slot is part of a pair, fixup the pair pointers
-	dprintf(D_ALWAYS, "Setting up slot pairings\n");
+	dprintf(D_FULLDEBUG, "Setting up slot pairings\n");
 	if (rip->r_pair_name && rip->r_pair_name[0] == '#') {
 		int slot_type = atoi(rip->r_pair_name+1);
 		dprintf(D_ALWAYS, "\t searching for type %d to pair with %s (%s)\n", slot_type, rip->r_id_str, rip->r_pair_name);
@@ -1493,8 +1672,8 @@ ResMgr::addResource( Resource *rip )
 			if (ripT->type() == slot_type) {
 				if ( ! ripT->r_pair_name || ripT->r_pair_name[0] == '#') {
 					// ok pair these two.
-					if (rip->r_pair_name) free(rip->r_pair_name); rip->r_pair_name = NULL;
-					if (ripT->r_pair_name) free(ripT->r_pair_name); ripT->r_pair_name = NULL;
+					free(rip->r_pair_name);
+					free(ripT->r_pair_name);
 					rip->r_pair_name = strdup(ripT->r_name);
 					ripT->r_pair_name = strdup(rip->r_name);
 					break;
@@ -1515,6 +1694,7 @@ ResMgr::addResource( Resource *rip )
 }
 
 
+//PRAGMA_REMIND("tj: re-write this silly function so that it doesn't allocate a new resources array just to remove a resource...")
 bool
 ResMgr::removeResource( Resource* rip )
 {
@@ -1527,6 +1707,7 @@ ResMgr::removeResource( Resource* rip )
 			// deleted, so we'll need to make a new resources array
 			// without this resource.
 		new_resources = new Resource* [ nresources - 1 ];
+		ASSERT(new_resources != NULL);
 		j = 0;
 		for( i = 0; i < nresources; i++ ) {
 			if( resources[i] != rip ) {
@@ -1647,6 +1828,26 @@ ResMgr::deleteResource( Resource* rip )
 	}
 }
 
+// return the count of claims on this machine associated with this user
+// used to decide when to delete credentials
+int ResMgr::claims_for_this_user(const char * user)
+{
+	if ( ! user || ! user[0]) {
+		return 0;
+	}
+	int num_matches = 0;
+
+	for (int ii = 0; ii < nresources; ++ii) {
+		Resource * res = resources[ii];
+		if (res && res->r_cur && res->r_cur->client() && res->r_cur->client()->user()) {
+			if (MATCH == strcmp(res->r_cur->client()->user(), user)) {
+				num_matches += 1;
+			}
+		}
+	}
+	return num_matches;
+}
+
 
 void
 ResMgr::makeAdList( ClassAdList *list, ClassAd *  /*pqueryAd =NULL*/ )
@@ -1725,7 +1926,7 @@ void ResMgr::updateHibernateConfiguration() {
 
 
 int
-ResMgr::allHibernating( MyString &target ) const
+ResMgr::allHibernating( std::string &target ) const
 {
     	// fail if there is no resource or if we are
 		// configured not to hibernate
@@ -1740,7 +1941,7 @@ ResMgr::allHibernating( MyString &target ) const
 		// We take largest value as the representative
 		// hibernation level for this machine
 	target = "";
-	MyString str;
+	std::string str;
 	int level = 0;
 	bool activity = false;
 	for( int i = 0; i < nresources; i++ ) {
@@ -1751,11 +1952,11 @@ ResMgr::allHibernating( MyString &target ) const
 		}
 
 		int tmp = m_hibernation_manager->stringToSleepState (
-			str.Value () );
+			str.c_str () );
 
 		dprintf ( D_FULLDEBUG,
 			"allHibernating: resource #%d: '%s' (0x%x)\n",
-			i + 1, str.Value (), tmp );
+			i + 1, str.c_str (), tmp );
 
 		if ( 0 == tmp ) {
 			activity = true;
@@ -1782,7 +1983,7 @@ ResMgr::checkHibernate( void )
 
 		// If all resources have gone unused for some time
 		// then put the machine to sleep
-	MyString	target;
+	std::string target;
 	int level = allHibernating( target );
 	if( level > 0 ) {
 
@@ -1894,7 +2095,7 @@ ResMgr::cancelHibernateTimer( void )
 
 
 int
-ResMgr::disableResources( const MyString &state_str )
+ResMgr::disableResources( const std::string &state_str )
 {
 
 	dprintf (
@@ -1905,7 +2106,7 @@ ResMgr::disableResources( const MyString &state_str )
 
 	/* set the sleep state so the plugin will pickup on the
 	fact that we are sleeping */
-	m_hibernation_manager->setTargetState ( state_str.Value() );
+	m_hibernation_manager->setTargetState ( state_str.c_str() );
 
 	/* update the CM */
 	bool ok = true;
@@ -1930,7 +2131,7 @@ ResMgr::disableResources( const MyString &state_str )
 		   machine so we don't allow new jobs to start while we are in
 		   the middle of hibernating.  We disable _after_ sending our
 		   update_with_ack(), because we want our machine to still be
-		   matchable while offline.  The negotiator knows to treat this
+		   matchable while broken.  The negotiator knows to treat this
 		   state specially. */
 		for ( i = 0; i < nresources; ++i ) {
 			resources[i]->disable();
@@ -2114,9 +2315,13 @@ ResMgr::FillExecuteDirsList( class StringList *list )
 	}
 }
 
+ExprTree * globalDrainingStartExpr = NULL;
+
 bool
-ResMgr::startDraining(int how_fast,bool resume_on_completion,ExprTree *check_expr,std::string &new_request_id,std::string &error_msg,int &error_code)
+ResMgr::startDraining(int how_fast,bool resume_on_completion,ExprTree *check_expr,ExprTree *start_expr,std::string &new_request_id,std::string &error_msg,int &error_code)
 {
+	// For now, let's assume that that you never want to change the start
+	// expression while draining.
 	if( draining ) {
 		new_request_id = "";
 		error_msg = "Draining already in progress.";
@@ -2178,6 +2383,13 @@ ResMgr::startDraining(int how_fast,bool resume_on_completion,ExprTree *check_exp
 			// they will finish within their retirement time, so do
 			// not call setBadputCausedByDraining() yet
 
+		// Even if we could pass start_expr through walk(), it turns out,
+		// beceause ResState::enter_action() calls unavail() as well, we
+		// really do need to keep the global.  To that end, we /want/ to
+		// assign the NULL value here if that's what we got, so that we
+		// do the right thing if we drain without a START expression after
+		// draining with one.
+		globalDrainingStartExpr = start_expr ? start_expr->Copy() : NULL;
 		walk(&Resource::releaseAllClaimsReversibly);
 	}
 	else if( how_fast <= DRAIN_QUICK ) {
@@ -2247,9 +2459,18 @@ ResMgr::gracefulDrainingTimeRemaining(Resource * /*rip*/)
 
 	int longest_retirement_remaining = 0;
 	for( int i = 0; i < nresources; i++ ) {
-		int retirement_remaining = resources[i]->evalRetirementRemaining();
-		if( retirement_remaining > longest_retirement_remaining ) {
-			longest_retirement_remaining = retirement_remaining;
+		// The max job retirement time of jobs accepted while draining is
+		// implicitly zero.  Otherwise, we'd need to record the result of
+		// this computation at the instant we entered draining state and
+		// set a timer to vacate all slots at that point.  This would
+		// probably be more efficient, but would be a small semantic change,
+		// because jobs would no longer be able to voluntarily reduce their
+		// max job retirement time after retirement began.
+		if(! resources[i]->wasAcceptedWhileDraining()) {
+			int retirement_remaining = resources[i]->evalRetirementRemaining();
+			if( retirement_remaining > longest_retirement_remaining ) {
+				longest_retirement_remaining = retirement_remaining;
+			}
 		}
 	}
 	return longest_retirement_remaining;
@@ -2411,4 +2632,57 @@ void
 ResMgr::addToDrainingBadput( int badput )
 {
 	total_draining_badput += badput;
+}
+
+void
+ResMgr::adlist_reset_monitors( unsigned r_id, ClassAd * forWhom ) {
+	extra_ads.reset_monitors( r_id, forWhom );
+}
+
+void
+ResMgr::adlist_unset_monitors( unsigned r_id, ClassAd * forWhom ) {
+	extra_ads.unset_monitors( r_id, forWhom );
+}
+
+void
+ResMgr::checkForDrainCompletion() {
+	if( ! resources ) { return; }
+
+	bool allAcceptedWhileDraining = true;
+	for( int i = 0; i < nresources; ++i ) {
+		if(! resources[i]->wasAcceptedWhileDraining()) {
+			// Not sure how COD and draining are supposed to interact, but
+			// the partitionable slot is never accepted-while-draining,
+			// nor claimed, nor should it block drain from completing.
+			if(! resources[i]->hasAnyClaim()) { continue; }
+			allAcceptedWhileDraining = false;
+		}
+	}
+	if(! allAcceptedWhileDraining) { return; }
+
+	dprintf( D_ALWAYS, "Initiating final draining (all original jobs complete).\n" );
+	// This (auto-reversibly) sets START to false when we release all claims.
+	globalDrainingStartExpr = NULL;
+	// Invalidate all claim IDs.  This prevents the schedd from claiming
+	// resources that were negotiated before draining finished.
+	walk( &Resource::invalidateAllClaimIDs );
+	// Set MAXJOBRETIREMENTTIME to 0.  This will be reset in ResState::eval()
+	// when draining completes.
+	this->max_job_retirement_time_override = 0;
+	walk( & Resource::refresh_classad, A_PUBLIC );
+	// Initiate final draining.
+	walk( & Resource::releaseAllClaimsReversibly );
+}
+
+
+void
+ResMgr::token_request_callback(bool success, void *miscdata)
+{
+	auto self = reinterpret_cast<ResMgr *>(miscdata);
+		// In the successful case, instantly re-fire the timer
+		// that will send an update to the collector.
+	if (success && (self->up_tid != -1)) {
+		daemonCore->Reset_Timer( self->up_tid, update_offset,
+			update_interval );
+	}
 }

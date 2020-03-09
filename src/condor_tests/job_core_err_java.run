@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -18,6 +19,10 @@
 ##
 ##**************************************************************
 
+# CondorTest::JavaTimeout() requires Check::CondorLog, but is only
+# called from CondorTest::JavaInitialize() is the test times out,
+# so we don't see this failure on successful platforms.
+use Check::CondorLog;
 use CondorTest;
 
 $cmd = 'job_core_err_java.cmd';

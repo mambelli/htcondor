@@ -1,4 +1,5 @@
 #! /usr/bin/env perl
+#testreq: personal
 ##**************************************************************
 ##
 ## Copyright (C) 1990-2007, Condor Team, Computer Sciences Department,
@@ -49,7 +50,7 @@ $abnormal = sub
 
 $failure = sub 
 {
-	CondorTest::debug("DAG failed as it should\n");
+	CondorTest::debug("DAG failed as expected\n");
 	CondorTest::debug("Verifying output\n");
 	$diditpass = 1;
 

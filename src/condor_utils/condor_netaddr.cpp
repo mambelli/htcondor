@@ -2,23 +2,23 @@
 #include "condor_netaddr.h"
 #include "internet.h"
 
-condor_netaddr::condor_netaddr() : maskbit_((unsigned int)-1) {
+condor_netaddr::condor_netaddr() : maskbit_((unsigned int)-1), matchesEverything( false ) {
 }
 
 condor_netaddr::condor_netaddr(const condor_sockaddr& base,
 		unsigned int maskbit)
-: base_(base), maskbit_(maskbit) {
+: base_(base), maskbit_(maskbit), matchesEverything( false ) {
 }
 
 bool condor_netaddr::match(const condor_sockaddr& target) const {
+	if( matchesEverything ) { return true; }
+
+	// An unitialized network matches nothing.
 	if (maskbit_ == (unsigned int)-1) {
-		return false; // uninitialized
+		return false;
 	}
 
-	// check if address type is same
-	//
-	// what is correct policy for matching between IPv4 address and
-	// IPv4-mapped-IPv6 address?
+	// An address of the wrong type can't match.
 	if (base_.get_aftype() != target.get_aftype()) {
 		return false;
 	}
@@ -78,6 +78,11 @@ static int convert_maskaddr_to_maskbit(uint32_t mask_value) {
 }
 
 bool condor_netaddr::from_net_string(const char* net) {
+	if( strcmp( net, "*" ) == 0 || strcmp( net, "*/*" ) == 0 ) {
+		matchesEverything = true;
+		return true;
+	}
+
 	const char* slash = strchr(net, '/');
 	const char* net_end = net + strlen(net);
 	if (slash) {
@@ -108,25 +113,73 @@ bool condor_netaddr::from_net_string(const char* net) {
 				// convert to mask bit
 				const uint32_t* maskaddr_array = maskaddr.get_address();
 				maskbit_ = convert_maskaddr_to_maskbit(*maskaddr_array);
-				if (maskbit_ == (unsigned int)-1)
+				if (maskbit_ == (unsigned int)-1) {
 					return false;
+				}
+			} else {
+				return false;
 			}
 		}
 	} else {
-		// if there is no slash ('/'), it should be IPv4 and
-		// wildcard format
-		//
-		// e.g. 128.105.*
+		const char * colon = strchr( net, ':' );
+		if( colon == NULL ) {
+			// IPv4 literal or asterisk.
 
-		in_addr base;
-		in_addr mask;
-		if (!is_ipv4_addr_implementation(net, &base, &mask, 1))
-			return false;
+			in_addr base;
+			in_addr mask;
+			if( ! is_ipv4_addr_implementation( net, &base, &mask, 1 ) ) {
+				return false;
+			}
 
-		base_ = condor_sockaddr(base, 0);
-		maskbit_ = convert_maskaddr_to_maskbit(*(uint32_t*)&mask);
-		if (maskbit_ == (unsigned)-1)
-			return false;
+			base_ = condor_sockaddr(base, 0);
+			maskbit_ = convert_maskaddr_to_maskbit(*(uint32_t*)&mask);
+			if( maskbit_ == (unsigned)-1 ) {
+				return false;
+			}
+		} else {
+			// IPv6 literal or asterisk.
+			const char * asterisk = strchr( net, '*' );
+			if( asterisk == NULL ) {
+				if ( base_.from_ip_string( net ) ) {
+					maskbit_ = 128;
+					return true;
+				} else {
+					return false;
+				}
+			} else {
+				//
+				// Like IPv4, require that the asterisk be on a boundary.
+				// That way, we don't need to guess at how many zeroes the
+				// administrator actually wanted.
+				//
+				const char * rcolon = strrchr( net, ':' );
+				if( asterisk - rcolon != 1 ) {
+					return false;
+				}
+
+				char * safenet = strdup( net );
+				assert( safenet != NULL );
+				char * safeasterisk = strchr( safenet, '*' );
+				assert( safeasterisk != NULL );
+				* safeasterisk = ':';
+
+				struct in6_addr in6a;
+				int rv = inet_pton( AF_INET6, safenet, & in6a );
+				free( safenet );
+				if( rv == 1 ) {
+					base_ = condor_sockaddr( in6a );
+				} else {
+					return false;
+				}
+
+				maskbit_ = 0;
+				for( const char * ptr = net; * ptr != '\0'; ++ptr ) {
+					if( * ptr == ':' ) { maskbit_ += 16; }
+				}
+
+				return true;
+			}
+		}
 	}
 	return true;
 }

@@ -58,28 +58,16 @@ ptr = NULL;
 ClassAdLogParser::ClassAdLogParser()
 {
 	log_fp = NULL;
+	m_close_fp = true;
 	nextOffset = 0;
 	job_queue_name[0] = '\0';
 }
 
 ClassAdLogParser::~ClassAdLogParser()
 {
-	log_fp = NULL;
-	nextOffset = 0;
+	closeFile();
 }
 
-
-int
-ClassAdLogParser::getFileDescriptor()
-{
-	return fileno(log_fp);
-}
-
-void
-ClassAdLogParser::setFileDescriptor(int fd)
-{
-    log_fp = fdopen(fd,"r");
-}
 
 FILE *
 ClassAdLogParser::getFilePointer() 
@@ -90,7 +78,9 @@ ClassAdLogParser::getFilePointer()
 void
 ClassAdLogParser::setFilePointer(FILE *fp)
 {
+	closeFile();
 	log_fp = fp;
+	m_close_fp = false;
 }
 
 ClassAdLogEntry*
@@ -121,6 +111,7 @@ ClassAdLogParser::setNextOffset(long offset)
 FileOpErrCode 
 ClassAdLogParser::openFile() {
     // open a job_queue.log file
+	closeFile();
 #ifdef _NO_CONDOR_
     log_fp = fopen(job_queue_name, "r");
 #else
@@ -130,15 +121,16 @@ ClassAdLogParser::openFile() {
     if (log_fp == NULL) {
         return FILE_OPEN_ERROR;
     }
+	m_close_fp = true;
 	return FILE_OP_SUCCESS;
 }
 
 FileOpErrCode 
 ClassAdLogParser::closeFile() {
-	if (log_fp != NULL) {
-	  fclose(log_fp);
-	  log_fp = NULL;
+	if (log_fp != NULL && m_close_fp) {
+		fclose(log_fp);
 	}
+	log_fp = NULL;
 	return FILE_OP_SUCCESS;
 }
 
@@ -146,8 +138,8 @@ ClassAdLogParser::closeFile() {
 void
 ClassAdLogParser::setJobQueueName(const char* jqn)
 {
-	int cch = strlen(jqn);
-	ASSERT (cch < (int)COUNTOF(job_queue_name));
+	size_t cch = strlen(jqn);
+	ASSERT (cch < COUNTOF(job_queue_name));
 	strcpy(job_queue_name, jqn);
 }
 
@@ -168,16 +160,14 @@ ClassAdLogParser::readLogEntry(int &op_type)
 
     // move to the current offset
     if (log_fp && fseek(log_fp, nextOffset, SEEK_SET) != 0) {
-        fclose(log_fp);
-        log_fp = NULL;
+        closeFile();
         return FILE_READ_EOF;
     }
 
     if(log_fp) {
 	    rval = readHeader(log_fp, op_type);
 	    if (rval < 0) {
-		    fclose(log_fp);
-		    log_fp = NULL;
+		    closeFile();
 		    return FILE_READ_EOF;
 	    }
     }
@@ -214,8 +204,7 @@ ClassAdLogParser::readLogEntry(int &op_type)
 		    rval = readEndTransactionBody(log_fp);
 				break;
 		    default:
-		    fclose(log_fp);
-		    log_fp = NULL;
+		    closeFile();
 			    return FILE_READ_ERROR;
 				break;
 		}
@@ -262,8 +251,7 @@ ClassAdLogParser::readLogEntry(int &op_type)
 		}
 		
 		if( !feof( log_fp ) ) {
-			fclose(log_fp);
-            log_fp = NULL;
+			closeFile();
 #ifdef _NO_CONDOR_
 			syslog(LOG_ERR,
 				   "Failed recovering from corrupt file, errno=%d (%m)",
@@ -281,8 +269,7 @@ ClassAdLogParser::readLogEntry(int &op_type)
 			// records starting from the bad record to the end-of-file, and
 		
 			// pretend that we hit the end-of-file.
-		fclose( log_fp );
-        log_fp = NULL;
+		closeFile();
 
 		curCALogEntry = lastCALogEntry;
 		curCALogEntry.offset = nextOffset;
@@ -501,8 +488,12 @@ ClassAdLogParser::readEndTransactionBody(FILE *fp)
 
 	ch = fgetc(fp);
 
-	if( ch == EOF || ch != '\n' ) {
+	if( ch == EOF || (ch != '\n' && ch != '#')) {
 		return( -1 );
+	}
+	// if the next character is a #, the remaineder of the line is a comment
+	if (ch == '#') {
+		readline(fp, curCALogEntry.value);
 	}
 	return( 1 );
 }

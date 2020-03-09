@@ -37,6 +37,7 @@
 #include "my_username.h"
 #include "StateMachine.h"
 #include "Utils.h"
+#include "ipv6_hostname.h"
 
 
 #define MESSAGES_PER_INTERVAL_FACTOR (2)
@@ -132,9 +133,9 @@ HADStateMachine::~HADStateMachine(void)
 
     SetMyTypeName( invalidate_ad, QUERY_ADTYPE );
     SetTargetTypeName( invalidate_ad, HAD_ADTYPE );
-    line.formatstr( "TARGET.%s == \"%s\"", ATTR_NAME, m_name.Value( ) );
+    line.formatstr( "TARGET.%s == \"%s\"", ATTR_NAME, m_name.c_str( ) );
     invalidate_ad.AssignExpr( ATTR_REQUIREMENTS, line.Value( ) );
-	invalidate_ad.Assign( ATTR_NAME, m_name.Value() );
+	invalidate_ad.Assign( ATTR_NAME, m_name );
     daemonCore->sendUpdates( INVALIDATE_HAD_ADS, &invalidate_ad, NULL, false );
 }
 
@@ -179,7 +180,7 @@ HADStateMachine::isHardConfigurationNeeded(void)
 	// HAD in the list has changed or the rest of remote HAD sinful strings
 	// has changed their order or value, we do need the hard reconfiguration
 	if(  ( m_selfId     != selfId              )  ||
-		 ( !m_allHadIps.identical(m_allHadIps) )   ) {
+		 ( !m_allHadIps.identical(allHadIps) )   ) {
 		return true;
 	}
 
@@ -208,7 +209,7 @@ HADStateMachine::softReconfigure(void)
         // 'my_username' allocates dynamic string
         buffer = my_username();
         tmp = buffer ? buffer : "UNKNOWN";
-        m_name.formatstr( "%s@%s", tmp, my_full_hostname( ) );
+        formatstr( m_name, "%s@%s", tmp, get_local_fqdn().Value() );
 	if ( buffer ) {
 		free( buffer );
 	}
@@ -352,7 +353,7 @@ HADStateMachine::reinitialize(void)
 
 	// reconfiguring data members, on which the negotiator location inside the
 	// pool depends
-	m_usePrimary = param_boolean("HAD_USE_PRIMARY", m_usePrimary);
+	m_usePrimary = param_boolean("HAD_USE_PRIMARY", false);
 
     tmp = param( "HAD_LIST" );
     if ( tmp ) {
@@ -558,7 +559,7 @@ HADStateMachine::sendCommandToOthers( int comm )
     while( (addr = m_otherHadIps.next()) ) {
 
         dprintf( D_FULLDEBUG, "send command %s(%d) to %s\n",
-				 utilToString(comm),comm,addr);
+				 getCommandStringSafe(comm),comm,addr);
 
         Daemon d( DT_ANY, addr );
         ReliSock sock;
@@ -577,7 +578,7 @@ HADStateMachine::sendCommandToOthers( int comm )
         // startCommand - max timeout is m_connectionTimeout sec
         if( !d.startCommand( cmd, &sock, m_connectionTimeout ) ) {
             dprintf( D_ALWAYS,"cannot start command %s(%d) to addr %s\n",
-					 utilToString(comm),cmd,addr);
+					 getCommandStringSafe(comm),cmd,addr);
             sock.close();
             continue;
         }
@@ -622,21 +623,21 @@ HADStateMachine::sendReplicationCommand( int command )
     int cmd = command;
     dprintf( D_FULLDEBUG,
 			 "send command %s(%d) to replication daemon %s\n",
-			 utilToString(cmd), cmd, m_replicationDaemonSinfulString );
+			 getCommandStringSafe(cmd), cmd, m_replicationDaemonSinfulString );
 
     // startCommand - max timeout is m_connectionTimeout sec
     if(! (m_masterDaemon->startCommand(cmd,&sock,m_connectionTimeout )) ) {
         dprintf( D_ALWAYS,
 				 "cannot start command %s, addr %s\n",
-				 utilToString(cmd), m_replicationDaemonSinfulString );
+				 getCommandStringSafe(cmd), m_replicationDaemonSinfulString );
         sock.close();
 
         return false;
     }
 
-    char* subsys = const_cast<char*>( daemonCore->InfoCommandSinfulString( ) );
+    if( !sock.put(daemonCore->InfoCommandSinfulString( )) ||
+        !sock.end_of_message() ) {
 
-    if( !sock.code(subsys) || !sock.end_of_message() ) {
         dprintf( D_ALWAYS, "send to replication daemon, !sock.code false \n");
         sock.close();
 
@@ -671,10 +672,11 @@ HADStateMachine::setReplicationDaemonSinfulString( void )
     replicationAddressList.rewind( );
 
     free( tmp );
-    char* host = getHostFromAddr( daemonCore->InfoCommandSinfulString( ) );
 
 	int replicationDaemonIndex = replicationAddressList.number() - 1;
 
+	const char * mySinfulString = daemonCore->InfoCommandSinfulString();
+	Sinful mySinful( mySinfulString );
     while( ( replicationAddress = replicationAddressList.next( ) ) ) {
         char* sinfulAddress     = utilToSinful( replicationAddress );
 
@@ -687,32 +689,44 @@ HADStateMachine::setReplicationDaemonSinfulString( void )
 
             //continue;
         }
-        char* sinfulAddressHost = getHostFromAddr( sinfulAddress );
 
-        if(  (replicationDaemonIndex == m_selfId)     &&
-			 (strcmp( sinfulAddressHost, host ) == 0)  ) {
-            m_replicationDaemonSinfulString = sinfulAddress;
-            free( sinfulAddressHost );
-			dprintf( D_ALWAYS,
-					"HADStateMachine::setReplicationDaemonSinfulString "
-					"corresponding replication daemon - %s\n",
-					 sinfulAddress );
-            // not freeing 'sinfulAddress', since its referent is pointed by
-            // 'replicationDaemonSinfulString' too
-            break;
-        } else if( replicationDaemonIndex == m_selfId ) {
-			sprintf( buffer,
-					 "HADStateMachine::setReplicationDaemonSinfulString"
-					 "host names of machine and replication daemon do "
-					 "not match: %s vs. %s\n", host, sinfulAddressHost);
-			utilCrucialError( buffer );
-		}
+		// We're checking if the replication daemon listed in the position
+		// corresponding to ours in the HAD list refers to the same machine
+		// or not.  We want to end up with 's' having the replication daemon's
+		// shared port ID and port number, while ignoring the shared port
+		// ID and port number in our comparison.  We temporarily set the
+		// replication daemon's shared port ID to our own (to make sure
+		// they match) and set (this sinful's copy of ) our own port number
+		// to the replication daemon's port number (to make sure they match).
+		// If the sinfuls do point to the same address, we change the
+		// replication daemon's socket name to REPLICATION_SOCKET_NAME
+		// (for backwards compatability, we can't just set the replication
+		// daemon's socket name in the replication daemon list).
+        if( replicationDaemonIndex == m_selfId ) {
+            Sinful s( sinfulAddress );
+            mySinful.setPort( s.getPort() );
+            s.setSharedPortID( mySinful.getSharedPortID() );
+            if( s.valid() && mySinful.addressPointsToMe( s ) ) {
+            	if( s.getSharedPortID() ) {
+            		s.setSharedPortID( param( "REPLICATION_SOCKET_NAME" ) );
+            	}
+                m_replicationDaemonSinfulString = strdup( s.getSinful() );
+                dprintf( D_ALWAYS,
+                    "HADStateMachine::setReplicationDaemonSinfulString "
+                    "corresponding replication daemon - %s\n",
+                    s.getSinful() );
+            } else {
+                sprintf( buffer,
+                         "HADStateMachine::setReplicationDaemonSinfulString "
+                         "host names of machine and replication daemon do "
+                         "not match: %s vs. %s\n", mySinful.getSinful(), s.getSinful() );
+                utilCrucialError( buffer );
+            }
+        }
 
 		replicationDaemonIndex --;
-        free( sinfulAddressHost );
         free( sinfulAddress );
     }
-    free( host );
 
     // if failed to found the replication daemon in REPLICATION_LIST, just
     // switch off the replication feature
@@ -751,13 +765,13 @@ HADStateMachine::sendControlCmdToMaster( int comm )
     int cmd = comm;
     dprintf( D_FULLDEBUG,
 			 "send command %s(%d) [%s] to master %s\n",
-			 utilToString(cmd), cmd, m_controlleeName,
+			 getCommandStringSafe(cmd), cmd, m_controlleeName,
 			 m_masterDaemon->addr() );
 
     // startCommand - max timeout is m_connectionTimeout sec
     if(! m_masterDaemon->startCommand( cmd, &sock, m_connectionTimeout )  ) {
         dprintf( D_ALWAYS,"cannot start command %s, addr %s\n",
-				 utilToString(cmd), m_masterDaemon->addr() );
+				 getCommandStringSafe(cmd), m_masterDaemon->addr() );
         sock.close();
         return false;
     }
@@ -826,23 +840,39 @@ HADStateMachine::getHadList( const char *str,
 	Sinful my_addr( daemonCore->InfoCommandSinfulString() );
 	ASSERT( daemonCore->InfoCommandSinfulString() && my_addr.valid() );
 
+       // Don't add to the HAD list on each reconfig.
+       otherIps.clearAll();
+       allIps.clearAll();
+
     bool iAmPresent = false;
     while( (try_address = had_list.next()) ) {
-        char *sinful_addr = utilToSinful( try_address );
+        char * sinful_addr = utilToSinful( try_address );
 		dprintf(D_ALWAYS,
-				"HADStateMachine::initializeHADList my address %s "
-				"vs. next address in the list%s\n",
+				"HADStateMachine::initializeHADList my address '%s' "
+				"vs. address in the list '%s'\n",
 				my_addr.getSinful(), sinful_addr );
         if( sinful_addr == NULL ) {
             dprintf( D_ALWAYS,
-					 "HAD CONFIGURATION ERROR: pid %d", daemonCore->getpid() );
-            dprintf( D_ALWAYS,"not valid address %s\n", try_address );
-
+					 "HAD CONFIGURATION ERROR: pid %d "
+					 "address '%s' not valid\n",
+					 daemonCore->getpid(), try_address );
             utilCrucialError( "" );
             continue;
         }
-		allIps.insert( sinful_addr );
-        if( my_addr.addressPointsToMe( Sinful(sinful_addr) ) ) {
+		// The list doesn't include shared port IDs, so if we've got one
+		// give it to each other address in the list before we check to
+		// see if they're the same.  We know that sinful_addr can't
+		// already have a shared port ID because we called utilToSinful,
+		// and not just the Sinful constructor.  (The Sinful object and/or
+		// constructor should probably resolve hostnames, but HAD does it
+		// itself.)
+		Sinful s( sinful_addr );
+		free( sinful_addr );
+		s.setSharedPortID( my_addr.getSharedPortID() );
+		allIps.insert( s.getSinful() );
+dprintf( D_ALWAYS, "Checking address with shared port ID '%s'...\n", s.getSinful() );
+        if( my_addr.addressPointsToMe( s ) ) {
+dprintf( D_ALWAYS, "... found myself in list: %s\n", s.getSinful() );
             iAmPresent = true;
             // HAD id of each HAD is just the index of its <ip:port>
             // in HAD_LIST in reverse order
@@ -855,13 +885,8 @@ HADStateMachine::getHadList( const char *str,
 				isPrimaryCopy = true;
             }
         } else {
-            otherIps.insert( sinful_addr );
+            otherIps.insert( s.getSinful() );
         }
-
-		// put attention to release memory allocated by malloc with
-		// free and by new with delete here utilToSinful returns
-		// memory allocated by malloc
-        free( sinful_addr );
         counter-- ;
     } // end while
 
@@ -935,7 +960,7 @@ HADStateMachine::commandHandlerHad(int cmd, Stream *strm)
 	char	buf[1024];
 
     dprintf( D_FULLDEBUG, "commandHandler command %s(%d) is received\n",
-			 utilToString(cmd), cmd);
+			 getCommandStringSafe(cmd), cmd);
 
     strm->timeout( m_connectionTimeout );
 
@@ -1126,10 +1151,8 @@ HADStateMachine::updateCollectors(void)
  *              HAD is active or not and sends the update to collectors
  */
 void
-HADStateMachine::updateCollectorsClassAd(const MyString& isHadActive)
+HADStateMachine::updateCollectorsClassAd(const std::string& isHadActive)
 {
-    MyString line;
-
     m_classAd.Assign( ATTR_HAD_IS_ACTIVE, isHadActive );
 
     int successfulUpdatesNumber =

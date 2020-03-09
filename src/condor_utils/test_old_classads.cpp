@@ -20,7 +20,6 @@
 
 #include "condor_common.h"
 #include "condor_classad.h"
-#include "stringSpace.h"
 #include "iso_dates.h"
 #define HAVE_DLOPEN 1
 #ifdef HAVE_DLOPEN // Used to be CLASSAD_FUNCTIONS
@@ -35,7 +34,6 @@
 
 #define LARGE_NUMBER_OF_CLASSADS 10000
 
-extern StringSpace classad_string_space; // for debugging only!
 
 #define NUMBER_OF_CLASSAD_STRINGS (sizeof(classad_strings)/sizeof(char *))
 char *classad_strings[] = 
@@ -195,9 +193,9 @@ void test_ads_dont_match(ClassAd *classad_1, ClassAd *classad_2,
     int line_number, TestResults *results);
 void test_printed_version(ClassAd *classad, const char *attribute_name, 
     char *expected_string, int line_number, TestResults *results);
-void test_in_references(char *name,	StringList &references,
+void test_in_references(char *name,	classad::References &references,
     int line_number, TestResults *results);
-void test_not_in_references(char *name,	StringList &references,
+void test_not_in_references(char *name,	classad::References &references,
     int line_number, TestResults *results);
 void test_dirty_attribute(
     TestResults *results);
@@ -281,7 +279,7 @@ main(
 		printf("%s\n", classad_strings[classad_index]);
 
 		original = new ClassAd;
-		original->initFromString(classad_strings[classad_index], NULL);
+		initAdFromString(classad_strings[classad_index], *original);
 		classads[classad_index] = original;
 
 		if (parameters.test_copy_constructor) {
@@ -291,8 +289,8 @@ main(
 		}
 		else if (parameters.test_assignment) {
 			duplicate = new ClassAd;
-			duplicate->initFromString("A = 1\n MyType=\"x\"\n TargetType=\"y\"",
-									  NULL);
+			initAdFromString("A = 1\n MyType=\"x\"\n TargetType=\"y\"",
+				*duplicate);
 			*duplicate = *original;
 			delete original;
 			classads[classad_index] = duplicate;
@@ -387,7 +385,7 @@ main(
 		expression = (char *) malloc(50000);
 		sprintf(expression, "%s = \"%s\"", variable, string);
 		
-		classads[0]->Insert(expression);
+		classads[0]->Assign(variable, string);
 		
 		test_string_value(classads[0], variable, string, __LINE__, &test_results);
 
@@ -403,7 +401,7 @@ main(
 			 __LINE__, &test_results);
 
 		ClassAd *big_classad = new ClassAd;
-		big_classad->initFromString(expression, NULL);
+		initAdFromString(expression, *big_classad);
 		test_printed_version(big_classad, variable, expression, __LINE__, &test_results);
 		delete big_classad;
 		free(variable);
@@ -434,14 +432,14 @@ main(
 
 	if (parameters.test_references) {
 		printf("\nTesting References...\n");
-		StringList  *internal_references; 
-		StringList  *external_references; 
+		classad::References *internal_references;
+		classad::References *external_references;
 
-		internal_references = new StringList;
-		external_references = new StringList;
+		internal_references = new classad::References;
+		external_references = new classad::References;
 
-		classads[9]->GetReferences("Requirements", *internal_references,
-								   *external_references);
+		GetReferences("Requirements", *classads[9], internal_references,
+		              external_references);
 		test_in_references("Memory", *internal_references, __LINE__, &test_results);
 		test_in_references("Disk", *internal_references, __LINE__, &test_results);
 		test_in_references("ImageSize", *external_references, __LINE__, &test_results);
@@ -458,11 +456,11 @@ main(
 		delete internal_references;
 		delete external_references;
 
-		internal_references = new StringList;
-		external_references = new StringList;
+		internal_references = new classad::References;
+		external_references = new classad::References;
 
-		classads[10]->GetReferences("Requirements", *internal_references,
-								   *external_references);
+		GetReferences("Requirements", *classads[10], internal_references,
+		              external_references);
 		test_in_references("Memory", *internal_references, __LINE__, &test_results);
 		test_in_references("Disk", *internal_references, __LINE__, &test_results);
 		test_in_references("ImageSize", *external_references, __LINE__, &test_results);
@@ -509,7 +507,6 @@ main(
 	*/
 
 	test_results.PrintResults();
-	//classad_string_space.dump();
 
 #endif
 	// Clean up when we're done.
@@ -1261,21 +1258,11 @@ test_printed_version(
 void
 test_in_references(
 	char         *name,        // IN: What to look for 
-	StringList   &references,   // IN: References to examine
+	classad::References &references,   // IN: References to examine
     int          line_number,  // IN: The line number to print
 	TestResults  *results)     // OUT: Modified to reflect result of test
 {
-	char *reference;
-	bool is_in_references = false;
-
-	references.rewind(); 
-	while ((reference = references.next()) != NULL) {
-		if (!strcmp(reference, name)) {
-			is_in_references = true;
-			break;
-		}
-	}
-	if (is_in_references) {
+	if (references.count(name) > 0) {
 		printf("Passed: %s is in references in line %d.\n", 
 			   name, line_number);
 		results->AddResult(true);
@@ -1298,21 +1285,11 @@ test_in_references(
 void
 test_not_in_references(
 	char         *name,        // IN: What to look for 
-	StringList   &references,   // IN: References to examine
+	classad::References &references,   // IN: References to examine
     int          line_number,  // IN: The line number to print
 	TestResults  *results)     // OUT: Modified to reflect result of test
 {
-	char *reference;
-	bool is_in_references = false;
-
-	references.rewind(); 
-	while ((reference = references.next()) != NULL) {
-		if (!strcmp(reference, name)) {
-			is_in_references = true;
-			break;
-		}
-	}
-	if (!is_in_references) {
+	if (!references.count(name) == 0) {
 		printf("Passed: %s is not in references in line %d.\n", 
 			   name, line_number);
 		results->AddResult(true);
@@ -1341,7 +1318,7 @@ test_dirty_attribute(
 	ExprTree *expr;
 
 	classad = new ClassAd;
-	classad->initFromString("A = 1\nB = 2", NULL);
+	initAdFromString("A = 1\nB = 2", *classad);
 	classad->ClearAllDirtyFlags();
 
 	// First of all, we should have zero dirty attributes. 
@@ -1357,7 +1334,7 @@ test_dirty_attribute(
 	}
 
 	// Add an attribute
-	classad->Insert("C = 3");
+	classad->Assign("C", 3);
 
 	// Now we should have exactly one dirty attribute, C.
 	classad->ResetExpr();
@@ -1382,7 +1359,7 @@ test_dirty_attribute(
 	}
 
 	// Add an attribute
-	classad->Insert("D = 4");
+	classad->Assign("D", 4);
 
 	// Now we should have two dirty attributes, C & D
 	classad->ResetExpr();
@@ -1531,7 +1508,7 @@ static void test_functions(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for functions in line %d\n", 
 			   __LINE__);
@@ -1723,7 +1700,7 @@ static void test_function_int(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function int() in line %d\n", 
 			   __LINE__);
@@ -1851,7 +1828,7 @@ static void test_function_ifthenelse(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function ifthenelse() in line %d\n", 
 			   __LINE__);
@@ -2059,7 +2036,7 @@ static void test_function_stringlists(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function stringlists() in line %d\n", 
 			   __LINE__);
@@ -2525,7 +2502,7 @@ static void test_function_real(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function real() in line %d\n", 
 			   __LINE__);
@@ -2645,7 +2622,7 @@ static void test_function_string(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function string() in line %d\n", 
 			   __LINE__);
@@ -2694,7 +2671,7 @@ static void test_function_strcat(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function strcat() in line %d\n", 
 			   __LINE__);
@@ -2748,7 +2725,7 @@ static void test_function_floor(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function floor() in line %d\n", 
 			   __LINE__);
@@ -2832,7 +2809,7 @@ static void test_function_ceiling(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function ceiling() in line %d\n", 
 			   __LINE__);
@@ -2916,7 +2893,7 @@ static void test_function_round(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function round() in line %d\n", 
 			   __LINE__);
@@ -3005,7 +2982,7 @@ static void test_function_random(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function random() in line %d\n", 
 			   __LINE__);
@@ -3068,7 +3045,7 @@ static void test_function_isstring(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function isString() in line %d\n", 
 			   __LINE__);
@@ -3121,7 +3098,7 @@ static void test_function_isundefined(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function isundefined() in line %d\n", 
 			   __LINE__);
@@ -3175,7 +3152,7 @@ static void test_function_iserror(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function iserror() in line %d\n", 
 			   __LINE__);
@@ -3254,7 +3231,7 @@ static void test_function_isinteger(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function isinteger() in line %d\n", 
 			   __LINE__);
@@ -3361,7 +3338,7 @@ static void test_function_isreal(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function isreal() in line %d\n", 
 			   __LINE__);
@@ -3470,7 +3447,7 @@ static void test_function_isboolean(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function isboolean() in line %d\n", 
 			   __LINE__);
@@ -3519,7 +3496,7 @@ static void test_function_formattime(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function formattime() in line %d\n", 
 			   __LINE__);
@@ -3642,7 +3619,7 @@ static void test_function_substr(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function substr() in line %d\n", 
 			   __LINE__);
@@ -3755,7 +3732,7 @@ static void test_function_strcmp(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function strcmp() in line %d\n", 
 			   __LINE__);
@@ -3887,7 +3864,7 @@ static void test_function_attrnm(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function attrnm() in line %d\n", 
 			   __LINE__);
@@ -3938,7 +3915,7 @@ static void test_function_regexp(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function regexp() in line %d\n", 
 			   __LINE__);
@@ -4124,7 +4101,7 @@ static void test_function_stringlists_regexpmember(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function stringlists_regexpmember() in line %d\n", 
 			   __LINE__);
@@ -4283,7 +4260,7 @@ static void test_function_XXX(
 	config();
 
 	classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 	if (classad == NULL) {
 		printf("Can't parse ClassAd for function XXX() in line %d\n", 
 			   __LINE__);
@@ -4392,7 +4369,7 @@ void test_random(
     ClassAd *classad;
 
     classad = new ClassAd;
-	classad->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *classad);
 
     // First we check that random gives us different numbers
     have_different_numbers = false;
@@ -4493,7 +4470,7 @@ void test_operators(TestResults *results)
         "N = 1 && ERROR\n "
         "O = 1.2 && ERROR ";
     ClassAd *c = new ClassAd;
-	c->initFromString(classad_string, NULL);
+	initAdFromString(classad_string, *c);
 
 	/* In new ClassAds, the operands of && and || must be booleans.
 	 * Thus, most of the tests here won't work properly.
@@ -4577,9 +4554,9 @@ test_scoping(TestResults *results)
     char *ad2_string = "X = 2\n Y = 3\n K=TARGET.L";
     int value;
     ClassAd *ad1  =  new ClassAd;
-	ad1->initFromString(ad1_string, NULL);
+	initAdFromString(ad1_string, *ad1);
     ClassAd *ad2  =  new ClassAd;
-	ad2->initFromString(ad2_string, NULL);
+	initAdFromString(ad2_string, *ad2);
 
     if (ad1->EvalInteger("A", ad2, value) && value == 1) {
          printf("Passed: eval of A is good in line %d\n", __LINE__);

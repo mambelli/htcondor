@@ -27,14 +27,6 @@
 #  include "pcre.h"
 #endif
 
-#define CUSTOMIZATION_SELDOM 	0
-
-#define RECONFIG_NORMAL 		0
-
-#define STATE_DEFAULT			0
-#define STATE_AUTODEFAULT		1
-#define STATE_USER				2
-#define STATE_RUNTIME			3
 
 //param_info_hash_t = bucket_t**
 //bucket_t** param_info;
@@ -109,6 +101,24 @@ MACRO_DEF_ITEM * param_subsys_default_lookup(const char * subsys, const char * p
 		return BinaryLookup<MACRO_DEF_ITEM>(subtab->aTable, subtab->cElms, param, strcasecmp);
 	}
 	return NULL;
+}
+
+// returns the subsystem table for the given defaults table and subsystem.
+int param_get_subsys_table(const void* pvdefaults, const char* subsys, MACRO_DEF_ITEM** ppTable)
+{
+	*ppTable = NULL;
+	if ( ! pvdefaults || (pvdefaults == condor_params::defaults)) {
+		MACRO_TABLE_PAIR* subtab = NULL;
+		subtab = BinaryLookup<MACRO_TABLE_PAIR>(
+			condor_params::subsystems,
+			condor_params::subsystems_count,
+			subsys, ComparePrefixBeforeDot);
+		if (subtab) {
+			*ppTable = subtab->aTable;
+			return subtab->cElms;
+		}
+	}
+	return 0;
 }
 
 MACRO_DEF_ITEM * param_default_lookup2(const char * param, const char * subsys)
@@ -216,13 +226,15 @@ int param_entry_get_type(const param_table_entry_t * p, bool & ranged) {
 	return (flags & condor_params::PARAM_FLAGS_TYPE_MASK);
 }
 
-int param_default_get_id(const char*param)
+int param_default_get_id(const char*param, const char * * ppdot)
 {
+	if (ppdot) *ppdot = NULL;
 	int ix = -1;
 	const param_table_entry_t* found = param_generic_default_lookup(param);
 	if ( ! found) {
 		const char * pdot = strchr(param, '.');
 		if (pdot) {
+			if (ppdot) *ppdot = pdot+1;
 			found = param_generic_default_lookup(pdot+1);
 		}
 	}
@@ -270,6 +282,31 @@ bool param_default_ispath_by_id(int ix)
 		}
 	}
 	return false;
+}
+
+param_info_t_type_t param_default_range_by_id(int ix, const int *&imin, const double*&dmin, const long long*&lmin)
+{
+	imin = NULL; dmin = NULL; lmin = NULL;
+	if (ix >= 0 && ix < condor_params::defaults_count) {
+		const param_table_entry_t* p = &condor_params::defaults[ix];
+		if (p && p->def) {
+			int flags = reinterpret_cast<const condor_params::string_value *>(p->def)->flags;
+			if (flags & condor_params::PARAM_FLAGS_RANGED) {
+				switch (flags & condor_params::PARAM_FLAGS_TYPE_MASK) {
+				case PARAM_TYPE_INT:
+					imin = &(reinterpret_cast<const condor_params::ranged_int_value *>(p->def)->min);
+					return PARAM_TYPE_INT;
+				case PARAM_TYPE_LONG:
+					lmin = &(reinterpret_cast<const condor_params::ranged_long_value *>(p->def)->min);
+					return PARAM_TYPE_LONG;
+				case PARAM_TYPE_DOUBLE:
+					dmin = &(reinterpret_cast<const condor_params::ranged_double_value *>(p->def)->min);
+					return PARAM_TYPE_DOUBLE;
+				}
+			}
+		}
+	}
+	return PARAM_TYPE_STRING;
 }
 
 #endif // PARAM_DEFAULTS_SORTED

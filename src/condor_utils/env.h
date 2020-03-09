@@ -190,6 +190,10 @@ class Env {
 		// ASSERTS if it runs out of memory.
 	bool SetEnv( const MyString &, const MyString & );
 
+		// Removes an environment variable; returns true if the variable
+		// was previously in the environment.
+	bool DeleteEnv( const std::string & );
+
 		// Update ClassAd with new environment, possibly adjusting the
 		// format depending on the Condor version and opsys of the
 		// receiver.
@@ -234,6 +238,10 @@ class Env {
 		// Returns a null-terminated array of strings.
 		// Caller should delete it (e.g. with deleteStringArray()).
 	char **getStringArray() const;
+
+		// Walk the environment, calling walk_func for each entry until walk_func returns false
+	void Walk(bool (*walk_func)(void* pv, const MyString &var, MyString &val), void* pv);
+	void Walk(bool (*walk_func)(void* pv, const MyString &var, const MyString &val), void* pv) const;
 
 	bool GetEnv(MyString const &var,MyString &val) const;
 

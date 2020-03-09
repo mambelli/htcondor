@@ -308,49 +308,60 @@ static bool test_input_was_v1_true_v1r_or(void);
 static bool test_input_was_v1_true_v1r(void);
 static bool test_input_was_v1_true_ad(void);
 
+#ifdef WIN32
+#define V1_ENV_DELIM "|"
+#else
+#define V1_ENV_DELIM ";"
+#endif
+#define V1_ENV_DELIM_NIX ";"
+#define V1_ENV_DELIM_WIN "|"
+
+
 //char* constants
 static const char 
-	*V1R = "one=1;two=2;three=3",	//V1Raw format
+	*V1R = "one=1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3",	//V1Raw format
+	   *V1R_NIX = "one=1;two=2;three=3",
 	   *V1R_WIN = "one=1|two=2|three=3",
-	   *V1R_MISS_NAME = "=1;two=2;three=3",
-	   *V1R_MISS_DELIM = "one1;two=2;three=3",
-	   *V1R_MISS_BOTH = "=1;two2;three=3",
+	   *V1R_MISS_NAME = "=1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3",
+	   *V1R_MISS_DELIM = "one1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3",
+	   *V1R_MISS_BOTH = "=1" V1_ENV_DELIM "two2" V1_ENV_DELIM "three=3",
 	*V2R ="one=1 two=2 three=3",	//V2Raw format
 	   *V2R_MISS_NAME ="=1 two=2 three=3",
 	   *V2R_MISS_DELIM ="one1 two=2 three=3",
 	   *V2R_MISS_BOTH ="=1 two2 three=3",
 	   *ARRAY_SKIP_BAD_STR = "one=1 two2 three=3",
-	   *V2R_SEMI ="one=1 two=2 three=3 semi=;",
-	   *V2R_MARK =" one=1 two=2 three=3 semi=;",
+	   *V2R_SEMI ="one=1 two=2 three=3 semi=" V1_ENV_DELIM,
+	   *V2R_MARK =" one=1 two=2 three=3 semi=" V1_ENV_DELIM ,
 	*V2Q ="\"one=1 two=2 three=3\"",	//V2Quoted format
 	   *V2Q_MISS_NAME = "\"=1 two=2 three=3\"",
 	   *V2Q_MISS_DELIM = "\"one1 two=2 three=3\"",
 	   *V2Q_MISS_BOTH = "\"=1 two2 three=3\"",
 	   *V2Q_MISS_END = "\"one=1 two=2 three=3",
 	   *V2Q_TRAIL = "\"one=1 two=2 three=3\"extra=stuff",
-	   *V2Q_SEMI ="\"one=1 two=2 three=3 semi=;\"",
-	   *V2Q_DELIM_SEMI = "\"one=1;two=2;three=3\"",
-	*V1R_ADD = "four=4;five=5",	//V1Raw format
+	   *V2Q_SEMI ="\"one=1 two=2 three=3 semi=" V1_ENV_DELIM "\"",
+	   *V2Q_DELIM_SEMI = "\"one=1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3\"",
+	*V1R_ADD = "four=4" V1_ENV_DELIM "five=5",	//V1Raw format
 	*V2R_ADD = "four=4 five=5",	//V2Raw format
-	*V1R_REP = "one=10;two=200;three=3000",	//V1Raw format
+	*V1R_REP = "one=10" V1_ENV_DELIM "two=200" V1_ENV_DELIM "three=3000",	//V1Raw format
+//		*V1R_REP_NIX = "one=10;two=200;three=3000",
 		*V1R_REP_WIN = "one=10|two=200|three=3000",
 	*V2R_REP = "one=10 two=200 three=3000",	//V2Raw format
-	   *V2R_REP_SEMI = "one=10 two=200 three=3000 semi=;",
+	   *V2R_REP_SEMI = "one=10 two=200 three=3000 semi=" V1_ENV_DELIM,
 	*V2Q_REP = "\"one=10 two=200 three=3000\"",	//V2Quoted format
-	   *V2Q_REP_SEMI = "\"one=10 two=200 three=3000 semi=;\"",
-	*V1R_REP_ADD = "one=10;two=200;three=3000;four=4;five=5",	//V1Raw format
+	   *V2Q_REP_SEMI = "\"one=10 two=200 three=3000 semi=" V1_ENV_DELIM "\"",
+	*V1R_REP_ADD = "one=10" V1_ENV_DELIM "two=200" V1_ENV_DELIM "three=3000" V1_ENV_DELIM "four=4" V1_ENV_DELIM "five=5",	//V1Raw format
 	*V2R_REP_ADD = "one=10 two=200 three=3000 four=4 five=5",	//V2Raw format
-	   *V2R_REP_ADD_SEMI = "one=10 two=200 three=3000 four=4 five=5 semi=;",
+	   *V2R_REP_ADD_SEMI = "one=10 two=200 three=3000 four=4 five=5 semi=" V1_ENV_DELIM,
 	*V2Q_REP_ADD = "\"one=10 two=200 three=3000 four=4 five=5\"",	//V2Quoted
-	   *V2Q_REP_ADD_SEMI = "\"one=10 two=200 three=3000 four=4 five=5 semi=;\"",
+	   *V2Q_REP_ADD_SEMI = "\"one=10 two=200 three=3000 four=4 five=5 semi=" V1_ENV_DELIM "\"",
 	*AD = "\tone=1\n\t\ttwo=2\n\t\tthree=3",	//ClassAd string
-	*AD_V1 = "\tEnv = \"one=1;two=2;three=3\"",	//ClassAd with V1 Env 
+	*AD_V1 = "\tEnv = \"one=1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3\"",	//ClassAd with V1 Env 
 	   *AD_V1_WIN = "\tEnv = \"one=1|two=2|three=3\"\nEnvDelim = \"|\"", 
-	   *AD_V1_MISS_NAME = "\tEnv = \"=1;two=2;three=3\"",
-	   *AD_V1_MISS_DELIM = "\tEnv = \"one1;two=2;three=3\"",
-	   *AD_V1_MISS_BOTH = "\tEnv = \"=1;two2;three=3\"",
-	   *AD_V1_REP = "\tEnv = \"one=10;two=200;three=3000\"", 
-	   *AD_V1_REP_ADD = "\tEnv = \"one=10;two=200;three=3000;four=4;five=5\"", 
+	   *AD_V1_MISS_NAME = "\tEnv = \"=1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3\"",
+	   *AD_V1_MISS_DELIM = "\tEnv = \"one1" V1_ENV_DELIM "two=2" V1_ENV_DELIM "three=3\"",
+	   *AD_V1_MISS_BOTH = "\tEnv = \"=1" V1_ENV_DELIM "two2" V1_ENV_DELIM "three=3\"",
+	   *AD_V1_REP = "\tEnv = \"one=10" V1_ENV_DELIM "two=200" V1_ENV_DELIM "three=3000\"", 
+	   *AD_V1_REP_ADD = "\tEnv = \"one=10" V1_ENV_DELIM "two=200" V1_ENV_DELIM "three=3000" V1_ENV_DELIM "four=4" V1_ENV_DELIM "five=5\"", 
 	*AD_V2 = "\tEnvironment = \"one=1 two=2 three=3\"",	//ClassAd with V2 Env
 	   *AD_V2_MISS_NAME = "\tEnvironment = \"=1 two=2 three=3\"",
 	   *AD_V2_MISS_DELIM = "\tEnvironment = \"one1 two=2 three=3\"",
@@ -358,7 +369,7 @@ static const char
 	   *AD_V2_REP = "\tEnvironment = \"one=10 two=200 three=3000\"",
 	   *AD_V2_REP_ADD = "\tEnvironment = \"one=10 two=200 three=3000 four=4 "
 	    	"five=5\"",
-		*AD_V2_SEMI = "\tEnvironment = \"one=1 two=2 three=3 semi=;\"",
+		*AD_V2_SEMI = "\tEnvironment = \"one=1 two=2 three=3 semi=" V1_ENV_DELIM "\"",
 	*ONE = "one=1",	//Single Env Var string
 	   *ONE_MISS_NAME = "=1",
 	   *ONE_MISS_DELIM = "one1",
@@ -2594,7 +2605,7 @@ static bool test_mf_ad_ret_v1r_valid() {
 		"ClassAd that uses V1Raw.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	bool expect = true;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2615,7 +2626,7 @@ static bool test_mf_ad_ret_v2r_valid() {
 		"ClassAd that uses V2Raw.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2, NULL);
+	initAdFromString(AD_V2, classad);
 	bool expect = true;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2636,7 +2647,7 @@ static bool test_mf_ad_ret_valid_define() {
 		"ClassAd that doesn't define an Environment");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD, NULL);
+	initAdFromString(AD, classad);
 	bool expect = true;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2657,7 +2668,7 @@ static bool test_mf_ad_ret_v1r_invalid_name() {
 		"ClassAd that uses V1Raw due to a missing variable name.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_MISS_NAME, NULL);
+	initAdFromString(AD_V1_MISS_NAME, classad);
 	bool expect = false;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2678,7 +2689,7 @@ static bool test_mf_ad_ret_v1r_invalid_delim() {
 		"ClassAd that uses V1Raw due to a missing delimiter.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_MISS_DELIM, NULL);
+	initAdFromString(AD_V1_MISS_DELIM, classad);
 	bool expect = false;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2699,7 +2710,7 @@ static bool test_mf_ad_ret_v2r_invalid_name() {
 		"ClassAd that uses V2Raw due to a missing variable name.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_MISS_NAME, NULL);
+	initAdFromString(AD_V2_MISS_NAME, classad);
 	bool expect = false;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2720,7 +2731,7 @@ static bool test_mf_ad_ret_v2r_invalid_delim() {
 		"ClassAd that uses V2Raw due to a missing delimiter.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_MISS_DELIM, NULL);
+	initAdFromString(AD_V2_MISS_DELIM, classad);
 	bool expect = false;
 	bool actual = env.MergeFrom(&classad, NULL);
 	emit_input_header();
@@ -2743,7 +2754,7 @@ static bool test_mf_ad_error_v1r_invalid_name() {
 	Env env;
 	MyString actual;
 	ClassAd classad;
-	classad.initFromString(AD_V1_MISS_NAME, NULL);
+	initAdFromString(AD_V1_MISS_NAME, classad);
 	env.MergeFrom(&classad, &actual);
 	emit_input_header();
 	emit_param("ClassAd", "%s", AD_V1_MISS_NAME);
@@ -2763,7 +2774,7 @@ static bool test_mf_ad_error_v1r_invalid_delim() {
 	Env env;
 	MyString actual;
 	ClassAd classad;
-	classad.initFromString(AD_V1_MISS_DELIM, NULL);
+	initAdFromString(AD_V1_MISS_DELIM, classad);
 	env.MergeFrom(&classad, &actual);
 	emit_input_header();
 	emit_param("ClassAd", "%s", AD_V1_MISS_DELIM);
@@ -2783,7 +2794,7 @@ static bool test_mf_ad_error_v2r_invalid_name() {
 	Env env;
 	MyString actual;
 	ClassAd classad;
-	classad.initFromString(AD_V2_MISS_NAME, NULL);
+	initAdFromString(AD_V2_MISS_NAME, classad);
 	env.MergeFrom(&classad, &actual);
 	emit_input_header();
 	emit_param("ClassAd", "%s", AD_V2_MISS_NAME);
@@ -2803,7 +2814,7 @@ static bool test_mf_ad_error_v2r_invalid_delim() {
 	Env env;
 	MyString actual;
 	ClassAd classad;
-	classad.initFromString(AD_V2_MISS_NAME, NULL);
+	initAdFromString(AD_V2_MISS_NAME, classad);
 	env.MergeFrom(&classad, &actual);
 	emit_input_header();
 	emit_param("ClassAd", "%s", AD_V2_MISS_NAME);
@@ -2841,7 +2852,7 @@ static bool test_mf_ad_add_define() {
 		"when passed a ClassAd that doesn't define an environment variable.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD, NULL);
+	initAdFromString(AD, classad);
 	MyString actual;
 	env.MergeFrom(&classad, NULL);
 	env.getDelimitedStringForDisplay(&actual);
@@ -2864,7 +2875,7 @@ static bool test_mf_ad_add_v1r_one() {
 	Env env;
 	const char* classad_string = "\tEnv = \"one=1\"";
 	ClassAd classad;
-	classad.initFromString(classad_string, NULL);
+	initAdFromString(classad_string, classad);
 	MyString actual;
 	env.MergeFrom(&classad, NULL);
 	env.getDelimitedStringForDisplay(&actual);
@@ -2886,7 +2897,7 @@ static bool test_mf_ad_add_v1r_many() {
 		"passed a valid ClassAd that uses V1Raw with many variables.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	MyString actual;
 	env.MergeFrom(&classad, NULL);
 	env.getDelimitedStringForDisplay(&actual);
@@ -2909,7 +2920,7 @@ static bool test_mf_ad_add_v2r_one() {
 	Env env;
 	const char* classad_string = "\tEnvironment = \"one=1\"";
 	ClassAd classad;
-	classad.initFromString(classad_string, NULL);
+	initAdFromString(classad_string, classad);
 	MyString actual;
 	env.MergeFrom(&classad, NULL);
 	env.getDelimitedStringForDisplay(&actual);
@@ -2931,7 +2942,7 @@ static bool test_mf_ad_add_v2r_many() {
 		"passed a valid ClassAd that uses V2Raw with many variables.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2, NULL);
+	initAdFromString(AD_V2, classad);
 	MyString actual;
 	env.MergeFrom(&classad, NULL);
 	env.getDelimitedStringForDisplay(&actual);
@@ -2953,7 +2964,7 @@ static bool test_mf_ad_v1r_replace() {
 		"passed a valid ClassAd that uses V1Raw with many variables.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_REP, NULL);
+	initAdFromString(AD_V1_REP, classad);
 	MyString actual;
 	env.MergeFromV2Raw(V2R, NULL);
 	env.MergeFrom(&classad, NULL);
@@ -2977,7 +2988,7 @@ static bool test_mf_ad_v2r_replace() {
 		"passed a valid ClassAd that uses V2Raw with many variables.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_REP, NULL);
+	initAdFromString(AD_V2_REP, classad);
 	MyString actual;
 	env.MergeFromV2Raw(V2R, NULL);
 	env.MergeFrom(&classad, NULL);
@@ -3002,7 +3013,7 @@ static bool test_mf_ad_v1r_replace_add() {
 		" V1Raw with many variables.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_REP_ADD, NULL);
+	initAdFromString(AD_V1_REP_ADD, classad);
 	MyString actual;
 	env.MergeFromV2Raw(V2R, NULL);
 	env.MergeFrom(&classad, NULL);
@@ -3027,7 +3038,7 @@ static bool test_mf_ad_v2r_replace_add() {
 		" V2Raw with many variables.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_REP_ADD, NULL);
+	initAdFromString(AD_V2_REP_ADD, classad);
 	MyString actual;
 	env.MergeFromV2Raw(V2R, NULL);
 	env.MergeFrom(&classad, NULL);
@@ -3128,13 +3139,15 @@ static bool test_set_env_with_error_message_err_invalid_name() {
 	emit_comment("This test just checks if the error message is not empty.");
 	Env env;
 	MyString actual;
-	actual = env.SetEnvWithErrorMessage(ONE_MISS_NAME, &actual);
+	bool retval;
+	retval = env.SetEnvWithErrorMessage(ONE_MISS_NAME, &actual);
 	emit_input_header();
 	emit_param("STRING", "%s", ONE_MISS_NAME);
 	emit_param("MyString", "%s", "");
 	emit_output_actual_header();
 	emit_param("Error Message", "%s", actual.Value());
-	if(actual.IsEmpty()) {
+	emit_param("Return Value", "%s", retval ? "true" : "false");
+	if(actual.IsEmpty() || retval) {
 		FAIL;
 	}
 	PASS;
@@ -3146,13 +3159,15 @@ static bool test_set_env_with_error_message_err_invalid_delim() {
 	emit_comment("This test just checks if the error message is not empty.");
 	Env env;
 	MyString actual;
-	actual = env.SetEnvWithErrorMessage(ONE_MISS_DELIM, &actual);
+	bool retval;
+	retval = env.SetEnvWithErrorMessage(ONE_MISS_DELIM, &actual);
 	emit_input_header();
 	emit_param("STRING", "%s", ONE_MISS_DELIM);
 	emit_param("MyString", "%s", "");
 	emit_output_actual_header();
 	emit_param("Error Message", "%s", actual.Value());
-	if(actual.IsEmpty()) {
+	emit_param("Return Value", "%s", retval ? "true" : "false");
+	if(actual.IsEmpty() || retval) {
 		FAIL;
 	}
 	PASS;
@@ -3715,7 +3730,7 @@ static bool test_insert_env_into_classad_v1_empty() {
 	env.MergeFromV1Raw(V1R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL);
-	char* actual;
+	char* actual = NULL;
 	classad.LookupString("Environment", &actual);
 	emit_input_header();
 	emit_param("Env", "%s", V1R);
@@ -3740,7 +3755,7 @@ static bool test_insert_env_into_classad_v2_empty() {
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL);
-	char* actual;
+	char* actual = NULL;
 	classad.LookupString("Environment", &actual);
 	emit_input_header();
 	emit_param("Env", "%s", V2R);
@@ -3763,10 +3778,10 @@ static bool test_insert_env_into_classad_v1_v1_replace() {
 		"variables from an Env object in V1 format into the ClassAd with a V1 "
 		"Environment.");
 	Env env;
-	char* actual;
+	char* actual = NULL;
 	env.MergeFromV1Raw(V1R_REP, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	env.InsertEnvIntoClassAd(&classad, NULL);
 	classad.LookupString("Env", &actual);
 	emit_input_header();
@@ -3777,7 +3792,7 @@ static bool test_insert_env_into_classad_v1_v1_replace() {
 	emit_param("ClassAd Env", "%s", V1R_REP);
 	emit_output_actual_header();
 	emit_param("ClassAd Env", "%s", actual);
-	if(!strings_similar(actual, V1R_REP, ";")) {
+	if(!strings_similar(actual, V1R_REP, V1_ENV_DELIM)) {
 		free(actual);
 		FAIL;
 	}
@@ -3790,10 +3805,10 @@ static bool test_insert_env_into_classad_v1_v2_replace() {
 		"variables from an Env object in V1 format into the ClassAd with a V2 "
 		"Environment.");
 	Env env;
-	char* actual;
+	char* actual = NULL;
 	env.MergeFromV1Raw(V1R_REP, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V2, NULL);
+	initAdFromString(AD_V2, classad);
 	env.InsertEnvIntoClassAd(&classad, NULL);
 	classad.LookupString("Environment", &actual);
 	emit_input_header();
@@ -3817,10 +3832,10 @@ static bool test_insert_env_into_classad_v2_v1_replace() {
 		"variables from an Env object in V2 format into the ClassAd with a V1 "
 		"Environment.");
 	Env env;
-	char* actual;
+	char* actual = NULL;
 	env.MergeFromV2Raw(V2R_REP, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	env.InsertEnvIntoClassAd(&classad, NULL);
 	classad.LookupString("Env", &actual);
 	emit_input_header();
@@ -3831,7 +3846,7 @@ static bool test_insert_env_into_classad_v2_v1_replace() {
 	emit_param("ClassAd Env", "%s", V1R_REP);
 	emit_output_actual_header();
 	emit_param("ClassAd Env", "%s", actual);
-	if(!strings_similar(actual, V1R_REP, ";")) {
+	if(!strings_similar(actual, V1R_REP, V1_ENV_DELIM)) {
 		free(actual);
 		FAIL;
 	}
@@ -3844,10 +3859,10 @@ static bool test_insert_env_into_classad_v2_v2_replace() {
 		"variables from an Env object in V2 format into the ClassAd with a V2 "
 		"Environment.");
 	Env env;
-	char* actual;
+	char* actual = NULL;
 	env.MergeFromV2Raw(V2R_REP, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V2, NULL);
+	initAdFromString(AD_V2, classad);
 	env.InsertEnvIntoClassAd(&classad, NULL);
 	classad.LookupString("Environment", &actual);
 	emit_input_header();
@@ -3871,7 +3886,7 @@ static bool test_insert_env_into_classad_version_v1() {
 		"CondorVersionInfo requires V1 format.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL, NULL, &info);
@@ -3886,7 +3901,7 @@ static bool test_insert_env_into_classad_version_v1() {
 	emit_param("ClassAd Env", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("ClassAd Env", "%s", actual);
-	if(!strings_similar(actual, V1R, ";")) {
+	if(!strings_similar(actual, V1R, V1_ENV_DELIM)) {
 		free(actual); free(version);
 		FAIL;
 	}
@@ -3900,7 +3915,7 @@ static bool test_insert_env_into_classad_version_v1_os_winnt() {
 		"CondorVersionInfo requires V1 format and the target OS is WINNT.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL, "WINNT", &info);
@@ -3929,7 +3944,7 @@ static bool test_insert_env_into_classad_version_v1_os_win32() {
 		"CondorVersionInfo requires V1 format and the target OS is WIN32.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL, "WIN32", &info);
@@ -3958,7 +3973,7 @@ static bool test_insert_env_into_classad_version_v1_os_unix() {
 		"CondorVersionInfo requires V1 format and the target OS is UNIX.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL, "UNIX", &info);
@@ -3970,10 +3985,10 @@ static bool test_insert_env_into_classad_version_v1_os_unix() {
 	emit_param("STRING", "%s", "UNIX");
 	emit_param("CondorVersionInfo", "%s", version);
 	emit_output_expected_header();
-	emit_param("ClassAd Env", "%s", V1R);
+	emit_param("ClassAd Env", "%s", V1R_NIX);
 	emit_output_actual_header();
 	emit_param("ClassAd Env", "%s", actual);
-	if(!strings_similar(actual, V1R, ";")) {
+	if(!strings_similar(actual, V1R_NIX, V1_ENV_DELIM_NIX)) {
 		free(actual); free(version);
 		FAIL;
 	}
@@ -3988,10 +4003,10 @@ static bool test_insert_env_into_classad_version_v1_semi() {
 		"a semicolon as a delimiter.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	env.InsertEnvIntoClassAd(&classad, NULL, NULL, &info);
 	classad.LookupString("Env", &actual);
 	emit_input_header();
@@ -4004,7 +4019,7 @@ static bool test_insert_env_into_classad_version_v1_semi() {
 	emit_param("ClassAd Env", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("ClassAd Env", "%s", actual);
-	if(!strings_similar(actual, V1R, ";")) {
+	if(!strings_similar(actual, V1R, V1_ENV_DELIM)) {
 		free(actual); free(version);
 		FAIL;
 	}
@@ -4019,10 +4034,10 @@ static bool test_insert_env_into_classad_version_v1_line() {
 		"a '|' as a delimiter.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R_REP, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V1_WIN, NULL);
+	initAdFromString(AD_V1_WIN, classad);
 	env.InsertEnvIntoClassAd(&classad, NULL, NULL, &info);
 	classad.LookupString("Env", &actual);
 	emit_input_header();
@@ -4050,7 +4065,7 @@ static bool test_insert_env_into_classad_version_v1_current() {
 		"current OS.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV2Raw(V2R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL, NULL, &info);
@@ -4065,7 +4080,7 @@ static bool test_insert_env_into_classad_version_v1_current() {
 	emit_param("ClassAd Env", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("ClassAd Env", "%s", actual);
-	if(!strings_similar(actual, V1R, ";")) {
+	if(!strings_similar(actual, V1R, V1_ENV_DELIM)) {
 		free(actual); free(version);
 		FAIL;
 	}
@@ -4081,11 +4096,11 @@ static bool test_insert_env_into_classad_version_v1_error_v2() {
 	emit_comment("This test just checks if the error message is not empty.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	MyString error;
 	env.MergeFromV2Raw(V2R_SEMI, NULL);
 	ClassAd classad;
-	classad.initFromString(AD_V2);
+	initAdFromString(AD_V2, classad);
 	env.InsertEnvIntoClassAd(&classad, &error, NULL, &info);
 	classad.LookupString("Env", &actual);
 	emit_input_header();
@@ -4111,7 +4126,7 @@ static bool test_insert_env_into_classad_version_v1_error() {
 	emit_comment("This test just checks if the error message is not empty.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 6.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	MyString error;
 	env.MergeFromV2Raw(V2R_SEMI, NULL);
 	ClassAd classad;
@@ -4139,7 +4154,7 @@ static bool test_insert_env_into_classad_version_v2() {
 		"CondorVersionInfo doesn't require V1 format.");
 	Env env;
 	CondorVersionInfo info("$CondorVersion: 7.0.0 " __DATE__ " PRE-RELEASE $");
-	char *actual, *version = info.get_version_string();
+	char *actual = NULL, *version = info.get_version_string();
 	env.MergeFromV1Raw(V1R, NULL);
 	ClassAd classad;
 	env.InsertEnvIntoClassAd(&classad, NULL, NULL, &info);
@@ -4645,7 +4660,7 @@ static bool test_get_delim_str_v1_raw_result_v1() {
 	emit_param("Result MyString", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("Result MyString", "%s", actual.Value());
-	if(!strings_similar(actual.Value(), V1R, ";")) {
+	if(!strings_similar(actual.Value(), V1R, V1_ENV_DELIM)) {
 		FAIL;
 	}
 	PASS;
@@ -4666,7 +4681,7 @@ static bool test_get_delim_str_v1_raw_result_v2() {
 	emit_param("Result MyString", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("Result MyString", "%s", actual.Value());
-	if(!strings_similar(actual.Value(), V1R, ";")) {
+	if(!strings_similar(actual.Value(), V1R, V1_ENV_DELIM)) {
 		FAIL;
 	}
 	PASS;
@@ -4692,8 +4707,8 @@ static bool test_get_delim_str_v1_raw_result_add() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R_REP, ";") || 
-		!strings_similar(actual2.Value(), V1R_REP_ADD, ";"))
+	if(!strings_similar(actual1.Value(), V1R_REP, V1_ENV_DELIM) || 
+		!strings_similar(actual2.Value(), V1R_REP_ADD, V1_ENV_DELIM))
 	{
 		FAIL;
 	}
@@ -4720,8 +4735,8 @@ static bool test_get_delim_str_v1_raw_result_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") || 
-		!strings_similar(actual2.Value(), V1R_REP, ";"))
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) || 
+		!strings_similar(actual2.Value(), V1R_REP, V1_ENV_DELIM))
 	{
 		FAIL;
 	}
@@ -4748,8 +4763,8 @@ static bool test_get_delim_str_v1_raw_result_add_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") || 
-		!strings_similar(actual2.Value(), V1R_REP_ADD, ";"))
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) || 
+		!strings_similar(actual2.Value(), V1R_REP_ADD, V1_ENV_DELIM))
 	{
 		FAIL;
 	}
@@ -4784,7 +4799,7 @@ static bool test_get_delim_str_v1or2_raw_ad_return_v1() {
 		"ClassAd using V1 format.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	MyString result, error;
 	bool expect = true;
 	bool actual = env.getDelimitedStringV1or2Raw(&classad, &result, &error);
@@ -4808,7 +4823,7 @@ static bool test_get_delim_str_v1or2_raw_ad_return_v2() {
 		"ClassAd using V2 format.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2, NULL);
+	initAdFromString(AD_V2, classad);
 	MyString result, error;
 	bool expect = true;
 	bool actual = env.getDelimitedStringV1or2Raw(&classad, &result, &error);
@@ -4832,7 +4847,7 @@ static bool test_get_delim_str_v1or2_raw_ad_return_invalid_v1() {
 		"passed an invalid ClassAd using V1 format.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_MISS_BOTH, NULL);
+	initAdFromString(AD_V1_MISS_BOTH, classad);
 	MyString result, error;
 	bool expect = false;
 	bool actual = env.getDelimitedStringV1or2Raw(&classad, &result, &error);
@@ -4856,7 +4871,7 @@ static bool test_get_delim_str_v1or2_raw_ad_return_invalid_v2() {
 		"passed an invalid ClassAd using V2 format.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_MISS_BOTH, NULL);
+	initAdFromString(AD_V2_MISS_BOTH, classad);
 	MyString result, error;
 	bool expect = false;
 	bool actual = env.getDelimitedStringV1or2Raw(&classad, &result, &error);
@@ -4881,7 +4896,7 @@ static bool test_get_delim_str_v1or2_raw_ad_error_v1() {
 	emit_comment("This test just checks if the error message is not empty.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_MISS_BOTH, NULL);
+	initAdFromString(AD_V1_MISS_BOTH, classad);
 	MyString result, error;
 	env.getDelimitedStringV1or2Raw(&classad, &result, &error);
 	emit_input_header();
@@ -4903,7 +4918,7 @@ static bool test_get_delim_str_v1or2_raw_ad_error_v2() {
 	emit_comment("This test just checks if the error message is not empty.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_MISS_BOTH, NULL);
+	initAdFromString(AD_V2_MISS_BOTH, classad);
 	MyString result, error;
 	env.getDelimitedStringV1or2Raw(&classad, &result, &error);
 	emit_input_header();
@@ -4946,7 +4961,7 @@ static bool test_get_delim_str_v1or2_raw_ad_result_v1() {
 		"MyString to the expected value for an Env object in V1 format.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	MyString actual, error;
 	env.getDelimitedStringV1or2Raw(&classad, &actual, &error);
 	emit_input_header();
@@ -4958,7 +4973,7 @@ static bool test_get_delim_str_v1or2_raw_ad_result_v1() {
 	emit_param("Result MyString", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("Result MyString", "%s", actual.Value());
-	if(!strings_similar(actual.Value(), V1R, ";")) {
+	if(!strings_similar(actual.Value(), V1R, V1_ENV_DELIM)) {
 		FAIL;
 	}
 	PASS;
@@ -4969,7 +4984,7 @@ static bool test_get_delim_str_v1or2_raw_ad_result_v2() {
 		"MyString to the expected value for an Env object in V2 format.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V2_SEMI, NULL);
+	initAdFromString(AD_V2_SEMI, classad);
 	MyString actual, error;
 	env.getDelimitedStringV1or2Raw(&classad, &actual, &error);
 	emit_input_header();
@@ -4993,7 +5008,7 @@ static bool test_get_delim_str_v1or2_raw_ad_result_replace() {
 		"from the ClassAd.");
 	Env env;
 	ClassAd classad;
-	classad.initFromString(AD_V1_REP, NULL);
+	initAdFromString(AD_V1_REP, classad);
 	MyString actual1, actual2, error;
 	env.MergeFromV1Raw(V1R, NULL);
 	env.getDelimitedStringV1Raw(&actual1, &error);
@@ -5009,8 +5024,8 @@ static bool test_get_delim_str_v1or2_raw_ad_result_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") || 
-		!strings_similar(actual2.Value(), V1R_REP, ";")) 
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) || 
+		!strings_similar(actual2.Value(), V1R_REP, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5117,7 +5132,7 @@ static bool test_get_delim_str_v1or2_raw_result_v1() {
 	emit_param("Result MyString", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("Result MyString", "%s", actual.Value());
-	if(!strings_similar(actual.Value(), V1R, ";")) {
+	if(!strings_similar(actual.Value(), V1R, V1_ENV_DELIM)) {
 		FAIL;
 	}
 	PASS;
@@ -5164,8 +5179,8 @@ static bool test_get_delim_str_v1or2_raw_result_add() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R_REP, ";") ||
-		!strings_similar(actual2.Value(), V1R_REP_ADD, ";")) 
+	if(!strings_similar(actual1.Value(), V1R_REP, V1_ENV_DELIM) ||
+		!strings_similar(actual2.Value(), V1R_REP_ADD, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5192,8 +5207,8 @@ static bool test_get_delim_str_v1or2_raw_result_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") ||
-		!strings_similar(actual2.Value(), V1R_REP, ";")) 
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) ||
+		!strings_similar(actual2.Value(), V1R_REP, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5220,8 +5235,8 @@ static bool test_get_delim_str_v1or2_raw_result_add_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") ||
-		!strings_similar(actual2.Value(), V1R_REP_ADD, ";")) 
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) ||
+		!strings_similar(actual2.Value(), V1R_REP_ADD, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5539,7 +5554,7 @@ static bool test_get_delim_str_v1r_or_v2q_result_v1() {
 	emit_param("Result MyString", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("Result MyString", "%s", actual.Value());
-	if(!strings_similar(actual.Value(), V1R, ";")) {
+	if(!strings_similar(actual.Value(), V1R, V1_ENV_DELIM)) {
 		FAIL;
 	}
 	PASS;
@@ -5588,8 +5603,8 @@ static bool test_get_delim_str_v1r_or_v2q_result_add() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R_REP, ";") ||
-		!strings_similar(actual2.Value(), V1R_REP_ADD, ";")) 
+	if(!strings_similar(actual1.Value(), V1R_REP, V1_ENV_DELIM) ||
+		!strings_similar(actual2.Value(), V1R_REP_ADD, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5616,8 +5631,8 @@ static bool test_get_delim_str_v1r_or_v2q_result_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") ||
-		!strings_similar(actual2.Value(), V1R_REP, ";")) 
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) ||
+		!strings_similar(actual2.Value(), V1R_REP, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5644,8 +5659,8 @@ static bool test_get_delim_str_v1r_or_v2q_result_add_replace() {
 	emit_output_actual_header();
 	emit_param("Result MyString Before", "%s", actual1.Value());
 	emit_param("Result MyString After", "%s", actual2.Value());
-	if(!strings_similar(actual1.Value(), V1R, ";") ||
-		!strings_similar(actual2.Value(), V1R_REP_ADD, ";")) 
+	if(!strings_similar(actual1.Value(), V1R, V1_ENV_DELIM) ||
+		!strings_similar(actual2.Value(), V1R_REP_ADD, V1_ENV_DELIM)) 
 	{
 		FAIL;
 	}
@@ -5995,9 +6010,9 @@ static bool test_is_safe_env_v1_value_false_semi() {
 		"with a semicolon.");
 	Env env;
 	bool expect = false;
-	bool actual = env.IsSafeEnvV1Value("semi=;");
+	bool actual = env.IsSafeEnvV1Value("semi=" V1_ENV_DELIM);
 	emit_input_header();
-	emit_param("STRING", "%s", "semi=;");
+	emit_param("STRING", "%s", "semi=" V1_ENV_DELIM);
 	emit_output_expected_header();
 	emit_retval("%s", tfstr(expect));
 	emit_output_actual_header();
@@ -6412,7 +6427,7 @@ static bool test_v2_quoted_to_v2_raw_result_semi() {
 	emit_param("Result MyString", "%s", V1R);
 	emit_output_actual_header();
 	emit_param("Result MyString", "%s", result.Value());
-	if(!strings_similar(result.Value(), V1R, ";")) {
+	if(!strings_similar(result.Value(), V1R, V1_ENV_DELIM)) {
 		FAIL;
 	}
 	PASS;
@@ -6574,7 +6589,7 @@ static bool test_input_was_v1_false_ad() {
 	emit_test("Test that InputWasV1() returns false for an Env object "
 		"created from a ClassAd that uses a V2 environment with MergeFrom().");
 	ClassAd classad;
-	classad.initFromString(AD_V2, NULL);
+	initAdFromString(AD_V2, classad);
 	Env env;
 	env.MergeFrom(&classad, NULL);
 	bool expect = false;
@@ -6633,7 +6648,7 @@ static bool test_input_was_v1_true_ad() {
 	emit_test("Test that InputWasV1() returns true for an Env object "
 		"created from a ClassAd that uses a V1 environment with MergeFrom().");
 	ClassAd classad;
-	classad.initFromString(AD_V1, NULL);
+	initAdFromString(AD_V1, classad);
 	Env env;
 	env.MergeFrom(&classad, NULL);
 	bool expect = true;

@@ -112,12 +112,14 @@ static const char NiceUserName[] = "nice-user";
 #endif
 
 /* Max space needed to hold an IP string, as
- * returned by inet_ntoa().
+ * returned by inet_ntoa().  Includes space for
+ * optional decoration like the square brackets
+ * around an IPv6 address.
  */
-static const size_t IP_STRING_BUF_SIZE = 46;
+static const size_t IP_STRING_BUF_SIZE = 48;
 
 /* Max space needed to hold a sinful string, as
- * returned by sin_to_string()
+ * returned by condor_sockaddr::to_sinful()
  */
 // TODO: [IPV6] Should be increased
 #define SINFUL_STRING_BUF_SIZE 64
@@ -139,5 +141,7 @@ static const size_t IP_STRING_BUF_SIZE = 46;
 #define DEFAULT_SHORT_COMMAND_DEADLINE 600
 
 #define STANDARD_COMMAND_PAYLOAD_TIMEOUT 300
+
+#define USE_INSTANCE_ROLE_MAGIC_STRING "FROM INSTANCE"
 
 #endif /* CONDOR_CONSTANTS_H */

@@ -69,7 +69,7 @@ class ExprList : public ExprTree
 	    typedef std::vector<ExprTree*>::iterator       iterator;
     	typedef std::vector<ExprTree*>::const_iterator const_iterator;
 
-        int size() const             { return exprList.size();  }
+        int size() const             { return (int)exprList.size();  }
         iterator begin()             { return exprList.begin(); }
 		iterator end()               { return exprList.end();   }
 		const_iterator begin() const { return exprList.begin(); }
@@ -80,8 +80,12 @@ class ExprList : public ExprTree
 		void erase(iterator it);
 		void erase(iterator f, iterator l);
 	
+		virtual const ClassAd *GetParentScope( ) const { return( parentScope ); }
+
 	private:
 		friend class ExprListIterator;
+
+		const ClassAd   *parentScope;
 
 		std::vector<ExprTree*> exprList;
 

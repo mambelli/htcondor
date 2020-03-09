@@ -25,6 +25,28 @@
 #include "selector.h"
 #include "condor_threads.h"
 
+#ifndef SELECTOR_USE_POLL
+#define POLLIN 1
+#define POLLOUT 2
+#define POLLERR 4
+#define POLLHUP 8
+int poll(struct fake_pollfd *, int, int)
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#if defined(UNIX)
+#  define MY_FD_SET(fd, ptr)	FD_SET(fd % FD_SETSIZE, &ptr[fd / FD_SETSIZE])
+#  define MY_FD_CLR(fd, ptr)	FD_CLR(fd % FD_SETSIZE, &ptr[fd / FD_SETSIZE])
+#  define MY_FD_ISSET(fd, ptr)	FD_ISSET(fd % FD_SETSIZE, &ptr[fd / FD_SETSIZE])
+#else
+#  define MY_FD_SET		FD_SET
+#  define MY_FD_CLR		FD_CLR
+#  define MY_FD_ISSET	FD_ISSET
+#endif
+
 int Selector::_fd_select_size = -1;
 
 Selector::Selector()
@@ -41,13 +63,13 @@ Selector::Selector()
 	fd_set_size = ( fd_select_size() + (nfdbits - 1) ) / nfdbits;
 #endif
 
-	read_fds = (fd_set *)malloc( 6 * fd_set_size * sizeof(fd_set) );
-	write_fds = read_fds + ( 1 * fd_set_size );
-	except_fds = read_fds + ( 2 * fd_set_size );
+	read_fds = NULL;
+	write_fds = NULL;
+	except_fds = NULL;
 
-	save_read_fds = read_fds + ( 3 * fd_set_size );
-	save_write_fds = read_fds + ( 4 * fd_set_size );
-	save_except_fds = read_fds + ( 5 * fd_set_size );
+	save_read_fds = NULL;
+	save_write_fds = NULL;
+	save_except_fds = NULL;
 
 	reset();
 }
@@ -55,6 +77,38 @@ Selector::Selector()
 Selector::~Selector()
 {
 	free( read_fds );
+}
+
+void
+Selector::init_fd_sets()
+{
+	if ( read_fds == NULL ) {
+		read_fds = (fd_set *)calloc( 1, 6 * fd_set_size * sizeof(fd_set) );
+		write_fds = read_fds + ( 1 * fd_set_size );
+		except_fds = read_fds + ( 2 * fd_set_size );
+
+		save_read_fds = read_fds + ( 3 * fd_set_size );
+		save_write_fds = read_fds + ( 4 * fd_set_size );
+		save_except_fds = read_fds + ( 5 * fd_set_size );
+
+#if defined(WIN32)
+		FD_ZERO( save_read_fds );
+		FD_ZERO( save_write_fds );
+		FD_ZERO( save_except_fds );
+#endif
+	}
+
+	if ( m_single_shot == SINGLE_SHOT_OK ) {
+		if ( m_poll.events & POLLIN ) {
+			MY_FD_SET( m_poll.fd, save_read_fds );
+		}
+		if ( m_poll.events & POLLOUT ) {
+			MY_FD_SET( m_poll.fd, save_write_fds );
+		}
+		if ( m_poll.events & POLLERR ) {
+			MY_FD_SET( m_poll.fd, save_except_fds );
+		}
+	}
 }
 
 void
@@ -67,15 +121,25 @@ Selector::reset()
 	timeout.tv_sec = timeout.tv_usec = 0;
 
 	max_fd = -1;
+	if ( save_read_fds != NULL ) {
 #if defined(WIN32)
-	FD_ZERO( save_read_fds );
-	FD_ZERO( save_write_fds );
-	FD_ZERO( save_except_fds );
+		FD_ZERO( save_read_fds );
+		FD_ZERO( save_write_fds );
+		FD_ZERO( save_except_fds );
 #else
-	memset( save_read_fds, 0, fd_set_size * sizeof(fd_set) );
-	memset( save_write_fds, 0, fd_set_size * sizeof(fd_set) );
-	memset( save_except_fds, 0, fd_set_size * sizeof(fd_set) );
+		memset( save_read_fds, 0, fd_set_size * sizeof(fd_set) );
+		memset( save_write_fds, 0, fd_set_size * sizeof(fd_set) );
+		memset( save_except_fds, 0, fd_set_size * sizeof(fd_set) );
 #endif
+	}
+
+#ifdef SELECTOR_USE_POLL
+	m_single_shot = SINGLE_SHOT_VIRGIN;
+#else
+	m_single_shot = SINGLE_SHOT_SKIP;
+	init_fd_sets();
+#endif
+	memset(&m_poll, '\0', sizeof(m_poll));
 
 	if (IsDebugLevel(D_DAEMONCORE)) {
 		dprintf(D_DAEMONCORE | D_VERBOSE, "selector %p resetting\n", this);
@@ -167,35 +231,57 @@ Selector::add_fd( int fd, IO_FUNC interest )
 		free(fd_description);
 	}
 
-	switch( interest ) {
+	if ((m_single_shot == SINGLE_SHOT_OK) && (m_poll.fd != fd)) {
+		init_fd_sets();
+		m_single_shot = SINGLE_SHOT_SKIP;
+	} else if ( m_single_shot == SINGLE_SHOT_VIRGIN ) {
+		m_single_shot = SINGLE_SHOT_OK;
+	}
 
-	  case IO_READ:
-#if defined(WIN32)
-		if ( save_read_fds->fd_count >= fd_select_size() ) {
-			EXCEPT( "Selector::add_fd(): read fd_set is full" );
-		}
-#endif
-		FD_SET( fd, save_read_fds );
-		break;
+	if ( m_single_shot == SINGLE_SHOT_OK ) {
+		m_poll.fd = fd;
+		switch( interest ) {
+		case IO_READ:
+			m_poll.events |= POLLIN;
+			break;
 
-	  case IO_WRITE:
-#if defined(WIN32)
-		if ( save_write_fds->fd_count >= fd_select_size() ) {
-			EXCEPT( "Selector::add_fd(): write fd_set is full" );
+		case IO_WRITE:
+			m_poll.events |= POLLOUT;
+			break;
+
+		case IO_EXCEPT:
+			m_poll.events |= POLLERR;
+			break;
 		}
+	} else {
+		switch( interest ) {
+		case IO_READ:
+#if defined(WIN32)
+			if ( save_read_fds->fd_count >= fd_select_size() ) {
+				EXCEPT( "Selector::add_fd(): read fd_set is full" );
+			}
 #endif
-		FD_SET( fd, save_write_fds );
-		break;
+			MY_FD_SET( fd, save_read_fds );
+			break;
+
+		case IO_WRITE:
+#if defined(WIN32)
+			if ( save_write_fds->fd_count >= fd_select_size() ) {
+				EXCEPT( "Selector::add_fd(): write fd_set is full" );
+			}
+#endif
+			MY_FD_SET( fd, save_write_fds );
+			break;
 
 	  case IO_EXCEPT:
 #if defined(WIN32)
-		if ( save_except_fds->fd_count >= fd_select_size() ) {
-			EXCEPT( "Selector::add_fd(): except fd_set is full" );
-		}
+			if ( save_except_fds->fd_count >= fd_select_size() ) {
+				EXCEPT( "Selector::add_fd(): except fd_set is full" );
+			}
 #endif
-		FD_SET( fd, save_except_fds );
-		break;
-
+			MY_FD_SET( fd, save_except_fds );
+			break;
+		}
 	}
 }
 
@@ -209,6 +295,9 @@ Selector::delete_fd( int fd, IO_FUNC interest )
 	}
 #endif
 
+	init_fd_sets();
+	m_single_shot = SINGLE_SHOT_SKIP;
+
 	if (IsDebugLevel(D_DAEMONCORE)) {
 		dprintf(D_DAEMONCORE | D_VERBOSE, "selector %p deleting fd %d\n", this, fd);
 	}
@@ -216,15 +305,15 @@ Selector::delete_fd( int fd, IO_FUNC interest )
 	switch( interest ) {
 
 	  case IO_READ:
-		FD_CLR( fd, save_read_fds );
+		MY_FD_CLR( fd, save_read_fds );
 		break;
 
 	  case IO_WRITE:
-		FD_CLR( fd, save_write_fds );
+		MY_FD_CLR( fd, save_write_fds );
 		break;
 
 	  case IO_EXCEPT:
-		FD_CLR( fd, save_except_fds );
+		MY_FD_CLR( fd, save_except_fds );
 		break;
 
 	}
@@ -260,9 +349,11 @@ Selector::execute()
 	struct timeval timeout_copy;
 	struct timeval	*tp;
 
-	memcpy( read_fds, save_read_fds, fd_set_size * sizeof(fd_set) );
-	memcpy( write_fds, save_write_fds, fd_set_size * sizeof(fd_set) );
-	memcpy( except_fds, save_except_fds, fd_set_size * sizeof(fd_set) );
+	if ( m_single_shot == SINGLE_SHOT_SKIP ) {
+		memcpy( read_fds, save_read_fds, fd_set_size * sizeof(fd_set) );
+		memcpy( write_fds, save_write_fds, fd_set_size * sizeof(fd_set) );
+		memcpy( except_fds, save_except_fds, fd_set_size * sizeof(fd_set) );
+	}
 
 	if( timeout_wanted ) {
 		timeout_copy = timeout;
@@ -274,11 +365,17 @@ Selector::execute()
 		// select() ignores its first argument on Windows. We still track
 		// max_fd for the display() functions.
 	start_thread_safe("select");
-	nfds = select( max_fd + 1, 
-				  (SELECT_FDSET_PTR) read_fds, 
-				  (SELECT_FDSET_PTR) write_fds, 
-				  (SELECT_FDSET_PTR) except_fds, 
-				  tp );
+	if (m_single_shot == SINGLE_SHOT_VIRGIN) {
+		nfds = select( 0, NULL, NULL, NULL, tp );
+	}
+	else if (m_single_shot == SINGLE_SHOT_OK)
+	{
+		nfds = poll(&m_poll, 1, tp ? (1000*tp->tv_sec + tp->tv_usec/1000) : -1);
+	}
+	else
+	{
+		nfds = select( max_fd + 1, read_fds, write_fds, except_fds, tp );
+	}
 	_select_errno = errno;
 	stop_thread_safe("select");
 	_select_retval = nfds;
@@ -335,15 +432,15 @@ Selector::fd_ready( int fd, IO_FUNC interest )
 	switch( interest ) {
 
 	  case IO_READ:
-		return FD_ISSET( fd, read_fds );
+		return (SINGLE_SHOT_SKIP != m_single_shot) ? (m_poll.revents & (POLLIN|POLLHUP)) : MY_FD_ISSET( fd, read_fds );
 		break;
 
 	  case IO_WRITE:
-		return FD_ISSET( fd, write_fds );
+		return (SINGLE_SHOT_SKIP != m_single_shot) ? (m_poll.revents & (POLLOUT|POLLHUP)) : MY_FD_ISSET( fd, write_fds );
 		break;
 
 	  case IO_EXCEPT:
-		return FD_ISSET( fd, except_fds );
+		return (SINGLE_SHOT_SKIP != m_single_shot) ? (m_poll.revents & POLLERR) : MY_FD_ISSET( fd, except_fds );
 		break;
 
 	}
@@ -379,6 +476,11 @@ Selector::has_ready()
 void
 Selector::display()
 {
+	// TODO This function doesn't properly handle situations where
+	//   poll() is used to query a single fd. Currently, it's only
+	//   called in DaemonCore::Driver(), where we should always be
+	//   in select() mode.
+	init_fd_sets();
 
 	switch( state ) {
 
@@ -435,7 +537,7 @@ display_fd_set( const char *msg, fd_set *set, int max, bool try_dup )
 
 	dprintf( D_ALWAYS, "%s {", msg );
 	for( i=0, count=0; i<=max; i++ ) {
-		if( FD_ISSET(i,set) ) {
+		if( MY_FD_ISSET(i,set) ) {
 			count++;
 
 			dprintf( D_ALWAYS | D_NOHEADER, "%d", i );

@@ -1,0 +1,16 @@
+
+[Unit]
+Description=Boot-time configuration for an HTCondor annex instance
+After=network-online.target nslcd.service ypbind.service time-sync.target nfs.client.target autofs.service
+Before=condor.service
+Wants=condor.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/condor/condor-annex-ec2 start
+TimeoutSec=0
+
+[Install]
+WantedBy=multi-user.target
+

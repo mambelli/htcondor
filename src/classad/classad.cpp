@@ -30,6 +30,13 @@ extern "C" void to_lower (char *);	// from util_lib (config.c)
 
 namespace classad {
 
+#define ATTR_TOPLEVEL "toplevel"
+#define ATTR_ROOT "root"
+#define ATTR_SELF "self"
+#define ATTR_PARENT "parent"
+#define ATTR_MY "my"
+#define ATTR_CURRENT_TIME "CurrentTime"
+
 // This flag is only meant for use in Condor, which is transitioning
 // from an older version of ClassAds with slightly different evaluation
 // semantics. It will be removed without warning in a future release.
@@ -68,10 +75,47 @@ void ClassAdLibraryVersion(string &version_string)
     return;
 }
 
+static inline ReferencesBySize &getSpecialAttrNames()
+{
+	static ReferencesBySize specialAttrNames;
+	static bool specialAttrNames_inited = false;
+	if ( !specialAttrNames_inited ) {
+		specialAttrNames.insert( ATTR_TOPLEVEL );
+		specialAttrNames.insert( ATTR_ROOT );
+		specialAttrNames.insert( ATTR_SELF );
+		specialAttrNames.insert( ATTR_PARENT );
+		specialAttrNames_inited = true;
+	}
+	return specialAttrNames;
+}
+
+static FunctionCall *getCurrentTimeExpr()
+{
+	static classad_shared_ptr<FunctionCall> curr_time_expr;
+	if ( !curr_time_expr ) {
+		vector<ExprTree*> args;
+		curr_time_expr.reset( FunctionCall::MakeFunctionCall( "time", args ) );
+	}
+	return curr_time_expr.get();
+}
+
+void SetOldClassAdSemantics(bool enable)
+{
+	_useOldClassAdSemantics = enable;
+	if ( enable ) {
+		getSpecialAttrNames().insert( ATTR_MY );
+		getSpecialAttrNames().insert( ATTR_CURRENT_TIME );
+	} else {
+		getSpecialAttrNames().erase( ATTR_MY );
+		getSpecialAttrNames().erase( ATTR_CURRENT_TIME );
+	}
+}
+
 ClassAd::
 ClassAd ()
 {
-	EnableDirtyTracking();
+	parentScope = NULL;
+	do_dirty_tracking = false;
 	chained_parent_ad = NULL;
 	alternateScope = NULL;
 }
@@ -113,6 +157,7 @@ CopyFrom( const ClassAd &ad )
 		ExprTree::CopyFrom(ad);
 		chained_parent_ad = ad.chained_parent_ad;
 		alternateScope = ad.alternateScope;
+		parentScope = ad.parentScope;
 		
 		this->do_dirty_tracking = false;
 		for( itr = ad.attrList.begin( ); itr != ad.attrList.end( ); itr++ ) {
@@ -124,7 +169,7 @@ CopyFrom( const ClassAd &ad )
                 break;
 			}
 			
-			Insert(itr->first, tree, false);
+			Insert(itr->first, tree);
 			if (ad.do_dirty_tracking && ad.IsAttributeDirty(itr->first)) {
 				dirtyAttrList.insert(itr->first);
 			}
@@ -233,6 +278,19 @@ GetComponents( vector< pair< string, ExprTree* > > &attrs ) const
 	}
 }
 
+void ClassAd::
+GetComponents( vector< pair< string, ExprTree* > > &attrs,
+	const References &whitelist ) const
+{
+	attrs.clear( );
+	for ( References::const_iterator wl_itr = whitelist.begin(); wl_itr != whitelist.end(); wl_itr++ ) {
+		AttrList::const_iterator attr_itr = attrList.find( *wl_itr );
+		if ( attr_itr != attrList.end() ) {
+			attrs.push_back( make_pair( attr_itr->first, attr_itr->second ) );
+		}
+	}
+}
+
 
 // --- begin integer attribute insertion ----
 bool ClassAd::
@@ -269,6 +327,25 @@ InsertAttr( const string &name, long long value, Value::NumberFactor f )
 	val.SetIntegerValue( value );
 	plit = Literal::MakeLiteral( val, f );
 	return( Insert( name, plit ) );
+}
+
+bool ClassAd::
+InsertAttr( const string &name, long long value)
+{
+	MarkAttributeDirty(name);
+
+	// Optimized insert of long long values that overwrite the destination value if the destination is a literal.
+	classad::ExprTree* & expr = attrList[name];
+	if (expr) {
+		if (expr->GetKind() == LITERAL_NODE) {
+			((Literal*)expr)->SetLong(value);
+			return true;
+		} else {
+			delete expr;
+		}
+	}
+	expr = Literal::MakeLong(value);
+	return expr != NULL;
 }
 
 
@@ -316,7 +393,27 @@ InsertAttr( const string &name, double value, Value::NumberFactor f )
 	
 	return( Insert( name, plit ) );
 }
-	
+
+
+bool ClassAd::
+InsertAttr( const string &name, double value)
+{
+	MarkAttributeDirty(name);
+
+	// Optimized insert of Real values that overwrite the destination value if the destination is a literal.
+	classad::ExprTree* & expr = attrList[name];
+	if (expr) {
+		if (expr->GetKind() == LITERAL_NODE) {
+			((Literal*)expr)->SetReal(value);
+			return true;
+		} else {
+			delete expr;
+		}
+	}
+	expr = Literal::MakeReal(value);
+	return expr != NULL;
+}
+
 
 bool ClassAd::
 DeepInsertAttr( ExprTree *scopeExpr, const string &name, double value, 
@@ -334,13 +431,20 @@ DeepInsertAttr( ExprTree *scopeExpr, const string &name, double value,
 bool ClassAd::
 InsertAttr( const string &name, bool value )
 {
-	ExprTree* plit ;
-	Value val;
-	
-	val.SetBooleanValue( value );
-	plit  = Literal::MakeLiteral( val );
-	
-	return( Insert( name, plit ) );
+	MarkAttributeDirty(name);
+
+	// Optimized insert of bool values that overwrite the destination value if the destination is a literal.
+	classad::ExprTree* & expr = attrList[name];
+	if (expr) {
+		if (expr->GetKind() == LITERAL_NODE) {
+			((Literal*)expr)->SetBool(value);
+			return true;
+		} else {
+			delete expr;
+		}
+	}
+	expr = Literal::MakeBool(value);
+	return expr != NULL;
 }
 
 
@@ -359,14 +463,29 @@ DeepInsertAttr( ExprTree *scopeExpr, const string &name, bool value )
 bool ClassAd::
 InsertAttr( const string &name, const char *value )
 {
-	ExprTree* plit;
-	Value val;
-	
-	val.SetStringValue( value );
-	plit  = Literal::MakeLiteral( val );
-	
+	ExprTree* plit  = Literal::MakeString( value );
 	return( Insert( name, plit ) );
 }
+
+bool ClassAd::
+InsertAttr( const string &name, const char * str, size_t len)
+{
+	MarkAttributeDirty(name);
+
+	// Optimized insert of long long values that overwrite the destination value if the destination is a literal.
+	classad::ExprTree* & expr = attrList[name];
+	if (expr) {
+		if (expr->GetKind() == LITERAL_NODE) {
+			((Literal*)expr)->SetString(str, len);
+			return true;
+		} else {
+			delete expr;
+		}
+	}
+	expr = Literal::MakeString( str, len );
+	return expr != NULL;
+}
+
 
 bool ClassAd::
 DeepInsertAttr( ExprTree *scopeExpr, const string &name, const char *value )
@@ -379,12 +498,7 @@ DeepInsertAttr( ExprTree *scopeExpr, const string &name, const char *value )
 bool ClassAd::
 InsertAttr( const string &name, const string &value )
 {
-	ExprTree* plit ;
-	Value val;
-	
-	val.SetStringValue( value );
-	plit  = Literal::MakeLiteral( val );
-	
+	ExprTree* plit  = Literal::MakeString( value );
 	return( Insert( name, plit ) );
 }
 
@@ -398,157 +512,168 @@ DeepInsertAttr( ExprTree *scopeExpr, const string &name, const string &value )
 }
 // --- end string attribute insertion
 
-bool ClassAd::Insert( const std::string& serialized_nvp)
+#if 0
+// disabled, compat layer handles this. use the 3 argument form below to insert through the classad cache.
+bool ClassAd::Insert(const std::string& serialized_nvp);
+#endif
+
+// Parse and insert an attribute value via cache if the cache is enabled
+//
+bool ClassAd::InsertViaCache( std::string& name, const std::string & rhs, bool lazy /*=false*/)
 {
+	if (name.empty()) return false;
 
-  bool bRet = false;
-  string name, szValue;
-  size_t pos, npos, vpos;
-  size_t bpos = 0;
-  
-  // comes in as "name = value" "name= value" or "name =value"
-  npos=pos=serialized_nvp.find("=");
-  
-  // only try to process if the string is valid 
-  if ( pos != string::npos  )
-  {
-    while (npos > 0 && serialized_nvp[npos-1] == ' ')
-    {
-      npos--;
-    }
-    while (bpos < npos && serialized_nvp[bpos] == ' ')
-    {
-      bpos++;
-    }
-    name = serialized_nvp.substr(bpos, npos - bpos);
+	// use cache if it is enabled, and the attribute name is not 'special' (i.e. doesn't start with a quote)
+	bool use_cache = doExpressionCaching;
+	if (name[0] == '\'') {
+		use_cache = false;
+	}
 
-    vpos=pos+1;
-    while (serialized_nvp[vpos] == ' ')
-    {
-      vpos++;
-    }
-
-    szValue = serialized_nvp.substr(vpos);
-
-	if ( name[0] == '\'' ) {
-		// We don't handle quoted attribute names for caching here.
-		// Hand the name-value-pair off to the parser as a one-attribute
-		// ad and merge the results into this ad.
-		ClassAdParser parser;
-		ClassAd new_ad;
-		name = "[" + serialized_nvp + "]";
-		if ( parser.ParseClassAd( name, new_ad, true ) ) {
-			return Update( new_ad );
-		} else {
-			return false;
+	// check the cache to see if we already have an expr tree, if we do then we
+	// get back a new envelope node, which we can just insert into the ad.
+	ExprTree * tree = NULL;
+	if (use_cache) {
+		CachedExprEnvelope * penv = CachedExprEnvelope::check_hit(name, rhs);
+		if (penv) {
+			tree = penv;
+			return Insert(name, tree);
+		}
+		if (lazy) {
+			tree = CachedExprEnvelope::cache_lazy(name, rhs);
+			return Insert(name, tree);
 		}
 	}
 
-    // here is the special logic to check
-    CachedExprEnvelope * cache_check = NULL;
-	if ( doExpressionCaching ) {
-		cache_check = CachedExprEnvelope::check_hit( name, szValue );
+	// we did not use the cache, or get a hit in the cache... parse the expression
+	ClassAdParser parser;
+	parser.SetOldClassAd(true);
+	tree = parser.ParseExpression(rhs);
+	if ( ! tree) {
+		return false;
 	}
-    if ( cache_check ) 
-    {
-	ExprTree * in = cache_check;
-	bRet = Insert( name, in, false );
-    }
-    else
-    {
-      ClassAdParser parser;
-      ExprTree * newTree=0;
 
-      // we did not hit in the cache... parse the expression
-      newTree = parser.ParseExpression(szValue);
-
-      if ( newTree )
-      {
-		// if caching is enabled, and we got to here then we know that the 
-		// cache doesn't already have an entry for this name:value, so add
-		// it to the cache now. 
-		if (doExpressionCaching) {
-			newTree = CachedExprEnvelope::cache(name, szValue, newTree);
-		}
-		bRet = Insert(name, newTree, false);
-      }
-
-    }
-    
-  } // end if pos != string::npos
-
-  return bRet;
+	// if caching is enabled, and we got to here then we know that the
+	// cache doesn't already have an entry for this name:value, so add
+	// it to the cache now.
+	if (use_cache) {
+		tree = CachedExprEnvelope::cache(name, tree, rhs);
+	}
+	return Insert(name, tree);
 }
 
-
-bool ClassAd::Insert( const std::string& attrName, ClassAd *& expr, bool cache )
+bool
+ClassAd::Insert(const std::string &str)
 {
-    ExprTree * tree = expr;
-    bool bRet =  Insert( attrName, tree, cache );
-    
-    expr = (ClassAd *)tree;
-    return (bRet);
-	
+	// this is not the optimial path, it would be better to
+	// use either the 2 argument insert, or the const char* form below
+	return this->Insert(str.c_str());
 }
 
-bool ClassAd::Insert( const std::string& attrName, ExprTree *& pRef, bool cache )
+bool
+ClassAd::Insert( const char *str )
+{
+	std::string attr;
+	const char * rhs;
+
+	while (isspace(*str)) ++str;
+
+	// We don't support quoted attribute names in this old ClassAds method.
+	if ( *str == '\'' ) {
+		return false;
+	}
+
+	const char * peq = strchr(str, '=');
+	if ( ! peq) return false;
+
+	const char * p = peq;
+	while (p > str && ' ' == p[-1]) --p;
+	attr.assign(str, p-str);
+
+	if ( attr.empty() ) {
+		return false;
+	}
+
+	// set rhs to the first non-space character after the =
+	p = peq+1;
+	while (' ' == *p) ++p;
+	rhs = p;
+
+	return InsertViaCache(attr, rhs);
+}
+
+bool ClassAd::
+AssignExpr(const std::string &name, const char *value)
+{
+	ClassAdParser par;
+	ExprTree *expr = NULL;
+	par.SetOldClassAd( true );
+
+	if ( value == NULL ) {
+		return false;
+	}
+	if ( !par.ParseExpression( value, expr, true ) ) {
+		return false;
+	}
+	if ( !Insert( name, expr ) ) {
+		delete expr;
+		return false;
+	}
+	return true;
+}
+
+bool ClassAd::Insert( const std::string& attrName, ExprTree * tree )
 {
 	bool bRet = false;
-	ExprTree * tree = pRef;
-	const std::string * pstrAttr = &attrName;
-#ifndef WIN32
-	std::string strName; // in case we want to insert attrName into the cache
-#endif
 	
 		// sanity checks
 	if( attrName.empty() ) {
 		CondorErrno = ERR_MISSING_ATTRNAME;
 		CondorErrMsg= "no attribute name when inserting expression in classad";
-		return( false );
+		return false;
 	}
-	if( !pRef ) {
+	if( !tree ) {
 		CondorErrno = ERR_BAD_EXPRESSION;
 		CondorErrMsg = "no expression when inserting attribute in classad";
-		return( false );
+		return false;
 	}
 
-	if (doExpressionCaching && cache)
-	{
-	  std::string empty; // an empty string to tell the cache to unparse the pRef
-#ifndef WIN32
-	  // when inserting an attrib into the cache, strName can get overwritten
-	  // by the string sharing code.  if it does we want to use strName from now on.
-	  strName = attrName; pstrAttr = &strName;
-	  tree = CachedExprEnvelope::cache(strName, empty, pRef);
+	// parent of the expression is this classad
+	tree->SetParentScope( this );
+
+	pair<AttrList::iterator,bool> insert_result = attrList.emplace(attrName, tree);
+	if ( ! insert_result.second) {
+			// replace existing value
+		delete insert_result.first->second;
+		insert_result.first->second = tree;
+	}
+
+	MarkAttributeDirty(attrName);
+
+	return true;
+}
+
+// Optimized code for inserting literals, use when the caller has guaranteed the validity
+// of the name and literal and wants a fast code path for insertion.  This function ALWAYS
+// bypasses the classad cache, which is fine for numeral literals, but probably a bad idea
+// for large string literals.
+//
+bool ClassAd::InsertLiteral(const std::string & name, Literal* lit)
+{
+#if 0 // tj wonders, is this slower/faster?
+	classad::ExprTree* & ppv = attrList[name];
+	if (ppv) delete ppv;
+	ppv = lit;
 #else
-	  // std:string based string sharing is disabled on windows.
-	  tree = CachedExprEnvelope::cache(attrName, empty, pRef);
+	pair<AttrList::iterator,bool> insert_result = attrList.emplace(name, lit);
+
+	if( !insert_result.second ) {
+			// replace existing value
+		delete insert_result.first->second;
+		insert_result.first->second = lit;
+	}
 #endif
-	  // what goes in may be destroyed in preference for cache.
-	  pRef = (ExprTree *)tree->self(); 
-	}
-	
-	if (tree)
-	{
-		
-		// parent of the expression is this classad
-		tree->SetParentScope( this );
-				
-		pair<AttrList::iterator,bool> insert_result =
-			attrList.insert( AttrList::value_type(*pstrAttr,tree) );
-
-		if( !insert_result.second ) {
-				// replace existing value
-			delete insert_result.first->second;
-			insert_result.first->second = tree;
-		}
-
-		MarkAttributeDirty(*pstrAttr);
-
-		bRet = true;
-	}
-	
-	return( bRet );
+	MarkAttributeDirty(name);
+	return true;
 }
 
 
@@ -593,6 +718,20 @@ Lookup( const string &name ) const
 	return tree;
 }
 
+ExprTree *ClassAd::
+LookupIgnoreChain( const string &name ) const
+{
+	ExprTree *tree;
+	AttrList::const_iterator itr;
+
+	itr = attrList.find( name );
+	if (itr != attrList.end()) {
+		tree = itr->second;
+	} else {
+		tree = NULL;
+	}
+	return tree;
+}
 
 ExprTree *ClassAd::
 LookupInScope( const string &name, const ClassAd *&finalScope ) const
@@ -616,9 +755,7 @@ LookupInScope( const string &name, const ClassAd *&finalScope ) const
 int ClassAd::
 LookupInScope(const string &name, ExprTree*& expr, EvalState &state) const
 {
-	extern int exprHash( const ExprTree* const&, int );
 	const ClassAd *current = this, *superScope;
-	Value			val;
 
 	expr = NULL;
 
@@ -632,30 +769,40 @@ LookupInScope(const string &name, ExprTree*& expr, EvalState &state) const
 			return( EVAL_OK );
 		}
 
-		superScope = current->parentScope;
-		if(strcasecmp(name.c_str( ),"toplevel")==0 || 
-				strcasecmp(name.c_str( ),"root")==0){
+		if ( state.rootAd == current ) {
+			superScope = NULL;
+		} else {
+			superScope = current->parentScope;
+		}
+		if ( getSpecialAttrNames().find(name) == getSpecialAttrNames().end() ) {
+			// continue searching from the superScope ...
+			current = superScope;
+			if( current == this ) {		// NAC - simple loop checker
+				return( EVAL_UNDEF );
+			}
+		} else if(strcasecmp(name.c_str( ),ATTR_TOPLEVEL)==0 ||
+				strcasecmp(name.c_str( ),ATTR_ROOT)==0){
 			// if the "toplevel" attribute was requested ...
 			expr = (ClassAd*)state.rootAd;
 			if( expr == NULL ) {	// NAC - circularity so no root
 				return EVAL_FAIL;  	// NAC
 			}						// NAC
 			return( expr ? EVAL_OK : EVAL_UNDEF );
-		} else if( strcasecmp( name.c_str( ), "self" ) == 0 ) {
+		} else if( strcasecmp( name.c_str( ), ATTR_SELF ) == 0 ||
+				   strcasecmp( name.c_str( ), ATTR_MY ) == 0 ) {
 			// if the "self" ad was requested
 			expr = (ClassAd*)state.curAd;
 			return( expr ? EVAL_OK : EVAL_UNDEF );
-		} else if( strcasecmp( name.c_str( ), "parent" ) == 0 ) {
+		} else if( strcasecmp( name.c_str( ), ATTR_PARENT ) == 0 ) {
 			// the lexical parent
-			expr = (ClassAd*)state.curAd->parentScope;
+			expr = (ClassAd*)superScope;
 			return( expr ? EVAL_OK : EVAL_UNDEF );
-		} else {
-			// continue searching from the superScope ...
-			current = superScope;
-			if( current == this ) {		// NAC - simple loop checker
-				return( EVAL_UNDEF );
-			}
+		} else if( strcasecmp( name.c_str( ), ATTR_CURRENT_TIME ) == 0 ) {
+			// an alias for time() from old ClassAds
+			expr = getCurrentTimeExpr();
+			return ( expr ? EVAL_OK : EVAL_UNDEF );
 		}
+
 	}	
 
 	return( EVAL_UNDEF );
@@ -756,10 +903,11 @@ DeepRemove( ExprTree *scopeExpr, const string &name )
 
 
 void ClassAd::
-_SetParentScope( const ClassAd* )
+_SetParentScope( const ClassAd *scope )
 {
-	// already set by base class for this node; we shouldn't propagate 
+	// We shouldn't propagate
 	// the call to sub-expressions because this is a new scope
+	parentScope = scope;
 }
 
 
@@ -769,7 +917,7 @@ Update( const ClassAd& ad )
 	AttrList::const_iterator itr;
 	for( itr=ad.attrList.begin( ); itr!=ad.attrList.end( ); itr++ ) {
 		ExprTree * cpy = itr->second->Copy();
-		if(!Insert( itr->first, cpy, false)) {
+		if(!Insert( itr->first, cpy )) {
 			return false;
 		}
 	}
@@ -871,8 +1019,6 @@ Copy( ) const
 	newAd->parentScope = parentScope;
 	newAd->chained_parent_ad = chained_parent_ad;
 
-	newAd->DisableDirtyTracking();
-
 	AttrList::const_iterator	itr;
 	for( itr=attrList.begin( ); itr != attrList.end( ); itr++ ) {
 		if( !( tree = itr->second->Copy( ) ) ) {
@@ -881,9 +1027,9 @@ Copy( ) const
 			CondorErrMsg = "";
 			return( NULL );
 		}
-		newAd->Insert(itr->first,tree,false);
+		newAd->Insert(itr->first,tree);
 	}
-	newAd->EnableDirtyTracking();
+
 	return newAd;
 }
 
@@ -892,7 +1038,7 @@ bool ClassAd::
 _Evaluate( EvalState&, Value& val ) const
 {
 	val.SetClassAdValue( (ClassAd*)this );
-	return( this );
+	return( true );
 }
 
 
@@ -1108,6 +1254,13 @@ EvaluateAttrBool( const string &attr, bool &b ) const
 	return( EvaluateAttr( attr, val ) && val.IsBooleanValue( b ) );
 }
 
+bool ClassAd::
+EvaluateAttrBoolEquiv( const string &attr, bool &b ) const
+{
+	Value val;
+	return( EvaluateAttr( attr, val ) && val.IsBooleanValueEquiv( b ) );
+}
+
 #if 0
 // disabled (see header)
 bool ClassAd::
@@ -1140,10 +1293,13 @@ EvaluateAttrList( const string &attr, ExprList *&l ) const
 #endif
 
 bool ClassAd::
-GetExternalReferences( const ExprTree *tree, References &refs, bool fullNames )
+GetExternalReferences( const ExprTree *tree, References &refs, bool fullNames ) const
 {
     EvalState       state;
 
+    // Treat this ad as the root of the tree for reference tracking.
+    // If an attribute is only present in a parent scope of this ad,
+    // then we want to treat it as an external reference.
     state.rootAd = this; 
 	state.curAd = this;
 
@@ -1152,8 +1308,8 @@ GetExternalReferences( const ExprTree *tree, References &refs, bool fullNames )
 
 
 bool ClassAd::
-_GetExternalReferences( const ExprTree *expr, ClassAd *ad, 
-	EvalState &state, References& refs, bool fullNames )
+_GetExternalReferences( const ExprTree *expr, const ClassAd *ad, 
+	EvalState &state, References& refs, bool fullNames ) const
 {
     switch( expr->GetKind( ) ) {
         case LITERAL_NODE:
@@ -1238,6 +1394,7 @@ _GetExternalReferences( const ExprTree *expr, ClassAd *ad,
 					return( rval );
 				}
 
+                case EVAL_FAIL:
                 default:    
                         // enh??
                     return( false );
@@ -1332,20 +1489,22 @@ _GetExternalReferences( const ExprTree *expr, ClassAd *ad,
 }
 
 bool ClassAd::
-GetExternalReferences( const ExprTree *tree, PortReferences &refs )
+GetExternalReferences( const ExprTree *tree, PortReferences &refs ) const
 {
     EvalState       state;
 
+    // Treat this ad as the root of the tree for reference tracking.
+    // If an attribute is only present in a parent scope of this ad,
+    // then we want to treat it as an external reference.
     state.rootAd = this; 
-    state.curAd = tree->GetParentScope( );
-	if( !state.curAd ) state.curAd = this;
+    state.curAd = this;
 	
     return( _GetExternalReferences( tree, this, state, refs ) );
 }
 
 bool ClassAd::
-_GetExternalReferences( const ExprTree *expr, ClassAd *ad, 
-	EvalState &state, PortReferences& refs )
+_GetExternalReferences( const ExprTree *expr, const ClassAd *ad, 
+	EvalState &state, PortReferences& refs ) const
 {
     switch( expr->GetKind( ) ) {
         case LITERAL_NODE:
@@ -1405,6 +1564,7 @@ _GetExternalReferences( const ExprTree *expr, ClassAd *ad,
 					return( rval );
 				}
 
+                case EVAL_FAIL:
                 default:    
                         // enh??
                     return( false );
@@ -1484,9 +1644,13 @@ _GetExternalReferences( const ExprTree *expr, ClassAd *ad,
 
 
 bool ClassAd::
-GetInternalReferences( const ExprTree *tree, References &refs, bool fullNames)
+GetInternalReferences( const ExprTree *tree, References &refs, bool fullNames) const
 {
     EvalState state;
+
+    // Treat this ad as the root of the tree for reference tracking.
+    // If an attribute is only present in a parent scope of this ad,
+    // then we want to treat it as an external reference.
     state.rootAd = this;
     state.curAd = this;
 
@@ -1495,8 +1659,8 @@ GetInternalReferences( const ExprTree *tree, References &refs, bool fullNames)
 
 //this is closely modelled off of _GetExternalReferences in the new_classads.
 bool ClassAd::
-_GetInternalReferences( const ExprTree *expr, ClassAd *ad,
-        EvalState &state, References& refs, bool fullNames)
+_GetInternalReferences( const ExprTree *expr, const ClassAd *ad,
+        EvalState &state, References& refs, bool fullNames) const
 {
 
     switch( expr->GetKind() ){
@@ -1523,58 +1687,23 @@ _GetInternalReferences( const ExprTree *expr, ClassAd *ad,
                     return false;
                 }
             } else {
+                bool orig_inAttrRefScope = state.inAttrRefScope;
+                state.inAttrRefScope = true;
+                bool rv = _GetInternalReferences( tree, ad, state, refs, fullNames );
+                state.inAttrRefScope = orig_inAttrRefScope;
+                if ( !rv ) {
+                    return false;
+                }
+
                 if (!tree->Evaluate(state, val) ) {
                     return false;
                 }
 
-                /*
-                 *
-                 * [
-                 * A = 3;
-                 * B = { 1, 3, 5};
-                 * C = D.A + 1;
-                 * D = [ A = E; B = 4; ];
-                 * E = 4;
-                 * ];
-                 */
-
+                // TODO Do we need extra handling for list values?
+                //   Should types other than undefined, error, or list
+                //   cause a failure?
                 if( val.IsUndefinedValue() ) {
                     return true;
-                }
-
-                string nameToAddToRefs = "";
-
-                string prefixStr;
-
-                if(tree != NULL)
-                {
-                    ClassAdUnParser unparser;
-                    //TODO: figure out how this would handle "B.D.G"
-                    unparser.Unparse(prefixStr, tree);
-                    //fullNameCpy = prefixStr;
-                    nameToAddToRefs = prefixStr;
-
-                    if(fullNames)
-                    {
-                        nameToAddToRefs += ".";
-                        nameToAddToRefs += attr;
-                    }
-                }
-
-                //WOULD INSERT "" IF tree == NULL! BAD! FIXME
-                refs.insert(nameToAddToRefs);
-
-                ExprTree *followRef;
-                //TODO: If we get to this point, must there be a prefix?
-                //  FIGURE OUT WHAT A SIMPLE / ABSOLUTE ATTR IS
-                followRef = ad->Lookup(prefixStr);
-                //this is checking to see if the prefix is in
-                //  this classad or not.
-                // if not, then we just let the loop continue
-                if(followRef != NULL)
-                {
-                    return _GetInternalReferences(followRef, ad,
-                                        state, refs, fullNames);
                 }
 
                 //otherwise, if the tree didn't evaluate to a classad,
@@ -1604,7 +1733,21 @@ _GetInternalReferences( const ExprTree *expr, ClassAd *ad,
 
                 case EVAL_OK:   {
                     //whoo, it's internal.
-                    refs.insert(attr);
+                    // Check whether the attribute was found in the root
+                    // ad for this evaluation and that the attribute isn't
+                    // one of our special ones (self, parent, my, etc.).
+                    // If the ad actually has an attribute with the same
+                    // name as one of our special attributes, then count
+                    // that as an internal reference.
+                    // TODO LookupInScope() knows whether it's returning
+                    //   the expression of one of the special attributes
+                    //   or that of an attribute that actually appears in
+                    //   the ad. If it told us which one, then we could
+                    //   avoid the Lookup() call below.
+                    if ( state.curAd == state.rootAd &&
+                         state.curAd->Lookup( attr ) ) {
+                        refs.insert(attr);
+                    }
                     if( state.depth_remaining <= 0 ) {
                         state.curAd = curAd;
                         return false;
@@ -1620,6 +1763,7 @@ _GetInternalReferences( const ExprTree *expr, ClassAd *ad,
                 break;
                                 }
 
+                case EVAL_FAIL:
                 default:
                     // "enh??"
                     return false;
@@ -1673,6 +1817,13 @@ _GetInternalReferences( const ExprTree *expr, ClassAd *ad,
             //also recurse on subtrees...
             vector< pair<string, ExprTree*> >               attrs;
             vector< pair<string, ExprTree*> >:: iterator    itr;
+
+            // If this ClassAd is only being used here as the scoping
+            // for an attribute reference, don't recurse into all of
+            // its attributes.
+            if ( state.inAttrRefScope ) {
+                return true;
+            }
 
             ((const ClassAd*)expr)->GetComponents(attrs);
             for(itr = attrs.begin(); itr != attrs.end(); itr++){
@@ -1995,6 +2146,29 @@ void ClassAd::ChainToAd(ClassAd *new_chain_parent_ad)
 	return;
 }
 
+bool ClassAd::PruneChildAttr(const std::string & attrName, bool if_child_matches /*=true*/)
+{
+	if ( ! chained_parent_ad)
+		return false;
+
+	AttrList::iterator itr = attrList.find(attrName);
+	if (itr == attrList.end())
+		return false;
+
+	bool prune_it = true;
+	if (if_child_matches) {
+		ExprTree * tree = chained_parent_ad->Lookup(itr->first);
+		prune_it = (tree && tree->SameAs(itr->second));
+	}
+
+	if (prune_it) {
+		delete itr->second;
+		attrList.erase(itr);
+		return true;
+	}
+	return false;
+}
+
 int ClassAd::PruneChildAd()
 {
 	int iRet =0;
@@ -2047,14 +2221,6 @@ const ClassAd *ClassAd::GetChainedParentAd(void) const
 void ClassAd::ClearAllDirtyFlags(void)
 { 
 	dirtyAttrList.clear();
-	return;
-}
-
-void ClassAd::MarkAttributeDirty(const string &name)
-{
-	if (do_dirty_tracking) {
-		dirtyAttrList.insert(name);
-	}
 	return;
 }
 

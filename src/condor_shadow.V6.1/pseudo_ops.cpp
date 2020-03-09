@@ -73,6 +73,7 @@ pseudo_register_starter_info( ClassAd* ad )
 int
 pseudo_register_job_info(ClassAd* ad)
 {
+	fix_update_ad(*ad);
 	Shadow->updateFromStarterClassAd(ad);
 	return 0;
 }
@@ -105,46 +106,6 @@ pseudo_get_job_info(ClassAd *&ad, bool &delete_ad)
 
 	ad = the_ad;
 
-	// If we're dealing with an old starter (pre 7.7.2) and file transfer
-	// may be used, we need to rename the stdout/err files to
-	// StdoutRemapName and StderrRemapName. Otherwise, they won't transfer
-	// back correctly if they contain any path information.
-	// If we don't know what version the starter is and we know file
-	// transfer will be used, do the rename. It won't harm a new starter
-	// and allows us to work correctly with old starters in more cases.
-	const CondorVersionInfo *vi = syscall_sock->get_peer_version();
-	if ( vi == NULL || !vi->built_since_version(7,7,2) ) {
-		std::string value;
-		ad->LookupString( ATTR_SHOULD_TRANSFER_FILES, value );
-		ShouldTransferFiles_t should_transfer = getShouldTransferFilesNum( value.c_str() );
-
-		if ( should_transfer == STF_YES ||
-			 ( vi != NULL && should_transfer == STF_IF_NEEDED ) ) {
-			ad = new ClassAd( *ad );
-			delete_ad = true;
-
-			// This is the same modification a modern starter will do when
-			// using file transfer in JICShadow::initWithFileTransfer()
-			bool stream;
-			std::string stdout_name;
-			std::string stderr_name;
-			ad->LookupString( ATTR_JOB_OUTPUT, stdout_name );
-			ad->LookupString( ATTR_JOB_ERROR, stderr_name );
-			if ( ad->LookupBool( ATTR_STREAM_OUTPUT, stream ) && !stream &&
-				 !nullFile( stdout_name.c_str() ) ) {
-				ad->Assign( ATTR_JOB_OUTPUT, StdoutRemapName );
-			}
-			if ( ad->LookupBool( ATTR_STREAM_ERROR, stream ) && !stream &&
-				 !nullFile( stderr_name.c_str() ) ) {
-				if ( stdout_name == stderr_name ) {
-					ad->Assign( ATTR_JOB_ERROR, StdoutRemapName );
-				} else {
-					ad->Assign( ATTR_JOB_ERROR, StderrRemapName );
-				}
-			}
-		}
-	}
-
 	return 0;
 }
 
@@ -161,19 +122,51 @@ pseudo_get_user_info(ClassAd *&ad)
 		user_ad = new ClassAd;
 
 #ifndef WIN32
-		char buf[1024];
+		user_ad->Assign( ATTR_UID, (int)get_user_uid() );
 
-		sprintf( buf, "%s = %d", ATTR_UID, (int)get_user_uid() );
-		user_ad->Insert( buf );
-
-		sprintf( buf, "%s = %d", ATTR_GID, (int)get_user_gid() );
-		user_ad->Insert( buf );
+		user_ad->Assign( ATTR_GID, (int)get_user_gid() );
 #endif
 
 	}
 
 	ad = user_ad;
 	return 0;
+}
+
+// The list of attributes that some (old?) statrers try and incorrectly update
+// this table is used to remove or rename them before we process the update ad.
+//
+typedef struct {
+	const char * const updateAttr; // name in update ad
+	const char * const newAttr;    // rename to this before processing the update ad, if NULL, delete the attribute
+} AttrToAttr;
+static const AttrToAttr updateAdBlacklist[] = {
+	// Prior to 8.7.2, the starter incorrectly sends JobStartDate each time the job starts
+	// but JobStartDate is defined to be the timestamp of the FIRST execution of the job
+	// and it is set by the Schedd the first time it makes a shadow, so we want to just delete
+	// this attribute.
+	{ ATTR_JOB_START_DATE, NULL },
+};
+
+void fix_update_ad(ClassAd & update_ad)
+{
+	// remove or rename attributes in the update ad before we process it.
+	for (size_t ii = 0; ii < COUNTOF(updateAdBlacklist); ++ii) {
+		ExprTree * tree = update_ad.Remove(updateAdBlacklist[ii].updateAttr);
+		if (tree) {
+			if (IsDebugLevel(D_MACHINE)) {
+				dprintf(D_MACHINE, "Update ad contained '%s=%s' %s it\n",
+					updateAdBlacklist[ii].updateAttr, ExprTreeToString(tree),
+					updateAdBlacklist[ii].newAttr ? "Renaming" : "Removing"
+					);
+			}
+			if (updateAdBlacklist[ii].newAttr) {
+				update_ad.Insert(updateAdBlacklist[ii].newAttr, tree);
+			} else {
+				delete tree;
+			}
+		}
+	}
 }
 
 int
@@ -191,8 +184,18 @@ pseudo_job_exit(int status, int reason, ClassAd* ad)
 	}
 	dprintf(D_SYSCALLS, "in pseudo_job_exit: status=%d,reason=%d\n",
 			status, reason);
+
+	// Despite what exit.h says, JOB_COREDUMPED is set by the starter only
+	// when the job is NOT killed (and left a core file).
+	if( reason == JOB_EXITED
+		|| reason == JOB_EXITED_AND_CLAIM_CLOSING
+		|| reason == JOB_COREDUMPED ) {
+		thisRemoteResource->incrementJobCompletionCount();
+	}
+	fix_update_ad(*ad);
 	thisRemoteResource->updateFromStarter( ad );
 	thisRemoteResource->resourceExit( reason, status );
+	Shadow->updateJobInQueue( U_STATUS );
 	return 0;
 }
 
@@ -203,7 +206,7 @@ pseudo_job_termination( ClassAd *ad )
 	bool core_dumped = false;
 	int exit_signal = 0;
 	int exit_code = 0;
-	MyString exit_reason;
+	std::string exit_reason;
 
 	ad->LookupBool(ATTR_ON_EXIT_BY_SIGNAL,exited_by_signal);
 	ad->LookupBool(ATTR_JOB_CORE_DUMPED,core_dumped);
@@ -234,10 +237,12 @@ pseudo_register_mpi_master_info( ClassAd* ad )
 		return -1;
 	}
 	if( ! Shadow->setMpiMasterInfo(addr) ) {
-		dprintf( D_ALWAYS, "ERROR: recieved "
+		dprintf( D_ALWAYS, "ERROR: received "
 				 "pseudo_register_mpi_master_info for a non-MPI job!\n" );
+		free(addr);
 		return -1;
 	}
+	free(addr);
 	return 0;
 }
 
@@ -252,10 +257,9 @@ so CurrentWorkingDir is replaced with the job's iwd.
  
 static void complete_path( const char *short_path, MyString &full_path )
 {
-	if(short_path[0]==DIR_DELIM_CHAR) {
+	if ( fullpath(short_path) ) {
 		full_path = short_path;
 	} else {
-		// strcpy(full_path,CurrentWorkingDir);
 		full_path.formatstr("%s%s%s",
 						  Shadow->getIwd(),
 						  DIR_DELIM_STRING,
@@ -271,7 +275,7 @@ the file from.  For example, joe/data might become buffer:remote:/usr/joe/data
 
 int pseudo_get_file_info_new( const char *logical_name, char *&actual_url )
 {
-	MyString remap_list;
+	std::string remap_list;
 	MyString	split_dir;
 	MyString	split_file;
 	MyString	full_path;
@@ -292,9 +296,9 @@ int pseudo_get_file_info_new( const char *logical_name, char *&actual_url )
 	/* Any name comparisons must check the logical name, the simple name, and the full path */
 
 	if(Shadow->getJobAd()->LookupString(ATTR_FILE_REMAPS,remap_list) &&
-	  (filename_remap_find( remap_list.Value(), logical_name, remap ) ||
-	   filename_remap_find( remap_list.Value(), split_file.Value(), remap ) ||
-	   filename_remap_find( remap_list.Value(), full_path.Value(), remap ))) {
+	  (filename_remap_find( remap_list.c_str(), logical_name, remap ) ||
+	   filename_remap_find( remap_list.c_str(), split_file.Value(), remap ) ||
+	   filename_remap_find( remap_list.c_str(), full_path.Value(), remap ))) {
 
 		dprintf(D_SYSCALLS,"\tremapped to: %s\n",remap.Value());
 
@@ -317,13 +321,6 @@ int pseudo_get_file_info_new( const char *logical_name, char *&actual_url )
 
 	/* Now, we have a full pathname. */
 	/* Figure out what url modifiers to slap on it. */
-
-#ifdef HPUX
-	/* I have no idea why this is happening, but I have seen it happen many
-	 * times on the HPUX version, so here is a quick hack -Todd 5/19/95 */
-	if ( full_path == "/usr/lib/nls////strerror.cat" )
-		full_path = "/usr/lib/nls/C/strerror.cat\0";
-#endif
 
 	if( use_local_access(full_path.Value()) ) {
 		method = "local";
@@ -359,7 +356,7 @@ int pseudo_get_file_info_new( const char *logical_name, char *&actual_url )
 
 static void append_buffer_info( MyString &url, const char *method, char const *path )
 {
-	MyString buffer_list;
+	std::string buffer_list;
 	MyString buffer_string;
 	MyString dir;
 	MyString file;
@@ -378,8 +375,8 @@ static void append_buffer_info( MyString &url, const char *method, char const *p
 	/* These lines have the same syntax as a remap list */
 
 	if(Shadow->getJobAd()->LookupString(ATTR_BUFFER_FILES,buffer_list)) {
-		if( filename_remap_find(buffer_list.Value(),path,buffer_string) ||
-		    filename_remap_find(buffer_list.Value(),file.Value(),buffer_string) ) {
+		if( filename_remap_find(buffer_list.c_str(),path,buffer_string) ||
+		    filename_remap_find(buffer_list.c_str(),file.Value(),buffer_string) ) {
 
 			/* If the file is merely mentioned, turn on the default buffer */
 			url += "buffer:";
@@ -405,12 +402,12 @@ static void append_buffer_info( MyString &url, const char *method, char const *p
 static int attr_list_has_file( const char *attr, const char *path )
 {
 	char const *file;
-	MyString str;
+	std::string str;
 
 	file = condor_basename(path);
 
 	Shadow->getJobAd()->LookupString(attr,str);
-	StringList list(str.Value());
+	StringList list(str.c_str());
 
 	if( list.contains_withwildcard(path) || list.contains_withwildcard(file) ) {
 		return 1;
@@ -470,6 +467,10 @@ static int use_local_access( const char *file )
 int
 pseudo_ulog( ClassAd *ad )
 {
+	// Ignore the event time we were given, use the
+	// current time and timezone
+	ad->Delete("EventTime");
+
 	ULogEvent *event = instantiateEvent(ad);
 	int result = 0;
 	char const *critical_error = NULL;
@@ -508,7 +509,7 @@ pseudo_ulog( ClassAd *ad )
 			char *execute_host = NULL;
 			thisRemoteResource->getMachineName(execute_host);
 			err->setExecuteHost(execute_host);
-			delete[] execute_host;
+			free(execute_host);
 		}
 
 		if(err->isCriticalError()) {
@@ -595,7 +596,7 @@ pseudo_phase( char *phase )
 	eventtext += phase;
 	event.setInfoText( eventtext.Value() );
 
-	ead = event.toClassAd();
+	ead = event.toClassAd(true);
 	ASSERT(ead);
 
 	// write the event
@@ -613,6 +614,20 @@ pseudo_phase( char *phase )
 
 	return 0;
 }
+
+int
+pseudo_get_job_ad( ClassAd* &ad )
+{
+	RemoteResource *remote;
+	if (parallelMasterResource == NULL) {
+		remote = thisRemoteResource;
+	} else {
+		remote = parallelMasterResource;
+	}
+	ad = remote->getJobAd();
+	return 0;
+}
+
 
 int
 pseudo_get_job_attr( const char *name, MyString &expr )

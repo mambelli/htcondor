@@ -82,6 +82,7 @@ int main( int argc, char *argv[] )
 	daemon_t type = DT_MASTER;
 
 	myDistro->Init( argc, argv );
+	set_priv_initialize(); // allow uid switching if root
 	config();
 
 	for( i=1; i<argc; i++ ) {
@@ -152,7 +153,7 @@ int main( int argc, char *argv[] )
 
 	dprintf(D_FULLDEBUG,"Daemon %s is %s\n",daemon->hostname(),daemon->addr());
 	
-	sock = (ReliSock*)daemon->startCommand( DC_FETCH_LOG, Sock::reli_sock);
+	sock = (ReliSock*)daemon->startCommand( DC_FETCH_LOG, Sock::reli_sock, 1200);
 
 	if(!sock) {
 		fprintf(stderr,"couldn't connect to daemon %s at %s\n",daemon->hostname(),daemon->addr());
@@ -182,7 +183,10 @@ int main( int argc, char *argv[] )
 	filesize_t filesize;
 
 	sock->decode();
-	sock->code(result);
+	if (!sock->code(result)) {
+		fprintf(stderr,"Couldn't fetch log: server did not reply\n");
+		return -1;
+	}
 
 	switch(result) {
 		case -1:
@@ -225,11 +229,17 @@ int handleHistoryDir(ReliSock *sock) {
 
 	sock->decode();
 
-	sock->code(result);
+	if (!sock->code(result)) {
+		printf("Can't connect to server\n");
+		exit(1);
+	}
 	while (result == 1) {
 			int fd = -1;
 			filename = NULL;
-			sock->code(filename);
+			if (!sock->code(filename)) {
+				printf("Can't get filename from server\n");
+				exit(1);
+			}
 			fd = safe_open_wrapper_follow(filename, O_CREAT | O_WRONLY);
 			if (fd < 0) {
 				printf("Can't open local file %s for writing\n", filename);
@@ -238,7 +248,10 @@ int handleHistoryDir(ReliSock *sock) {
 			result = sock->get_file(&filesize,fd,0);
 			close(fd);
 			
-			sock->code(result);
+			if (!sock->code(result)) {
+				printf("Cannot get result status from server\n");
+				result = -1;
+			}
 			free(filename);
 	}
 	return 0;

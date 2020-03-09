@@ -155,10 +155,10 @@ ProcAPI::getAllPids( pid_t* &pids, int &numpids ) {
     PPERF_INSTANCE_DEFINITION pThisInstance = firstInstance(pThisObject);
 	numpids = pThisObject->NumInstances;
 	pids = new pid_t[numpids];
-	DWORD ctrblk;
+	UINT_PTR ctrblk;
 		
 	for( int i=0 ; i<numpids ; i++ ) {
-        ctrblk = ((DWORD)pThisInstance) + pThisInstance->ByteLength;
+        ctrblk = ((UINT_PTR)pThisInstance) + pThisInstance->ByteLength;
         pids[i] = (pid_t) *((pid_t*)(ctrblk + offsets->procid));
         pThisInstance = nextInstance(pThisInstance);        
 	}
@@ -178,9 +178,7 @@ ProcAPI::getPidFamily( pid_t pid, PidEnvID *penvid, ExtArray<pid_t>& pidFamily,
 	int fam_status;
 	int rval;
 
-#ifndef HPUX
 	buildPidList();
-#endif
 
 	buildProcInfoList();
 
@@ -474,11 +472,9 @@ ProcAPI::getPidFamilyByLogin( const char *searchLogin, ExtArray<pid_t>& pidFamil
 	piPTR cur = allProcInfos;
 	int fam_index = 0;
 
-#ifndef HPUX        // everyone except HPUX needs a pidlist built.
 	buildPidList();
-#endif
 
-	buildProcInfoList();  // HPUX has its own version of this, too.
+	buildProcInfoList();
 
 	// buildProcInfoList() just changed allProcInfos pointer, so update cur.
 	cur = allProcInfos;
@@ -498,7 +494,7 @@ ProcAPI::getPidFamilyByLogin( const char *searchLogin, ExtArray<pid_t>& pidFamil
 	return PROCAPI_SUCCESS;
 #else
 	// Win32 version
-	ExtArray<pid_t> pids(256);
+	std::vector<pid_t> pids;
 	int num_pids;
 	int index_pidFamily = 0;
 	int index_familyHandles = 0;
@@ -522,7 +518,7 @@ ProcAPI::getPidFamilyByLogin( const char *searchLogin, ExtArray<pid_t>& pidFamil
 	num_pids = ntSysInfo.GetPIDs(pids);
 
 	// loop through pids comparing process owner
-	for (int s=0; s<num_pids; s++) {
+	for (size_t s=0; s<pids.size(); s++) {
 
 		// find owner for pid pids[s]
 		
@@ -731,7 +727,7 @@ ProcAPI::multiInfo( pid_t *pidlist, int numpids, piPTR &pi ) {
 
 		// at this point we're all set to march through the data block to find
         // the pids that we want
-    DWORD ctrblk;
+    UINT_PTR ctrblk;
 	int instanceNum = 0;
     pid_t thispid;
     
@@ -745,7 +741,7 @@ ProcAPI::multiInfo( pid_t *pidlist, int numpids, piPTR &pi ) {
 
     while( instanceNum < pThisObject->NumInstances ) {
         
-        ctrblk = ((DWORD)pThisInstance) + pThisInstance->ByteLength;
+        ctrblk = ((UINT_PTR)pThisInstance) + pThisInstance->ByteLength;
         thispid = (pid_t) *((pid_t*)(ctrblk + offsets->procid));
 
         if( isinlist(thispid, pidlist, numpids) != -1 ) {

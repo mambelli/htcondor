@@ -29,53 +29,35 @@
 #include "daemon_list.h"
 #include "condor_timeslice.h"
 
+#include <deque>
+#include <map>
 
-/** Class to manage the sequence nubmers of individual ClassAds
- * published by the application
- **/
+// This holds a single update ad sequence number
+//
 class DCCollectorAdSeq {
-  public:
-	DCCollectorAdSeq( const char *, const char *, const char * );
-	DCCollectorAdSeq( const DCCollectorAdSeq & );
-	~DCCollectorAdSeq( void );
-
-	bool Match( const char *, const char *, const char * ) const;
-	unsigned getSequenceAndIncrement( void );
-	unsigned getSequence( void ) const { return sequence; };
-
-	const char *getName( void ) const { return Name; };
-	const char *getMyType( void ) const { return MyType; };
-	const char *getMachine( void ) const { return Machine; };
-
-  private:
-	char		*Name;			// "Name" in the ClassAd
-	char		*MyType;		// "MyType" in the ClassAd
-	char		*Machine;		// "Machine" in ClassAd
-	unsigned	sequence;		// The sequence number for it.
+public:
+	DCCollectorAdSeq() : sequence(0), last_advance(0) {}
+	long long getSequence() { return sequence; }
+	time_t    lastAdvance() { return last_advance; }
+	long long advance(time_t now) {
+		//if ( ! now) now = time(NULL);
+		last_advance = now;
+		++sequence;
+		return sequence;
+	}
+protected:
+	long long sequence;     // current sequence number
+	time_t    last_advance; // last time advance was called (for garbage collection if we ever want to do that)
 };
 
-/** Class to manage the sequence nubmers of all ClassAds published by
- * the application
- **/
-class DCCollectorAdSeqMan {
-  public:
-	DCCollectorAdSeqMan( void );
-	DCCollectorAdSeqMan( const DCCollectorAdSeqMan &copy,
-						 bool copy_array = true );
-	~DCCollectorAdSeqMan( void );
-
-	unsigned getSequence( const ClassAd *ad );
-	int getNumAds( void ) const { return numAds; };
-
-	// Used for the copy constructor
-  protected:
-	const ExtArray<DCCollectorAdSeq *> & getSeqInfo( void ) const
-		{ return adSeqInfo; };
-
-  private:
-	ExtArray<DCCollectorAdSeq *> adSeqInfo;
-	int		numAds;
+typedef std::map<std::string, DCCollectorAdSeq> DCCollectorAdSeqMap;
+class DCCollectorAdSequences {
+public:
+	DCCollectorAdSeq* getAdSeq(const ClassAd & ad);
+private:
+	DCCollectorAdSeqMap seqs;
 };
+
 
 /** This is the Collector-specific class derived from Daemon.  It
 	implements some of the collectors's daemonCore command interface.  
@@ -84,7 +66,7 @@ class DCCollectorAdSeqMan {
 */
 class DCCollector : public Daemon {
 public:
-	enum UpdateType { UDP, TCP, CONFIG };
+	enum UpdateType { UDP, TCP, CONFIG, CONFIG_VIEW };
 
 		/** Constructor
 			@param name The name (or sinful string) of the collector, 
@@ -111,7 +93,7 @@ public:
 			@param ad ClassAd you want to use for the update
 			file)
 		*/
-	bool sendUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking );
+	bool sendUpdate( int cmd, ClassAd* ad1, DCCollectorAdSequences& seq, ClassAd* ad2, bool nonblocking, StartCommandCallbackType=nullptr, void *miscdata=nullptr );
 
 	void reconfig( void );
 
@@ -123,11 +105,15 @@ public:
 
 	bool useTCPForUpdates() { return use_tcp; }
 
-  protected:
-		// Get the ad sequence manager (for copy constructor)
-	const DCCollectorAdSeqMan &getAdSeqMan( void ) const
-		{ return *adSeqMan; };
+	time_t getStartTime() { return startTime; }
+	time_t getReconfigTime() { return reconfigTime; }
 
+		/** Request that the collector get an identity token from the specified
+		 *  schedd.
+		 */
+	bool requestScheddToken(const std::string &schedd_name,
+		const std::vector<std::string> &authz_bounding_set,
+		int lifetime, std::string &token, CondorError &err);
 
 private:
 
@@ -137,30 +123,26 @@ private:
 
 	ReliSock* update_rsock;
 
-	char* tcp_collector_host;
-	char* tcp_collector_addr;
-	int tcp_collector_port;
 	bool use_tcp;
 	bool use_nonblocking_update;
 	UpdateType up_type;
 
-	class UpdateData *pending_update_list;
+	std::deque<class UpdateData*> pending_update_list;
 	friend class UpdateData;
 
-	bool sendTCPUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking );
-	bool sendUDPUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking );
+	bool sendTCPUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking, StartCommandCallbackType callback_fn, void* miscdata );
+	bool sendUDPUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking, StartCommandCallbackType callback_fn, void *miscdata );
 
-	static bool finishUpdate( DCCollector *self, Sock* sock, ClassAd* ad1, ClassAd* ad2 );
+	static bool finishUpdate( DCCollector *self, Sock* sock, ClassAd* ad1, ClassAd* ad2, StartCommandCallbackType callback_fn, void *miscdata );
 
 	void parseTCPInfo( void );
 	void initDestinationStrings( void );
 
-	bool initiateTCPUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking );
+	bool initiateTCPUpdate( int cmd, ClassAd* ad1, ClassAd* ad2, bool nonblocking, StartCommandCallbackType callback_fn, void *miscdata );
 
-	char* tcp_update_destination;
-	char* udp_update_destination;
+	char* update_destination;
 
-	UtcTime m_blacklist_monitor_query_started;
+	struct timeval m_blacklist_monitor_query_started;
 	static std::map< std::string, Timeslice > blacklist;
 
 	Timeslice &getBlacklistTimeslice();
@@ -169,7 +151,7 @@ private:
 
 	// Items to manage the sequence numbers
 	time_t startTime;
-	DCCollectorAdSeqMan *adSeqMan;
+	time_t reconfigTime;
 };
 
 

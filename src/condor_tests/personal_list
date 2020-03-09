@@ -1,4 +1,6 @@
 lib_procapi_pidtracking-byenv
+job_hyperthread_check
+job_slash_transfer
 job_core_killsignal_sched
 job_core_rmkillsig_sched
 job_dagman_large_dag
@@ -79,6 +81,10 @@ job_dagman_final-F
 job_dagman_final-G
 job_dagman_final-H
 job_dagman_final-I
+job_dagman_final-J
+job_dagman_final-K
+job_dagman_final-L
+job_dagman_final-M
 job_dagman_nonexistent_subdag
 lib_unit_tests
 lib_auth_config
@@ -177,7 +183,7 @@ job_filexfer_whento-base_van
 job_filexfer_whento-simpleinput_van
 job_filexfer_whento-withinput_van
 job_filexfer_output_van
-job_filexfer_md5-remote_van
+job_filexfer_sha256-remote_van
 cmd_wait_shows-all
 cmd_wait_shows-base
 cmd_wait_shows-notimeout
@@ -237,6 +243,7 @@ job_dagman_loglink
 job_dagman_global_event_log-A
 job_dagman_global_event_log-B
 job_dagman_condor_restart
+job_schedd_restart-endurance
 job_dagman_suppress_notification
 job_dagman_suppress_notification-cmd_line
 job_dagman_classad

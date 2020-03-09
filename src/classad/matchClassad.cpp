@@ -67,6 +67,9 @@ InitMatchClassAd( ClassAd *adl, ClassAd *adr )
 {
 	ClassAdParser parser;
 
+	// don't need this and just slows down matchmaking
+	this->DisableDirtyTracking();
+
 		// clear out old info
 	Clear( );
 	lad = rad = NULL;
@@ -117,8 +120,8 @@ InitMatchClassAd( ClassAd *adl, ClassAd *adr )
 
 	// Insert the Ad resolver but also lookup before using b/c
 	// there are no gaurentees not to collide.
-	Insert( "lCtx", lCtx, false );
-	Insert( "rCtx", rCtx, false );
+	Insert( "lCtx", lCtx );
+	Insert( "rCtx", rCtx );
 
 	symmetric_match = Lookup("symmetricMatch");
 	right_matches_left = Lookup("rightMatchesLeft");
@@ -143,7 +146,7 @@ ReplaceLeftAd( ClassAd *ad )
 	lad = ad;
 	ladParent = ad ? ad->GetParentScope( ) : (ClassAd*)NULL;
 	if( ad ) {
-		if( !Insert( "LEFT", ad, false ) ) {
+		if( !Insert( "LEFT", ad ) ) {
 			lad = NULL;
 			ladParent = NULL;
 			Delete( "LEFT" );
@@ -155,8 +158,15 @@ ReplaceLeftAd( ClassAd *ad )
 		// its parent scope to be the context ad.
 		lCtx->SetParentScope(this);
 		lad->SetParentScope(lCtx);
+
+		if ( _useOldClassAdSemantics ) {
+			lad->alternateScope = rad;
+		}
 	} else {
 		Delete( "LEFT" );
+	}
+	if ( rad && _useOldClassAdSemantics ) {
+		rad->alternateScope = lad;
 	}
 	return true;
 }
@@ -168,7 +178,7 @@ ReplaceRightAd( ClassAd *ad )
 	rad = ad;
 	radParent = ad ? ad->GetParentScope( ) : (ClassAd*)NULL;
 	if( ad ) {
-		if( !Insert( "RIGHT", ad , false ) ) {
+		if( !Insert( "RIGHT", ad ) ) {
 			rad = NULL;
 			radParent = NULL;
 			Delete( "RIGHT" );
@@ -181,8 +191,15 @@ ReplaceRightAd( ClassAd *ad )
 		// its parent scope to be the context ad.
 		rCtx->SetParentScope(this);
 		rad->SetParentScope(rCtx);
+
+		if ( _useOldClassAdSemantics ) {
+			rad->alternateScope = lad;
+		}
 	} else {
 		Delete( "RIGHT" );
+	}
+	if ( lad && _useOldClassAdSemantics ) {
+		lad->alternateScope = rad;
 	}
 	return true;
 }
@@ -223,6 +240,10 @@ RemoveLeftAd( )
 	Remove( "LEFT" );
 	if( lad ) {
 		lad->SetParentScope( ladParent );
+		if ( _useOldClassAdSemantics && rad ) {
+			lad->alternateScope = NULL;
+			rad->alternateScope = NULL;
+		}
 	}
 	ladParent = NULL;
 	lad = NULL;
@@ -237,30 +258,76 @@ RemoveRightAd( )
 	Remove( "RIGHT" );
 	if( rad ) {
 		rad->SetParentScope( radParent );
+		if ( _useOldClassAdSemantics && lad ) {
+			lad->alternateScope = NULL;
+			rad->alternateScope = NULL;
+		}
 	}
 	radParent = NULL;
 	rad = NULL;
 	return( ad );
 }
 
-bool MatchClassAd::
-OptimizeRightAdForMatchmaking( ClassAd *ad, std::string *error_msg )
+void MatchClassAd::
+SetLeftAlias( const std::string &name )
 {
-	return MatchClassAd::OptimizeAdForMatchmaking( ad, true, error_msg );
+	CaseIgnEqStr attr_cmp;
+	if ( attr_cmp( name.c_str(), lAlias.c_str() ) ) {
+		return;
+	}
+	// TODO Use ClassAd::Remove() to allow reuse of existing ExprTrees?
+	if ( !lAlias.empty() ) {
+		lCtx->Delete( name );
+		rCtx->Delete( name );
+	}
+	lAlias = name;
+	if ( !lAlias.empty() ) {
+		// TODO make reference in right ad point directly at '.LEFT.rCtx.ad'?
+		lCtx->Insert( lAlias, AttributeReference::MakeAttributeReference( NULL, "ad", false ) );
+		rCtx->Insert( lAlias, AttributeReference::MakeAttributeReference( NULL, "LEFT", true ) );
+	}
+}
+
+void MatchClassAd::
+SetRightAlias( const std::string &name )
+{
+	CaseIgnEqStr attr_cmp;
+	if ( attr_cmp( name.c_str(), rAlias.c_str() ) ) {
+		return;
+	}
+	// TODO Use ClassAd::Remove() to allow reuse of existing ExprTrees?
+	if ( !rAlias.empty() ) {
+		lCtx->Delete( name );
+		rCtx->Delete( name );
+	}
+	rAlias = name;
+	if ( !rAlias.empty() ) {
+		// TODO make reference in left ad point directly at '.RIGHT.rCtx.ad'?
+		lCtx->Insert( rAlias, AttributeReference::MakeAttributeReference( NULL, "RIGHT", true ) );
+		rCtx->Insert( rAlias, AttributeReference::MakeAttributeReference( NULL, "ad", false ) );
+	}
 }
 
 bool MatchClassAd::
-OptimizeLeftAdForMatchmaking( ClassAd *ad, std::string *error_msg )
+OptimizeRightAdForMatchmaking( ClassAd *ad, std::string *error_msg, const std::string &left_alias, const std::string &right_alias )
 {
-	return MatchClassAd::OptimizeAdForMatchmaking( ad, false, error_msg );
+	return MatchClassAd::OptimizeAdForMatchmaking( ad, true, error_msg, left_alias, right_alias );
 }
 
 bool MatchClassAd::
-OptimizeAdForMatchmaking( ClassAd *ad, bool is_right, std::string *error_msg )
+OptimizeLeftAdForMatchmaking( ClassAd *ad, std::string *error_msg, const std::string &left_alias, const std::string &right_alias )
+{
+	return MatchClassAd::OptimizeAdForMatchmaking( ad, false, error_msg, left_alias, right_alias );
+}
+
+bool MatchClassAd::
+OptimizeAdForMatchmaking( ClassAd *ad, bool is_right, std::string *error_msg, const std::string &left_alias, const std::string &right_alias )
 {
 	if( ad->Lookup("my") ||
 		ad->Lookup("target") ||
 		ad->Lookup("other") ||
+		( !left_alias.empty() && ad->Lookup(left_alias) ) ||
+		( !right_alias.empty() && ad->Lookup(right_alias) ) ||
 		ad->Lookup(ATTR_UNOPTIMIZED_REQUIREMENTS) )
 	{
 		if( error_msg ) {
@@ -279,10 +346,12 @@ OptimizeAdForMatchmaking( ClassAd *ad, bool is_right, std::string *error_msg )
 
 		// insert "my" into this ad so that references that use it
 		// can be flattened
-	Value me;
-	ExprTree * pLit;
-	me.SetClassAdValue( ad );
-	ad->Insert("my",(pLit=Literal::MakeLiteral(me)));
+	if ( !_useOldClassAdSemantics ) {
+		Value me;
+		ExprTree * pLit;
+		me.SetClassAdValue( ad );
+		ad->Insert("my",(pLit=Literal::MakeLiteral(me)));
+	}
 
 		// insert "target" and "other" into this ad so references can be
 		// _partially_ flattened to the more efficient .RIGHT or .LEFT
@@ -292,6 +361,20 @@ OptimizeAdForMatchmaking( ClassAd *ad, bool is_right, std::string *error_msg )
 	
 	ad->Insert("target",target);
 	ad->Insert("other",t2);
+	if ( !left_alias.empty() ) {
+		if ( is_right ) {
+			ad->Insert( left_alias, AttributeReference::MakeAttributeReference( NULL, "LEFT", true ) );
+		} else {
+			ad->Insert( left_alias, AttributeReference::MakeAttributeReference( NULL, "self", false ) );
+		}
+	}
+	if ( !right_alias.empty() ) {
+		if ( is_right ) {
+			ad->Insert( right_alias, AttributeReference::MakeAttributeReference( NULL, "self", false ) );
+		} else {
+			ad->Insert( right_alias, AttributeReference::MakeAttributeReference( NULL, "RIGHT", true ) );
+		}
+	}
 
 
 	ExprTree *flat_requirements = NULL;
@@ -332,9 +415,18 @@ OptimizeAdForMatchmaking( ClassAd *ad, bool is_right, std::string *error_msg )
 		// After flatenning, no references should remain to MY or TARGET.
 		// Even if there are, those can be resolved by the context ads, so
 		// we don't need to leave these attributes in the ad.
-	ad->Delete("my");
+	// TODO The failure cases above should run this cleanup code
+	if ( !_useOldClassAdSemantics ) {
+		ad->Delete("my");
+	}
 	ad->Delete("other"); 
 	ad->Delete("target");
+	if ( !left_alias.empty() ) {
+		ad->Delete( left_alias );
+	}
+	if ( !right_alias.empty() ) {
+		ad->Delete( right_alias );
+	}
 
 	return true;
 }
@@ -361,7 +453,7 @@ EvalMatchExpr(ExprTree *match_expr)
 
 	if( EvaluateExpr( match_expr, val ) ) {
 		bool result = false;
-		if( val.IsBooleanValue( result ) ) {
+		if( val.IsBooleanValueEquiv( result ) ) {
 			return result;
 		}
 		long long int_result = 0;

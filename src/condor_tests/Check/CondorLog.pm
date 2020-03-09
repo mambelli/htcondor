@@ -43,12 +43,20 @@ sub RunCheck
     my $result;
     my $count = 0;
     while(1) {
-
-		if(defined $args{all}) {
+		if(defined $args{all} || defined $args{echo}) {
+		  if (defined $args{all}) {
 			$result = CondorTest::SearchCondorLog($daemon,$match_regexp,$args{all});
+		  } else {
+		    my @lines = ();
+			$result = CondorTest::SearchCondorLog($daemon,$match_regexp,\@lines);
+			if ($result) {
+			  for (@lines) { print $args{echo} . $_; }
+			}
+		  }
 		} else {
 			$result = CondorTest::SearchCondorLog($daemon,$match_regexp);
 		}
+		$count += 1;
 	
 		last if $result;
 		last if ($count >= $num_retries);
@@ -59,6 +67,7 @@ sub RunCheck
 	$result = !$result;
     }
 
+    if ($result) { $result = 1; }
     CondorTest::RegisterResult( $result, %args );
     return $result;
 }
@@ -80,9 +89,8 @@ sub RunCheckMultiple
     my $count = 0;
 	my $undead = undef;
 	my $testname = "RunCheckMultiple Tool";
-	system("date");
 
-	CondorTest::RegisterTimed( $testname, $timed_callback, $match_timeout);
+	CondorTest::RegisterCLTimed( $testname, $timed_callback, $match_timeout);
 	if(defined $args{match_callback}) {
 		# we don't just want to look for it, we want to get it back
 		#print "Match Callback set\n";
@@ -95,6 +103,7 @@ sub RunCheckMultiple
     	CondorTest::RegisterResult( $result, %args );
 	}
 	#print "Result returned from RunCheckMultiple is <$result>\n";
+	CondorTest::RemoveCLTimed($testname);
     return $result;
 }
 

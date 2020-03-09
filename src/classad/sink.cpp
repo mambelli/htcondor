@@ -169,8 +169,7 @@ Unparse( string &buffer, const Value &val )
 		case Value::INTEGER_VALUE: {
 			long long	i;
 			val.IsIntegerValue( i );
-			sprintf( tempBuf, "%lld", i );
-			buffer += tempBuf;
+			append_long(buffer, i);
 			return;
 		}
 		case Value::REAL_VALUE: {
@@ -192,9 +191,9 @@ Unparse( string &buffer, const Value &val )
                 buffer += "real(\"INF\")";
             } else if (oldClassAd) {
                 sprintf(tempBuf, "%.16G", real);
-                // %G may print something that looks like an integer.
+                // %G may print something that looks like an integer or exponent.
                 // In that case, tack on a ".0"
-                if (!strchr(tempBuf, '.')) {
+                if (tempBuf[strcspn(tempBuf, ".Ee")] == '\0') {
                     strcat(tempBuf, ".0");
                 }
                 buffer += tempBuf;
@@ -238,6 +237,7 @@ Unparse( string &buffer, const Value &val )
 	  
 			return;
 		}
+		case Value::SCLASSAD_VALUE:
 		case Value::CLASSAD_VALUE: {
 			const ClassAd *ad = NULL;
 			vector< pair<string,ExprTree*> > attrs;
@@ -255,6 +255,8 @@ Unparse( string &buffer, const Value &val )
 			UnparseAux( buffer, exprs );
 			return;
 		}
+		default:
+			break;
 	}
 }
 
@@ -269,9 +271,14 @@ Unparse( string &buffer, const ExprTree *tree )
 
 	switch( tree->GetKind( ) ) {
 		case ExprTree::LITERAL_NODE: {
+#if 0
+			Value::NumberFactor factor;
+			const Value & val = ((const Literal*)tree)->getValue(factor);
+#else
 			Value				val;
 			Value::NumberFactor	factor;
 			((Literal*)tree)->GetComponents( val, factor );
+#endif
 			UnparseAux( buffer, val, factor );
 			return;
 		}
@@ -315,10 +322,17 @@ Unparse( string &buffer, const ExprTree *tree )
 			return;
 		}
 		
-		case ExprTree::EXPR_ENVELOPE:
-		{
-			// recurse b/c we indirect for this element.
-			Unparse( buffer, ((CachedExprEnvelope*)tree)->get());
+		case ExprTree::EXPR_ENVELOPE: {
+#if 0
+			if (this->oldClassAd) {
+				buffer += ((CachedExprEnvelope*)tree)->get_unparsed_str();
+			} else {
+#else
+			{
+#endif
+				// recurse b/c we indirect for this element.
+				Unparse( buffer, ((CachedExprEnvelope*)tree)->get());
+			}
 			return;
 		}
 
@@ -333,6 +347,18 @@ Unparse( string &buffer, const ExprTree *tree )
 	}
 }
 				
+void ClassAdUnParser::
+Unparse( string &buffer, const ClassAd *ad, const References &whitelist )
+{
+	if( !ad ) {
+		buffer = "<error:null expr>";
+		return;
+	}
+
+	vector< pair<string, ExprTree*> > attrs;
+	ad->GetComponents( attrs, whitelist );
+	UnparseAux( buffer, attrs );
+}
 
 
 void ClassAdUnParser::
@@ -368,9 +394,9 @@ UnparseAux(string &buffer, Operation::OpKind op, ExprTree *t1, ExprTree *t2,
 {
 		// case 0: parentheses op
 	if( op==Operation::PARENTHESES_OP ) {
-		buffer += "( ";
+		buffer += "(";
 		Unparse( buffer, t1 );
-		buffer += " )";
+		buffer += ")";
 		return;
 	}
 		// case 1: check for unary ops
@@ -383,9 +409,13 @@ UnparseAux(string &buffer, Operation::OpKind op, ExprTree *t1, ExprTree *t2,
 		// case 2: check for ternary op
 	if( op==Operation::TERNARY_OP ) {
 		Unparse( buffer, t1 );
-		buffer += " ? ";
-		Unparse( buffer, t2 );
-		buffer += " : ";
+		if (t2) {
+			buffer += " ? ";
+			Unparse( buffer, t2 );
+			buffer += " : ";
+		} else {
+			buffer += " ?: ";
+		}
 		Unparse( buffer, t3 );
 		return;
 	}
@@ -503,7 +533,7 @@ UnparseAux( string &buffer, vector<ExprTree*>& exprs )
  * it's unparsed either as a quoted attribute or non-quoted attribute 
  */
 void ClassAdUnParser::
-UnparseAux( string &buffer, string identifier )
+UnparseAux( string &buffer, const string &identifier )
 {
 	Value  val;
 	string idstr;
@@ -634,7 +664,9 @@ UnparseAux(string &buffer,Operation::OpKind op,ExprTree *op1,ExprTree *op2,
 	if( op==Operation::TERNARY_OP ) {
 		Unparse( buffer, op1 );
 		buffer += " ? ";
-		Unparse( buffer, op2 );
+		if (op2) {
+			Unparse( buffer, op2 );
+		}
 		buffer += " : ";
 		Unparse( buffer, op3 );
 		return;

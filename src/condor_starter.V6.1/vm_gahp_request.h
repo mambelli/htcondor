@@ -25,7 +25,6 @@
 #include "condor_daemon_core.h"
 #include "gahp_common.h"
 #include "MyString.h"
-#include "condor_string.h"
 #include "condor_arglist.h"
 #include "vm_proc.h"
 #include "vm_gahp_server.h"
@@ -37,6 +36,8 @@ static const int VMGAHP_REQ_COMMAND_TIMED_OUT = 2;
 static const int VMGAHP_REQ_COMMAND_NOT_SUPPORTED = 3;
 static const int VMGAHP_REQ_VMTYPE_NOT_SUPPORTED = 4;
 static const int VMGAHP_REQ_COMMAND_ERROR = 5;
+
+extern const char * VMGAHP_REQ_RETURN_TABLE[];
 
 enum reqstatus {
 	REQ_INITIALIZED,	//set during initializing
@@ -75,6 +76,7 @@ class VMGahpRequest : public Service {
 
 		int getReqId();
 		Gahp_Args* getResult();
+		bool hasValidResult();
 		bool checkResult(MyString& errmsg);
 
 		reqstatus getPendingStatus();
@@ -101,7 +103,7 @@ class VMGahpRequest : public Service {
 		void setReqId(int id);
 		void setPendingStatus(reqstatus status);
 		void setResult(Gahp_Args *result);
-		int pending_timer_fn();
+		void pending_timer_fn();
 
 		reqmode m_mode;
 		MyString m_command;

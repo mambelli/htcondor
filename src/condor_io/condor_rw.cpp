@@ -27,6 +27,7 @@
 #include "internet.h"
 #include "selector.h"
 #include "condor_threads.h"
+#include "condor_sockfunc.h"
 
 /*
  * Returns true if the given error number indicates
@@ -50,12 +51,40 @@ static int errno_is_temporary( int e )
 #endif
 }
 
+static int errno_socket_dead( int e )
+{
+	switch( e ) {
+#ifdef WIN32
+	case WSAENETRESET:
+	case WSAECONNABORTED:
+	case WSAECONNRESET:
+	case WSAESHUTDOWN:
+	case WSAETIMEDOUT:
+	case WSAECONNREFUSED:
+#else
+	case ECONNRESET:
+	case ENOTCONN:
+	case ETIMEDOUT:
+#endif
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 static char const *not_null_peer_description(char const *peer_description,SOCKET fd,char *sinbuf)
 {
     if( peer_description ) {
         return peer_description;
     }
-    return sock_peer_to_string(fd,sinbuf,SINFUL_STRING_BUF_SIZE,"disconnected socket");
+
+	condor_sockaddr addr;
+	if (condor_getpeername(fd, addr) < 0) {
+		return "disconnected socket";
+	}
+
+	addr.to_sinful(sinbuf, SINFUL_STRING_BUF_SIZE);
+	return sinbuf;
 }
 
 /* Generic read/write wrappers for condor.  These function emulate-ish the 
@@ -106,8 +135,8 @@ condor_read( char const *peer_description, SOCKET fd, char *buf, int sz, int tim
 		int fcntl_flags;
 		if ( (fcntl_flags=fcntl(fd, F_GETFL)) < 0 )
 			return -1;
-		fcntl_flags |= O_NONBLOCK;      // set nonblocking mode
-		if ( fcntl(fd, F_SETFL, fcntl_flags) == -1 )
+			// set nonblocking mode
+		if ( ((fcntl_flags & O_NONBLOCK) == 0) && fcntl(fd, F_SETFL, fcntl_flags | O_NONBLOCK) == -1 )
 			return -1;
 #endif
 		nr = -2;
@@ -131,6 +160,13 @@ condor_read( char const *peer_description, SOCKET fd, char *buf, int sz, int tim
 					"Socket closed when trying to read %d bytes from %s in non-blocking mode\n",
 					sz,
 					not_null_peer_description(peer_description,fd,sinbuf) );
+			} else if ( errno_socket_dead(the_error) ) {
+				nr = -2;
+				dprintf( D_ALWAYS, "condor_read(): "
+					"Socket closed abnormally when trying to read %d bytes from %s in non-blocking mode, errno=%d %s\n",
+					sz,
+					not_null_peer_description(peer_description,fd,sinbuf),
+					the_error, the_errorstr );
 			} else if ( !errno_is_temporary(the_error) ) {
 				dprintf( D_ALWAYS, "condor_read() failed: recv() %d bytes from %s "
 					"returned %d, "     
@@ -150,10 +186,8 @@ condor_read( char const *peer_description, SOCKET fd, char *buf, int sz, int tim
 		if (ioctlsocket(fd, FIONBIO, &mode) < 0)
 			return -1;
 #else
-		if ( (fcntl_flags=fcntl(fd, F_GETFL)) < 0 )
-			return -1;
-		fcntl_flags &= ~O_NONBLOCK;     // reset blocking mode
-		if ( fcntl(fd, F_SETFL, fcntl_flags) == -1 )
+			// reset flags to prior value
+		if ( ((fcntl_flags & O_NONBLOCK) == 0) && (fcntl(fd, F_SETFL, fcntl_flags) == -1) )
 			return -1;
 #endif
 		return nr;
@@ -265,20 +299,6 @@ condor_read( char const *peer_description, SOCKET fd, char *buf, int sz, int tim
 #else
             the_errorstr = strerror(the_error);
 #endif
-			if ( errno_is_temporary(the_error) ) {
-				dprintf( D_FULLDEBUG, "condor_read(): "
-				         "recv() returned temporary error %d %s,"
-				         "still trying to read from %s\n",
-				         the_error,the_errorstr,
-				         not_null_peer_description(peer_description,fd,sinbuf) );
-				continue;
-			}
-
-			dprintf( D_ALWAYS, "condor_read() failed: recv(fd=%d) returned %d, "
-					 "errno = %d %s, reading %d bytes from %s.\n",
-					 fd, nro, the_error, the_errorstr, sz,
-					 not_null_peer_description(peer_description,fd,sinbuf) );
-
 			if( the_error == ETIMEDOUT ) {
 				if( timeout <= 0 ) {
 					dprintf( D_ALWAYS,
@@ -294,6 +314,26 @@ condor_read( char const *peer_description, SOCKET fd, char *buf, int sz, int tim
 							 timeout);
 				}
 			}
+			if ( errno_is_temporary(the_error) ) {
+				dprintf( D_FULLDEBUG, "condor_read(): "
+				         "recv() returned temporary error %d %s,"
+				         "still trying to read from %s\n",
+				         the_error,the_errorstr,
+				         not_null_peer_description(peer_description,fd,sinbuf) );
+				continue;
+			} else if ( errno_socket_dead(the_error) ) {
+				dprintf( D_ALWAYS, "condor_read(): "
+					"Socket closed abnormally when trying to read %d bytes from %s, errno=%d %s\n",
+					sz,
+					not_null_peer_description(peer_description,fd,sinbuf),
+					the_error, the_errorstr );
+				return -2;
+			}
+			dprintf( D_ALWAYS, "condor_read() failed: recv(fd=%d) returned %d, "
+					 "errno = %d %s, reading %d bytes from %s.\n",
+					 fd, nro, the_error, the_errorstr, sz,
+					 not_null_peer_description(peer_description,fd,sinbuf) );
+
 			return -1;
 		}
 		nr += nro;
@@ -341,8 +381,8 @@ condor_write( char const *peer_description, SOCKET fd, const char *buf, int sz, 
 		int fcntl_flags;
 		if ( (fcntl_flags=fcntl(fd, F_GETFL)) < 0 )
 			return -1;
-		fcntl_flags |= O_NONBLOCK;      // set nonblocking mode
-		if ( fcntl(fd, F_SETFL, fcntl_flags) == -1 )
+			// set nonblocking mode
+		if ( ((fcntl_flags & O_NONBLOCK) == 0) && fcntl(fd, F_SETFL, fcntl_flags | O_NONBLOCK) == -1 )
 			return -1;
 #endif
 		nw = -2;
@@ -382,10 +422,8 @@ condor_write( char const *peer_description, SOCKET fd, const char *buf, int sz, 
 		if (ioctlsocket(fd, FIONBIO, &mode) < 0)
 			return -1;
 #else
-		if ( (fcntl_flags=fcntl(fd, F_GETFL)) < 0 )
-			return -1;
-		fcntl_flags &= ~O_NONBLOCK;     // reset blocking mode
-		if ( fcntl(fd, F_SETFL, fcntl_flags) == -1 )
+			// reset flags to prior value
+		if ( ((fcntl_flags & O_NONBLOCK) == 0) && fcntl(fd, F_SETFL, fcntl_flags) == -1 )
 			return -1;
 #endif
 		return nw;

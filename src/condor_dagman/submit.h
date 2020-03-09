@@ -24,53 +24,59 @@
 #include "condor_id.h"
 
 /** Submits a job to condor using popen().  This is a very primitive method
-    to submitting a job, and SHOULD be replacable by a Condor Submit API.
+    to submitting a job, and SHOULD be replacable by a HTCondor Submit API.
 
     In the mean time, this function executes the condor_submit command
     via popen() and parses the output, sniffing for the CondorID assigned
     to the submitted job.
 
     Parsing the condor_submit output successfully depends on the current
-    version of Condor, and how it's condor_submit outputs results on the
+    version of HTCondor, and how it's condor_submit outputs results on the
     command line.
    
 	@param dm the appropriate Dagman object
-	@param cmdFile the job's Condor command file.
+	@param cmdFile the job's HTCondor command file.
 	@param condorID will hold the ID for the submitted job (if successful)
 	@param DAGNodeName the name of the job's DAG node
 	@param DAGParentNodeNames a delimited string listing the node's parents
 	@param vars list of any variables for this node
+	@param priority the priority of this node
 	@param retry the retry number (0 the first time the job is run)
 	@param directory the directory in which to run this job
 	@param default log file name
 	@param whether to use the default log
 	@param log file to force this job to use (should be null if submit
 		file specifies log file)
-	@param prohibitMultiJobs flag that prohibits multiple jobs in a
-		cluster from being submitted.
 	@param hold_claim is true if DAGMAN_HOLD_CLAIM_IDLE is positive
 	@return true on success, false on failure
 */
 
 bool condor_submit( const Dagman &dm, const char* cmdFile, CondorID& condorID,
-					const char* DAGNodeName, MyString &DAGParentNodeNames,
-					List<Job::NodeVar> *vars, int retry,
-					const char* directory, const char *defLog, bool useDefLog,
-					const char *logFile, bool prohibitMultiJobs,
-					bool hold_claim );
+					const char* DAGNodeName, const char *DAGParentNodeNames,
+#ifdef DEAD_CODE
+					List<Job::NodeVar> *vars, int priority, int retry,
+#else
+					Job* node, int priority, int retry,
+#endif
+					const char* directory, const char *worflowLogFile,
+					bool hold_claim, const MyString &batchName );
 
-bool stork_submit( const Dagman &dm, const char* cmdFile, CondorID& condorID,
-				   const char* DAGNodeName, const char* directory );
+bool direct_condor_submit(const Dagman &dm, Job* node,
+	const char *worflowLogFile,
+	const MyString &parents,
+	const char *batchName,
+	CondorID& condorID);
+
+bool send_reschedule(const Dagman &dm);
 
 void set_fake_condorID( int subprocID );
 
 bool fake_condor_submit( CondorID& condorID, Job* job, const char* DAGNodeName,
-					const char* directory, const char *logFile,
-					bool logIsXml );
+					const char* directory, const char *logFile );
 
 int get_fake_condorID();
 
 bool writePreSkipEvent( CondorID& condorID, Job* job, const char* DAGNodeName, 
-			   const char* directory, const char *logFile, bool logIsXml );
+			   const char* directory, const char *logFile );
 
 #endif /* #ifndef CONDOR_SUBMIT_H */

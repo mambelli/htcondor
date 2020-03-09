@@ -38,7 +38,7 @@ sysapi_set_resource_limits(int stack_size)
 	long long free_blocks = sysapi_disk_space( "." );
 	long long core_lim = (free_blocks - SLOP) * 1024;
 
-	PRAGMA_REMIND("FIXME: disk_space truncation to INT_MAX here")
+	//PRAGMA_REMIND("FIXME: disk_space truncation to INT_MAX here")
 	if( core_lim > INT_MAX ) {
 		lim = INT_MAX;
 	} else {
@@ -103,16 +103,7 @@ sysapi_set_resource_limits(int)
 	dprintf( D_ALWAYS, "Done setting resource limits\n" );
 }
 
-#elif defined( HPUX ) 
-
-void
-sysapi_set_resource_limits(int)
-{
-		/* These platforms do not support limit() */
-	dprintf( D_ALWAYS, "Setting resource limits not supported!\n" );
-}
-
-#elif defined( WIN32 ) || defined( AIX ) || defined( Darwin ) || defined( CONDOR_FREEBSD )
+#elif defined( WIN32 ) || defined( Darwin ) || defined( CONDOR_FREEBSD )
 
 void
 sysapi_set_resource_limits(int)

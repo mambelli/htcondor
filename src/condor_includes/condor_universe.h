@@ -28,9 +28,6 @@ BEGIN_C_DECLS
 /*
 Warning: These symbols must stay in sync
 with the strings in condor_universe.c
-
-Please also sync condor__UniverseType in 
-src/condor_schedd.V6/gsoap_schedd_types.h
 */
 
 #define CONDOR_UNIVERSE_MIN       0  /* A placeholder, not a universe */
@@ -56,6 +53,16 @@ const char *CondorUniverseNameUcFirst( int universe );
 /* To get the number of a universe from a string, call this.  Returns
    0 if the given string doesn't correspond to a known universe */
 int CondorUniverseNumber( const char* univ );
+
+/* check if a string is a universe or pseudo-universe (aka. toppings like Docker)
+ * Returns 0 if the input is not a universe or topping.
+ * returns universe id for universes and toppings. (universe id's are non-zero)
+ * if return is non-zero then is_obsolete will be set or cleared,
+ * and topping_id will be non-zero for toppings.
+*/
+int CondorUniverseInfo( const char* univ_or_topping, int * topping_id, int * is_obsolete );
+/* return universe or "universe" name given universe id and topping id */
+const char *CondorUniverseOrToppingName( int universe, int topping );
 
 BOOLEAN universeCanReconnect( int universe );
 

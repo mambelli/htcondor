@@ -47,6 +47,7 @@ class ClassAdXMLUnParser
 	 * 	@param expr The expression to unparse
 		 */
 	void Unparse(std::string &buffer, const ExprTree *expr);
+	void Unparse(std::string &buffer, const ClassAd *ad, const References &whitelist);
 	/* This version is provided for backwards SO compatibility.
 	 * It should be removed the next time we have to bump the
 	 * SO version.
@@ -61,7 +62,7 @@ class ClassAdXMLUnParser
 	 */
 	void Unparse(std::string &buffer, const ExprTree *expr, int indent);
 
-	void Unparse(std::string &buffer, Value &val, int indent);
+	void Unparse(std::string &buffer, const Value &val, int indent);
 	virtual void UnparseAux(std::string &buffer, 
 							std::vector< std::pair< std::string, ExprTree*> >& attrlist,
 							int indent);

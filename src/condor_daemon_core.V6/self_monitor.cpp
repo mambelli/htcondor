@@ -24,17 +24,14 @@
 #include "classad_helpers.h" // for cleanStringForUseAsAttr
 #include "condor_config.h"   // for param
 #include "../condor_procapi/procapi.h"
-#undef min
-#undef max
 #include <limits>
-
 
 int configured_statistics_window_quantum() {
     int quantum = param_integer("STATISTICS_WINDOW_QUANTUM_DAEMONCORE", INT_MAX, 1, INT_MAX);
     if (quantum >= INT_MAX)
         quantum = param_integer("STATISTICS_WINDOW_QUANTUM_DC", INT_MAX, 1, INT_MAX);
     if (quantum >= INT_MAX)
-        quantum = param_integer("STATISTICS_WINDOW_QUANTUM", 4*60, 1, INT_MAX);
+        quantum = param_integer("STATISTICS_WINDOW_QUANTUM", 1*60, 1, INT_MAX);
 
     return quantum;
 }
@@ -56,6 +53,7 @@ SelfMonitorData::SelfMonitorData()
     image_size       = 0;
     rs_size          = 0;
     age              = -1;
+	user_time = sys_time = -1;
 	registered_socket_count = 0;
 	cached_security_sessions = 0;
     return;
@@ -99,14 +97,18 @@ void SelfMonitorData::CollectData(void)
 
     dprintf(D_FULLDEBUG, "Getting monitoring info for pid %d\n", getpid());
 
-    ProcAPI::getProcInfo(getpid(), my_process_info, status);
+    int r = ProcAPI::getProcInfo(getpid(), my_process_info, status);
 
-    if (my_process_info != NULL) {
+    if ((r == PROCAPI_SUCCESS) && (my_process_info != NULL)) {
         cpu_usage  = my_process_info->cpuusage;
         image_size = my_process_info->imgsize;
         rs_size    = my_process_info->rssize;
+        user_time  = my_process_info->user_time;
+        sys_time   = my_process_info->sys_time;
         age        = my_process_info->age;
+	}
 
+	if (my_process_info != NULL) {
         delete my_process_info;
     }
 
@@ -116,11 +118,20 @@ void SelfMonitorData::CollectData(void)
 
 	cached_security_sessions = daemonCore->getSecMan()->session_cache->count();
 
+	// collect data on the udp port depth
+	if (daemonCore->wants_dc_udp_self()) {
+		int commandPort = daemonCore->InfoCommandPort();
+		if (commandPort > 0) {
+			int udpQueueDepth = SafeSock::recvQueueDepth(daemonCore->InfoCommandPort());
+    		daemonCore->dc_stats.UdpQueueDepth = udpQueueDepth;
+		}
+	}
+
     // Collecting more info is yet to be done
     return;
 }
 
-bool SelfMonitorData::ExportData(ClassAd *ad)
+bool SelfMonitorData::ExportData(ClassAd *ad, bool verbose /*=false*/)
 {
     bool      success;
     MyString  attribute;
@@ -128,14 +139,19 @@ bool SelfMonitorData::ExportData(ClassAd *ad)
     if (ad == NULL) {
         success = false;
     } else {
-        ad->Assign("MonitorSelfTime",            (int)   last_sample_time);
-        ad->Assign("MonitorSelfCPUUsage",        (float) cpu_usage);
-        ad->Assign("MonitorSelfImageSize",       (float) image_size);
-        ad->Assign("MonitorSelfResidentSetSize", (int)   rs_size);
-        ad->Assign("MonitorSelfAge",             (int)   age);
-		ad->Assign("MonitorSelfRegisteredSocketCount", (int) registered_socket_count);
-		ad->Assign("MonitorSelfSecuritySessions", (int) cached_security_sessions);
-
+        ad->Assign("MonitorSelfTime",            last_sample_time);
+        ad->Assign("MonitorSelfCPUUsage",        cpu_usage);
+        ad->Assign("MonitorSelfImageSize",       image_size);
+        ad->Assign("MonitorSelfResidentSetSize", rs_size);
+        ad->Assign("MonitorSelfAge",             age);
+        ad->Assign("MonitorSelfRegisteredSocketCount", registered_socket_count);
+        ad->Assign("MonitorSelfSecuritySessions", cached_security_sessions);
+        ad->Assign(ATTR_DETECTED_CPUS, param_integer("DETECTED_CORES", 0));
+        ad->Assign(ATTR_DETECTED_MEMORY, param_integer("DETECTED_MEMORY", 0));
+        if (verbose) {
+            ad->Assign("MonitorSelfSysCpuTime",         sys_time);
+            ad->Assign("MonitorSelfUserCpuTime",        user_time);
+        }
         success = true;
     }
 
@@ -164,6 +180,11 @@ void DaemonCore::Stats::Reconfig()
     }
     SetWindowSize(this->RecentWindowMax);
 
+    std::string strWhitelist;
+    if (param(strWhitelist, "STATISTICS_TO_PUBLISH_LIST")) {
+       this->Pool.SetVerbosities(strWhitelist.c_str(), this->PublishFlags, true);
+    }
+
     std::string timespans;
     param(timespans,"DCSTATISTICS_TIMESPANS");
 
@@ -188,12 +209,14 @@ void DaemonCore::Stats::SetWindowSize(int window)
 // this is for first time initialization before calling SetWindowSize,
 // use the Clear() method to reset stats after the window size has been set.
 //
-void DaemonCore::Stats::Init() 
+void DaemonCore::Stats::Init(bool enable)
 { 
    Clear();
+   this->enabled = enable;
    this->RecentWindowQuantum = configured_statistics_window_quantum();
    this->RecentWindowMax = this->RecentWindowQuantum; 
    this->PublishFlags    = -1;
+   if ( ! enable) return;
 
    // insert static items into the stats pool so we can use the pool 
    // to Advance and Clear.  these items also publish the overall value
@@ -205,14 +228,52 @@ void DaemonCore::Stats::Init()
    DC_STATS_ADD_RECENT(Pool, SocketRuntime,   IF_BASICPUB);
    DC_STATS_ADD_RECENT(Pool, PipeRuntime,     IF_BASICPUB);
    DC_STATS_ADD_RECENT(Pool, Signals,       IF_BASICPUB);
-   DC_STATS_ADD_RECENT(Pool, TimersFired,   IF_BASICPUB);
+   STATS_POOL_ADD_VAL(Pool, "DC", TimersFired, IF_BASICPUB);
+   STATS_POOL_PUB_PEAK(Pool, "DC", TimersFired, IF_BASICPUB);
    DC_STATS_ADD_RECENT(Pool, SockMessages,  IF_BASICPUB);
    DC_STATS_ADD_RECENT(Pool, PipeMessages,  IF_BASICPUB);
    //DC_STATS_ADD_RECENT(Pool, SockBytes,     IF_BASICPUB);
    //DC_STATS_ADD_RECENT(Pool, PipeBytes,     IF_BASICPUB);
    DC_STATS_ADD_RECENT(Pool, DebugOuts,     IF_VERBOSEPUB);
    DC_STATS_ADD_RECENT(Pool, PumpCycle,     IF_VERBOSEPUB);
+   STATS_POOL_ADD_VAL(Pool, "DC", UdpQueueDepth,  IF_BASICPUB);
+   STATS_POOL_PUB_PEAK(Pool, "DC", UdpQueueDepth,  IF_BASICPUB);
    DC_STATS_ADD_DEF(Pool, Commands, IF_BASICPUB);
+
+   // insert entries that are stored in helper modules
+   //
+   extern stats_entry_probe<double> condor_fsync_runtime;
+   Pool.AddProbe("DCfsync", &condor_fsync_runtime, "DCfsync", IF_VERBOSEPUB | IF_RT_SUM);
+
+#if 1
+   //PRAGMA_REMIND("temporarily!! publish recent windowed values for DNS lookup runtime...")
+   extern stats_entry_recent<Probe> getaddrinfo_runtime; // count & runtime of all lookups, success and fail
+   extern stats_entry_recent<Probe> getaddrinfo_fast_runtime; // count & runtime of successful lookups that were faster than getaddrinfo_slow_limit
+   extern stats_entry_recent<Probe> getaddrinfo_slow_runtime; // count & runtime of successful lookups that were slower than getaddrinfo_slow_limit
+   extern stats_entry_recent<Probe> getaddrinfo_fail_runtime; // count & runtime of failed lookups
+   //extern double getaddrinfo_slow_limit;
+   //#define GAI_TAG "DNSLookup"
+   #define GAI_TAG "NameResolve"
+   const int pub_flags = ProbeDetailMode_RT_SUM | stats_entry_recent<Probe>::PubValueAndRecent;
+   Pool.AddProbe("DC" GAI_TAG,        &getaddrinfo_runtime,      NULL, IF_VERBOSEPUB | pub_flags);
+   Pool.AddProbe("DC" GAI_TAG "Fast", &getaddrinfo_fast_runtime, NULL, IF_VERBOSEPUB | pub_flags);
+   Pool.AddProbe("DC" GAI_TAG "Slow", &getaddrinfo_slow_runtime, NULL, IF_VERBOSEPUB | pub_flags);
+   Pool.AddProbe("DC" GAI_TAG "Fail", &getaddrinfo_fail_runtime, NULL, IF_VERBOSEPUB | pub_flags);
+   #undef GAI_TAG
+#else
+   extern stats_entry_probe<double> getaddrinfo_runtime; // count & runtime of all lookups, success and fail
+   extern stats_entry_probe<double> getaddrinfo_fast_runtime; // count & runtime of successful lookups that were faster than getaddrinfo_slow_limit
+   extern stats_entry_probe<double> getaddrinfo_slow_runtime; // count & runtime of successful lookups that were slower than getaddrinfo_slow_limit
+   extern stats_entry_probe<double> getaddrinfo_fail_runtime; // count & runtime of failed lookups
+   //extern double getaddrinfo_slow_limit;
+   //#define GAI_TAG "DNSLookup"
+   #define GAI_TAG "NameResolve"
+   Pool.AddProbe("DC" GAI_TAG,        &getaddrinfo_runtime,      "DC" GAI_TAG,        IF_VERBOSEPUB | IF_RT_SUM);
+   Pool.AddProbe("DC" GAI_TAG "Fast", &getaddrinfo_fast_runtime, "DC" GAI_TAG "Fast", IF_VERBOSEPUB | IF_RT_SUM);
+   Pool.AddProbe("DC" GAI_TAG "Slow", &getaddrinfo_slow_runtime, "DC" GAI_TAG "Slow", IF_VERBOSEPUB | IF_RT_SUM);
+   Pool.AddProbe("DC" GAI_TAG "Fail", &getaddrinfo_fail_runtime, "DC" GAI_TAG "Fail", IF_VERBOSEPUB | IF_RT_SUM);
+   #undef GAI_TAG
+#endif
 
    // Insert additional publish entries for the XXXDebug values
    //
@@ -222,13 +283,13 @@ void DaemonCore::Stats::Init()
    DC_STATS_PUB_DEBUG(Pool, SocketRuntime,   IF_BASICPUB);
    DC_STATS_PUB_DEBUG(Pool, PipeRuntime,     IF_BASICPUB);
    DC_STATS_PUB_DEBUG(Pool, Signals,       IF_BASICPUB);
-   DC_STATS_PUB_DEBUG(Pool, TimersFired,   IF_BASICPUB);
    DC_STATS_PUB_DEBUG(Pool, SockMessages,  IF_BASICPUB);
    DC_STATS_PUB_DEBUG(Pool, PipeMessages,  IF_BASICPUB);
    //DC_STATS_PUB_DEBUG(Pool, SockBytes,     IF_BASICPUB);
    //DC_STATS_PUB_DEBUG(Pool, PipeBytes,     IF_BASICPUB);
    DC_STATS_PUB_DEBUG(Pool, DebugOuts,     IF_VERBOSEPUB);
    DC_STATS_PUB_DEBUG(Pool, PumpCycle,     IF_VERBOSEPUB);
+
 
    // clear all counters we just added to the pool
    Pool.Clear();
@@ -260,6 +321,8 @@ void DaemonCore::Stats::Publish(ClassAd & ad, const char * config) const
 
 void DaemonCore::Stats::Publish(ClassAd & ad, int flags) const
 {
+   if ( ! this->enabled) return;
+
    if ((flags & IF_PUBLEVEL) > 0) {
       ad.Assign("DCStatsLifetime", (int)StatsLifetime);
       if (flags & IF_VERBOSEPUB)
@@ -328,6 +391,8 @@ time_t DaemonCore::Stats::Tick(time_t now)
 
 void DaemonCore::Stats::AddToProbe(const char * name, int val)
 {
+   if ( ! this->enabled) return;
+
    stats_entry_recent<int>* pstat = Pool.GetProbe<stats_entry_recent<int> >(name);
    if (pstat)
       pstat->Add(val);
@@ -335,6 +400,8 @@ void DaemonCore::Stats::AddToProbe(const char * name, int val)
 
 void DaemonCore::Stats::AddToProbe(const char * name, int64_t val)
 {
+   if ( ! this->enabled) return;
+
    stats_entry_recent<int64_t>* pstat = Pool.GetProbe<stats_entry_recent<int64_t> >(name);
    if (pstat)
       pstat->Add(val);
@@ -342,6 +409,8 @@ void DaemonCore::Stats::AddToProbe(const char * name, int64_t val)
 
 void DaemonCore::Stats::AddToAnyProbe(const char * name, int val)
 {
+   if ( ! this->enabled) return;
+
    int units;
    stats_entry_base* pbase = Pool.GetProbe(name, units);
    if (pbase) {
@@ -374,22 +443,67 @@ void DaemonCore::Stats::AddToAnyProbe(const char * name, int val)
 }
 
 void DaemonCore::Stats::AddToSumEmaRate(const char * name, int val) {
+   if ( ! this->enabled) return;
+
    stats_entry_sum_ema_rate<int>* pstat = Pool.GetProbe<stats_entry_sum_ema_rate<int> >(name);
    if (pstat)
       pstat->Add(val);
 }
 
+#ifdef USE_MIRON_PROBE_FOR_DC_RUNTIME_STATS
+
 double DaemonCore::Stats::AddRuntime(const char * name, double before)
 {
-   double now = UtcTime::getTimeDouble();
+   double now = _condor_debug_get_time_double();
+   if ( ! this->enabled) return now;
+   stats_entry_probe<double> * probe = Pool.GetProbe< stats_entry_probe<double> >(name);
+   if (probe)
+      probe->Add(now - before);
+   return now;
+}
+
+double DaemonCore::Stats::AddSample(const char * name, int as, double val)
+{
+   if ( ! this->enabled) return val;
+
+   stats_entry_probe<double> * probe = Pool.GetProbe< stats_entry_probe<double> >(name);
+   if ( ! probe) {
+       MyString attr(name);
+       cleanStringForUseAsAttr(attr);
+       probe = Pool.NewProbe< stats_entry_probe<double> >(name, attr.Value(), as);
+   }
+
+   if (probe)
+      probe->Add(val);
+   return val;
+}
+
+double DaemonCore::Stats::AddRuntimeSample(const char * name, int as, double before) // returns current time.
+{
+   double now = _condor_debug_get_time_double();
+   if ( ! this->enabled) return now;
+
+   this->AddSample(name, as | IF_RT_SUM, now - before);
+   return now;
+}
+
+#else
+
+double DaemonCore::Stats::AddRuntime(const char * name, double before)
+{
+   if ( ! this->enabled) return;
+
+   double now = _condor_debug_get_time_double();
    stats_recent_counter_timer * probe = Pool.GetProbe<stats_recent_counter_timer>(name);
    if (probe)
       probe->Add(now - before);
    return now;
 }
 
-stats_entry_recent<Probe> * DaemonCore::Stats::AddSample(const char * name, int as, double val)
+double DaemonCore::Stats::AddSample(const char * name, int as, double val)
 {
+   if ( ! this->enabled) return;
+
    stats_entry_recent<Probe> * probe = Pool.GetProbe< stats_entry_recent<Probe> >(name);
    if ( ! probe) {
        MyString attr;
@@ -404,20 +518,26 @@ stats_entry_recent<Probe> * DaemonCore::Stats::AddSample(const char * name, int 
        }
    }
 
-   if (probe) 
+   if (probe)
       probe->Add(val);
-   return probe;
+   return val;
 }
 
 double DaemonCore::Stats::AddRuntimeSample(const char * name, int as, double before) // returns current time.
 {
-   double now = UtcTime::getTimeDouble();
+   if ( ! this->enabled) return;
+
+   double now = _condor_debug_get_time_double();
    this->AddSample(name, as, now - before);
    return now;
 }
 
-void* DaemonCore::Stats::New(const char * category, const char * name, int as)
+#endif
+
+void* DaemonCore::Stats::NewProbe(const char * category, const char * name, int as)
 {
+   if ( ! this->enabled) return NULL;
+
    MyString attr;
    attr.formatstr("DC%s_%s", category, name);
    cleanStringForUseAsAttr(attr);
@@ -485,6 +605,18 @@ void* DaemonCore::Stats::New(const char * category, const char * name, int as)
          break;
 
       case AS_COUNT | IS_RCT:
+#ifdef USE_MIRON_PROBE_FOR_DC_RUNTIME_STATS
+         {
+         as &= ~(IS_CLASS_MASK);  // strip off IS_RTC class
+         as |= IS_CLS_PROBE | IF_RT_SUM; // and set IS_CLS_PROBE & IF_RT_SUM classes
+         stats_entry_probe<double> * probe =
+         Pool.NewProbe< stats_entry_probe<double> >(name, attr.Value(), as);
+         ret = probe;
+         }
+         break;
+#else
+          // fall through
+#endif
       case AS_RELTIME | IS_RCT:
          {
          stats_recent_counter_timer * probe =
@@ -500,7 +632,7 @@ void* DaemonCore::Stats::New(const char * category, const char * name, int as)
          break;
 
       default:
-         EXCEPT("unsupported probe type\n");
+         EXCEPT("unsupported probe type");
          break;
       }
 
@@ -508,7 +640,10 @@ void* DaemonCore::Stats::New(const char * category, const char * name, int as)
 }
 
 dc_stats_auto_runtime_probe::dc_stats_auto_runtime_probe(const char * name, int as)
-{
+{	
+   begin = 0;
+   if ( ! daemonCore->dc_stats.enabled) { this->probe = NULL; return; }
+
    StatisticsPool * pool = &daemonCore->dc_stats.Pool;
    this->probe = pool->GetProbe< stats_entry_recent<Probe> >(name);
    if ( ! this->probe) {
@@ -521,14 +656,15 @@ dc_stats_auto_runtime_probe::dc_stats_auto_runtime_probe(const char * name, int 
           this->probe->SetRecentMax(daemonCore->dc_stats.RecentWindowMax / daemonCore->dc_stats.RecentWindowQuantum);
        }
    }
-   if (this->probe)
-       this->begin = UtcTime::getTimeDouble();
+   if (this->probe) {
+       this->begin = _condor_debug_get_time_double();
+	} 
 }
 
 dc_stats_auto_runtime_probe::~dc_stats_auto_runtime_probe()
 {
    if (this->probe) {
-      double now = UtcTime::getTimeDouble();
+      double now = _condor_debug_get_time_double();
       this->probe->Add(now - this->begin);
    }
 }

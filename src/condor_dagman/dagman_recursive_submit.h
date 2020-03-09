@@ -17,6 +17,7 @@
  *
  ***************************************************************/
 
+#if 0 // Moved to dagman_utils
 #ifndef DAGMAN_RECURSIVE_SUBMIT_H
 #define DAGMAN_RECURSIVE_SUBMIT_H
 
@@ -44,7 +45,6 @@ struct SubmitDagShallowOptions
 	int iMaxJobs;
 	int iMaxPre;
 	int iMaxPost;
-	bool bNoEventChecks;
 	MyString appendFile; // append to .condor.sub file before queue
 	StringList appendLines; // append to .condor.sub file before queue
 	MyString strConfigFile;
@@ -52,23 +52,27 @@ struct SubmitDagShallowOptions
 	bool runValgrind;
 	MyString primaryDagFile;
 	StringList	dagFiles;
+	bool doRecovery;
+	bool bPostRun;
+	bool bPostRunSet; // whether this was actually set on the command line
+	int priority;
 
 	// non-command line options
 	MyString strLibOut;
 	MyString strLibErr;
-	MyString strDebugLog;
-	MyString strSchedLog;
+	MyString strDebugLog; // the dagman.out file
+	MyString strSchedLog; // the user log of condor_dagman's events
 	MyString strSubFile;
 	MyString strRescueFile;
 	MyString strLockFile;
 	bool copyToSpool;
 	int iDebugLevel;
-	bool bPostRun;
 
 	SubmitDagShallowOptions() 
 	{ 
 		bSubmit = true;
-		bPostRun = true;
+		bPostRun = false;
+		bPostRunSet = false;
 		strRemoteSchedd = "";
 		strScheddDaemonAdFile = "";
 		strScheddAddressFile = "";
@@ -76,14 +80,15 @@ struct SubmitDagShallowOptions
 		iMaxJobs = 0;
 		iMaxPre = 0;
 		iMaxPost = 0;
-		bNoEventChecks = false;
-		appendFile = param("DAGMAN_INSERT_SUB_FILE");
+		appendFile = param( "DAGMAN_INSERT_SUB_FILE" );
 		strConfigFile = "";
 		dumpRescueDag = false;
 		runValgrind = false;
 		primaryDagFile = "";
+		doRecovery = false;
 		copyToSpool = param_boolean( "DAGMAN_COPY_TO_SPOOL", false );
 		iDebugLevel = DEBUG_UNSET;
+		priority = 0;
 	}
 };
 
@@ -98,31 +103,26 @@ struct SubmitDagDeepOptions
 	bool bVerbose;
 	bool bForce;
 	MyString strNotification;
-	bool bAllowLogError;
 	MyString strDagmanPath; // path to dagman binary
 	bool useDagDir;
 	MyString strOutfileDir;
+	MyString batchName; // optional value from -batch-name argument, will be double quoted if it exists.
 	bool autoRescue;
 	int doRescueFrom;
 	bool allowVerMismatch;
 	bool recurse; // whether to recursively run condor_submit_dag on nested DAGs
 	bool updateSubmit; // allow updating submit file w/o -force
 	bool importEnv; // explicitly import environment into .condor.sub file
-	int priority; // Priority of parent of DAG node
 
-		// Use the default node log (<DAGfile>.nodes.log) for events
-		// Defaults to true
-		// Set to false if this dagman is going to be communicating
-		// with pre-7.9.0 schedd/shadow/submit
-	bool always_use_node_log;		 	
 	bool suppress_notification;
+	MyString acctGroup;
+	MyString acctGroupUser;
 
 	SubmitDagDeepOptions() 
 	{ 
 		bVerbose = false;
 		bForce = false;
 		strNotification = "";
-		bAllowLogError = false;
 		useDagDir = false;
 		autoRescue = param_boolean( "DAGMAN_AUTO_RESCUE", true );
 		doRescueFrom = 0; // 0 means no rescue DAG specified
@@ -130,9 +130,9 @@ struct SubmitDagDeepOptions
 		recurse = false;
 		updateSubmit = false;
 		importEnv = false;
-		priority = 0;
-		always_use_node_log = true;
 		suppress_notification = true;
+		acctGroup = "";
+		acctGroupUser = "";
 	}
 };
 
@@ -142,10 +142,14 @@ extern "C" {
 	@param dagFile: the DAG file to process
 	@param directory: the directory from which the DAG file should
 		be processed (ignored if NULL)
+	@param priority: the priority of this DAG
+	@param isRetry: whether this is a retry
 	@return 0 if successful, 1 if failed
 */
 int runSubmitDag( const SubmitDagDeepOptions &deepOpts,
-			const char *dagFile, const char *directory, bool isRetry );
+			const char *dagFile, const char *directory, int priority,
+			bool isRetry );
 }
 
 #endif	// ifndef DAGMAN_RECURSIVE_SUBMIT_H
+#endif

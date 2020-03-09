@@ -49,15 +49,23 @@
 // reason defining fileno and fdopen to the right ones does not work 
 // in new versions of Visual Studio)
 //#pragma warning( disable : 4996 )
-#define _CRT_NONSTDC_NO_DEPRECATE
+#define _CRT_NONSTDC_NO_DEPRECATE 1
 #define _CRT_NONSTDC_NO_WARNINGS
+
+// we define this this to disable the warning about using WSAAddressToStringA
+#define _WINSOCK_DEPRECATED_NO_WARNINGS 1
 
 // #define NOGDI
 #define NOSOUND
+#define NOMINMAX
 
 // Make it official that Windows 2000 is our target
 //#define _WIN32_WINNT 0x0500
 //#define WINVER       0x0500
+
+// disable MSVC code analysis warnings for system headers
+#pragma warning(push)
+#pragma warning(disable : 6011 6031 6101 6386 6387 6509 28196 )
 
 // Make sure to define this *before* we include winsock2.h
 #define FD_SETSIZE 1024
@@ -65,7 +73,6 @@
 // the ordering of the two following header files 
 // is important! Starting with the new SDK, we want 
 // winsock2.h not winsock.h, so we include it first. 
-
 #include <winsock2.h>
 #include <windows.h>
 
@@ -85,7 +92,9 @@
 #include <sys/stat.h>
 typedef unsigned short mode_t;
 typedef int socklen_t;
+#ifndef Py_CONFIG_H //conflicts with pyconfig.h 
 typedef DWORD pid_t;
+#endif 
 typedef	unsigned __int16 uint16_t;
 typedef unsigned __int32 uint32_t;
 typedef __int32 int32_t;
@@ -110,6 +119,7 @@ typedef __int32 int32_t;
 #define strlwr _strlwr
 #define chdir _chdir
 #define fsync _commit
+#pragma warning(suppress: 28251) // disable inconsistent annotation warning.
 DLL_IMPORT_MAGIC int __cdecl access(const char *, int);
 #define execl _execl  
 #define execv _execv
@@ -146,6 +156,9 @@ DLL_IMPORT_MAGIC int __cdecl access(const char *, int);
 #include <float.h>   // for DBL_MAX and other constants
 #include <errno.h>
 #include <Mstcpip.h> // for Winsock SIO_KEEPALIVE_VALS support
+
+#pragma warning(pop) // restore code analysis warnings
+
 #include "file_lock.h"
 #include "condor_fix_assert.h"
 
@@ -155,7 +168,9 @@ DLL_IMPORT_MAGIC int __cdecl access(const char *, int);
 #define S_IRWXO 2
 #define S_ISDIR(mode) (((mode)&_S_IFDIR) == _S_IFDIR)
 #define S_ISREG(mode) (((mode)&_S_IFREG) == _S_IFREG)
+#if _MSC_VER < 1800 // Added to the standard library in VS 2013
 #define rint(num) ((num<0.)? -floor(-num+.5):floor(num+.5))
+#endif
 
 #ifndef ETIMEDOUT
 #define ETIMEDOUT ERROR_TIMEOUT
@@ -168,8 +183,6 @@ DLL_IMPORT_MAGIC int __cdecl access(const char *, int);
 #ifndef EWOULDBLOCK
 #	define EWOULDBLOCK EAGAIN
 #endif
-
-typedef fd_set *SELECT_FDSET_PTR;
 
 struct rusage {
     struct timeval ru_utime;    /* user time used */

@@ -25,20 +25,28 @@
 #include "condor_constants.h"
 #include "list.h"
 
+
 /*
   This primitive class is used to contain and search arrays of strings.
 */
 class StringList {
 public:
 	StringList(const char *s = NULL, const char *delim = " ," );
+	StringList(const char *s, char delim_char, bool keep_empty_fields );
 	StringList( const StringList &other );
 	virtual ~StringList();
 	void initializeFromString (const char *);
+	void initializeFromString (const char *, char delim_char);
 
 	/** Note: the contains* methods have side affects -- they
-		change "current" to point at the location of the match */
+		change "current" to point at the location of the match
+		(so do the prefix* methods) */
+	// prefix() works like contains_withwildcard() would if all of the
+	// items in the list ended with a '*'. That is, it returns true if
+	// any item in the list is a prefix of the given string.
+	bool prefix( const char * );
+	bool prefix_anycase( const char * );
 	bool contains( const char * );
-	bool substring( const char * );
 	bool contains_anycase( const char * );
 	bool contains_withwildcard( const char *str );
 	bool contains_anycase_withwildcard( const char * );
@@ -49,7 +57,7 @@ public:
 											StringList *matches);
 
 	/** This doesn't have any side affects */
-	bool find( const char *str, bool anycase = false ) const;
+	const char * find( const char *str, bool anycase = false ) const;
 
 	void print (void);
 	void rewind (void) { m_strings.Rewind(); }
@@ -59,6 +67,23 @@ public:
 	void clearAll();
 	void remove_anycase (const char* str);
 	char *next (void) { return m_strings.Next(); }
+	char *first (void) { m_strings.Rewind(); return m_strings.Next(); }
+	char *pop () {
+		if (m_strings.IsEmpty())
+			return NULL;
+		return m_strings.PopHead();
+	}
+	void append (const char* mem, int cb) {
+		char * p = (char *)malloc(cb+2);
+		memcpy(p, mem, cb); p[cb] = p[cb+1] = 0;
+		m_strings.Append(p);
+	}
+	// move items from that list to the end of this list.
+	void take_list(StringList & that) {
+		while ( ! that.m_strings.IsEmpty()) {
+			m_strings.Append(that.m_strings.PopHead());
+		}
+	}
 	
 	/** This is invalid when "current" points to NULL as stated in list.h*/
 	void deleteCurrent();
@@ -106,6 +131,14 @@ public:
 	const List<char> &getList( void ) const { return m_strings; };
 	const char *getDelimiters(void) const { return m_delimiters; };
 
+	StringList &operator=(StringList &&rhs) {
+		clearAll();
+		free(m_delimiters);
+		this->m_strings = std::move(rhs.m_strings);
+		this->m_delimiters = rhs.m_delimiters;
+		rhs.m_delimiters = nullptr;
+		return *this;
+	}
 protected:
     const char * contains_withwildcard( const char *string,
 										bool anycase,

@@ -31,12 +31,20 @@ typedef _Longlong int64_t;
 #include <stdint.h>
 #endif
 #include <ctime>
+#if defined(WIN32)
+# include <winsock2.h>
+#else
+# include <sys/time.h>
+#endif
 
 struct DebugFileInfo;
 typedef struct DebugHeaderInfo {
-   time_t clock_now;
+   struct timeval tv;
    struct tm * tm;
    DPF_IDENT  ident; // caller supplied identity, used by D_AUDIT
+   int        backtrace_id;  // per-process unique identifier for this backtrace
+   int        num_backtrace; // number of valid entries in the backtrace array
+   void **    backtrace;     // if non null, pointer to an array of void* pointers containing the backtrace (set when D_BACKTRACE is specified)
 }  DebugHeaderInfo;
 
 typedef void (*DprintfFuncPtr)(int, int, DebugHeaderInfo &, const char*, DebugFileInfo*);
@@ -102,7 +110,7 @@ struct DebugFileInfo
 	DebugFileInfo(const DebugFileInfo &dfi) : outputTarget(dfi.outputTarget), debugFP(NULL),
 		choice(dfi.choice), headerOpts(dfi.headerOpts),
 		logPath(dfi.logPath), maxLog(dfi.maxLog), logZero(dfi.logZero), maxLogNum(dfi.maxLogNum), want_truncate(dfi.want_truncate),
-		accepts_all(dfi.accepts_all), rotate_by_time(dfi.rotate_by_time), dont_panic(dfi.dont_panic), dprintfFunc(dfi.dprintfFunc) {}
+		accepts_all(dfi.accepts_all), rotate_by_time(dfi.rotate_by_time), dont_panic(dfi.dont_panic), userData(dfi.userData), dprintfFunc(dfi.dprintfFunc) {}
 	DebugFileInfo(const dprintf_output_settings&);
 	~DebugFileInfo();
 	bool MatchesCatAndFlags(int cat_and_flags) const;
